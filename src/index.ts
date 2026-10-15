@@ -33,6 +33,8 @@ const server = serve({ fetch: engine.app.fetch, port: config.port }, (info) => {
     public_url: config.publicUrl,
     version: engine.version,
     provider_proxies: describeProxies(config),
+    locale: config.engineLocale,
+    default_timezone: config.defaultTimezone,
   })
 })
 

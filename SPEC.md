@@ -1770,7 +1770,7 @@ a log pipeline. There is no database (§2): a restart or deploy means an empty j
 | `callback_sent`, `callback_failed` | info / error | delivery outcome (§7) | — |
 | `ack` | info | session lock released: `via` — `callback` / `endpoint` / `wait` | — |
 | `cancel`, `sse_subscribe`, `run_deleted`, `ack_missing` | info / debug / warn | stop, SSE subscription, run deletion (`retention` / `evicted`) | — |
-| `egress_denied`, `egress_headers_dropped`, `retained_full`, `shutdown`, `engine_listening` | warn / info | egress refusals and dropped headers, retention full, shutdown, startup (`provider_proxies`) | — |
+| `egress_denied`, `egress_headers_dropped`, `retained_full`, `shutdown`, `engine_listening` | warn / info | egress refusals and dropped headers, retention full, shutdown, startup (`provider_proxies`, `locale`, `default_timezone`) | — |
 
 ## 13. Conformance tests
 
