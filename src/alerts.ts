@@ -9,6 +9,7 @@
  * contents, prompts, tool args / results or keys — the same rules as for logs.
  */
 import { ENGINE_SECRET_HEADER } from './config.js'
+import { CONTRACT_VERSION } from './contracts.js'
 import type { EgressClient } from './egress/client.js'
 import { log, safeUrl } from './log.js'
 
@@ -65,7 +66,7 @@ export function sendAlert(event: AlertEvent, fields: Record<string, unknown>): v
       method: 'POST',
       headers,
       body: JSON.stringify({
-        contract_version: '1',
+        contract_version: CONTRACT_VERSION,
         event,
         at: new Date(now).toISOString(),
         engine_version: target.version,

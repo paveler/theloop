@@ -1,5 +1,5 @@
 /** Identifiers and tokens. The run token is 32 random bytes (SPEC §4.1). */
-import { randomBytes, createHash } from 'node:crypto'
+import { randomBytes, createHash, timingSafeEqual } from 'node:crypto'
 
 const ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ' // Crockford base32, as in ULID
 
@@ -41,10 +41,9 @@ export function stableStringify(value: unknown): string {
   return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(',')}}`
 }
 
-/** Constant-time secret comparison (tokens). */
+/** Constant-time secret comparison (tokens): digests have a fixed length, so nothing leaks the secret's length. */
 export function timingSafeEqualStr(a: string, b: string): boolean {
-  if (a.length !== b.length) return false
-  let diff = 0
-  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
-  return diff === 0
+  const da = createHash('sha256').update(a).digest()
+  const db = createHash('sha256').update(b).digest()
+  return timingSafeEqual(da, db)
 }

@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url'
 import { serve } from '@hono/node-server'
 import { createEngine } from './app.js'
 import { createConfig, describeProxies } from './config.js'
-import { initLogger, log } from './log.js'
+import { log } from './log.js'
 
 function readVersion(): string {
   try {
@@ -24,8 +24,7 @@ function readVersion(): string {
 }
 
 const config = createConfig()
-initLogger(config)
-
+// createEngine initializes the logger from config
 const engine = createEngine(config, {}, readVersion())
 
 const server = serve({ fetch: engine.app.fetch, port: config.port }, (info) => {

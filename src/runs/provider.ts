@@ -386,13 +386,12 @@ export function classifyProviderError(err: unknown, t: Texts = texts()): Provide
   // the SDK may wrap the fetch error in its own — look into cause as well
   const oauth = findGigachatOAuthError(err)
   if (oauth?.permanent) {
-    const err = oauth
     return {
       kind: 'failed',
       code: 'provider_auth',
-      message: redactSecrets(err.message).slice(0, 512),
-      providerStatus: err.status,
-      providerBody: err.responseBody ? redactSecrets(err.responseBody) : undefined,
+      message: redactSecrets(oauth.message).slice(0, 512),
+      providerStatus: oauth.status,
+      providerBody: oauth.responseBody ? redactSecrets(oauth.responseBody) : undefined,
       retriable: false,
     }
   }
