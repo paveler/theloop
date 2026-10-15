@@ -50,7 +50,7 @@ Effort: **S** — days, **M** — 1–2 weeks, **L** — a month or more.
 |---|---|
 | Extract the reference implementation; English code comments; locale layer (`en` / `ru`, Appendix B); `DEFAULT_TIMEZONE` | M |
 | CI (typecheck + tests), Docker image on GHCR, versioned releases — **done in v1.0.1** | S |
-| README quickstart: `docker run` + one `curl` with `wait: true` | S |
+| README quickstart: `docker run` + one `curl` with `wait: true` — **done** | S |
 | `SECURITY.md`: threat model, supported versions, disclosure process with a response SLA | S |
 | `examples/sqlite-harness`: a complete harness on SQLite — history, a read tool, a write tool with approval, continuation, recovery — with an end-to-end test — **done** | M |
 | A thin harness SDK (TypeScript): apply results idempotently, ack, deadline recovery, the write-endpoint lookup order — with storage as callbacks, so a harness is mostly glue | M |
