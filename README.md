@@ -118,6 +118,8 @@ npm run build && npm start
 - [SPEC.md](SPEC.md) — the contract: API, message format, loop semantics, limits, reliability.
 - [ROADMAP.md](ROADMAP.md) — proposals: MCP, more providers, skills, compaction, sub-runs, a
   reference harness with channels and memory.
+- [AGENTS.md](AGENTS.md) — how to work on the code: commands, architecture rules, conventions,
+  tests, releases. Written for AI coding agents; a good short version for contributors too.
 
 ## License
 
