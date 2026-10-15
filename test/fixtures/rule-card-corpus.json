@@ -1,0 +1,267 @@
+[
+  {
+    "name": "case 01: escalate outage tickets with one condition",
+    "block": "{\"summary\": \"Escalate tickets that report an outage.\",\n\"rules\": [\n{\"condition\": {\"op\": \"subject_has\", \"terms\": [\"outage\", \"service down\", \"cannot log in\"]}, \"action\": \"escalate\", \"weight\": 6, \"note\": \"Outages go to the on-call team first\"}\n]}",
+    "valid": true
+  },
+  {
+    "name": "case 02: archive newsletters via a one-item predicates list with match",
+    "block": "{\"summary\": \"Archive newsletters and promotional mail.\",\n\"rules\": [\n{\"match\": \"all\", \"predicates\": [{\"op\": \"from_domain_in\", \"domains\": [\"news.example.net\", \"promo.example.net\"]}], \"action\": \"archive\", \"weight\": 3}\n]}",
+    "valid": true
+  },
+  {
+    "name": "case 03: merged two conditions into one rule",
+    "block": "{\"summary\": \"Escalate urgent tickets from enterprise customers.\",\n\"rules\": [\n{\"match\": \"all\", \"predicates\": [{\"op\": \"from_domain_in\", \"domains\": [\"enterprise.example.com\"]}, {\"op\": \"priority_in\", \"codes\": [\"p1\", \"p2\"]}], \"action\": \"escalate\", \"weight\": 6, \"note\": \"Enterprise SLA\"}\n]}",
+    "valid": false
+  },
+  {
+    "name": "case 04: label billing questions with the predicate field",
+    "block": "{\"summary\": \"Label billing questions so the billing team sees them.\",\n\"rules\": [{\"predicate\": {\"op\": \"body_has\", \"terms\": [\"invoice\", \"refund\", \"charged twice\"]}, \"action\": \"label\", \"label\": \"billing\", \"weight\": 4}]}",
+    "valid": true
+  },
+  {
+    "name": "case 05: routing sent as an object keyed by type",
+    "block": "{\"summary\": \"Route Spanish tickets to the regional team.\",\n\"routing\": {\"team_adjust\": {\"add\": [\"support-es\"], \"note\": \"Spanish speakers\"}}}",
+    "valid": false
+  },
+  {
+    "name": "case 06: routing sent as an object instead of a list",
+    "block": "{\"summary\": \"Add the billing team to routing.\",\n\"routing\": {\"type\": \"team_adjust\", \"add\": [\"billing\"], \"note\": \"Billing now takes payment tickets\"}}",
+    "valid": false
+  },
+  {
+    "name": "case 07: routing as a list with add and remove",
+    "block": "{\"summary\": \"Billing takes payment tickets, the general queue stops getting them.\",\n\"remove_routing\": [],\n\"routing\": [\n{\"type\": \"team_adjust\", \"add\": [\"billing\"], \"remove\": [\"general\"]}]\n}",
+    "valid": true
+  },
+  {
+    "name": "case 08: routing with an empty remove and nothing to add",
+    "block": "{\"summary\": \"Stop routing to the general queue.\",\n\"routing\": [{\"type\": \"team_adjust\", \"remove\": [], \"note\": \"nothing listed\"}]}",
+    "valid": false
+  },
+  {
+    "name": "case 09: routing with an unknown type",
+    "block": "{\"routing\": [{\"type\": \"queue_adjust\", \"add\": [\"vip\"]}]}",
+    "valid": false
+  },
+  {
+    "name": "case 10: size range with both bounds",
+    "block": "{\"summary\": \"Deprioritize very large messages by archiving them for manual review.\",\n\"rules\": [\n{\"condition\": {\"op\": \"size_range\", \"min\": 10240, \"max\": 51200}, \"action\": \"archive\", \"weight\": 2, \"note\": \"Large attachments are reviewed in batches\"}\n]}",
+    "valid": true
+  },
+  {
+    "name": "case 11: size range with a numeric string bound",
+    "block": "{\"rules\": [{\"condition\": {\"op\": \"size_range\", \"min\": \"20 480\"}, \"action\": \"label\", \"label\": \"large-attachment\", \"weight\": 1}]}",
+    "valid": true
+  },
+  {
+    "name": "case 12: size range with a text bound",
+    "block": "{\"rules\": [{\"condition\": {\"op\": \"size_range\", \"min\": \"about 20 MB\"}, \"action\": \"label\", \"label\": \"large-attachment\", \"weight\": 1}]}",
+    "valid": false
+  },
+  {
+    "name": "case 13: size range with a null min and a real max",
+    "block": "{\"rules\": [{\"condition\": {\"op\": \"size_range\", \"min\": null, \"max\": 4}, \"action\": \"archive\", \"weight\": 1, \"note\": \"Empty auto-replies\"}]}",
+    "valid": true
+  },
+  {
+    "name": "case 14: size range with both bounds null",
+    "block": "{\"rules\": [{\"condition\": {\"op\": \"size_range\", \"min\": null, \"max\": null}, \"action\": \"archive\", \"weight\": 1}]}",
+    "valid": false
+  },
+  {
+    "name": "case 15: size range with a negative bound",
+    "block": "{\"rules\": [{\"condition\": {\"op\": \"size_range\", \"min\": -5}, \"action\": \"archive\", \"weight\": 1}]}",
+    "valid": false
+  },
+  {
+    "name": "case 16: age range without bounds",
+    "block": "{\"rules\": [{\"predicate\": {\"op\": \"age_range\", \"since\": \"last_reply\"}, \"action\": \"escalate\", \"weight\": 3}]}",
+    "valid": false
+  },
+  {
+    "name": "case 17: age range without since",
+    "block": "{\"rules\": [{\"predicate\": {\"op\": \"age_range\", \"min\": 48}, \"action\": \"escalate\", \"weight\": 3}]}",
+    "valid": false
+  },
+  {
+    "name": "case 18: age range with since and min",
+    "block": "{\"summary\": \"Escalate tickets nobody answered for two days.\",\n\"rules\": [\n{\"condition\": {\"op\": \"age_range\", \"since\": \"last_reply\", \"min\": 48}, \"action\": \"escalate\", \"weight\": 5, \"note\": \"Hours since the last customer reply\"}\n]}",
+    "valid": true
+  },
+  {
+    "name": "case 19: category code with a comma",
+    "block": "{\"rules\": [{\"condition\": {\"op\": \"category_in\", \"codes\": [\"10,2\"]}, \"action\": \"label\", \"label\": \"hardware\", \"weight\": 3}]}",
+    "valid": false
+  },
+  {
+    "name": "case 20: category codes in the dotted form",
+    "block": "{\"summary\": \"Label hardware categories.\",\n\"rules\": [\n{\"condition\": {\"op\": \"category_in\", \"codes\": [\"10\", \"10.2\", \"10.2.15\"]}, \"action\": \"label\", \"label\": \"hardware\", \"weight\": 3}\n]}",
+    "valid": true
+  },
+  {
+    "name": "case 21: channel not in the list",
+    "block": "{\"rules\": [{\"condition\": {\"op\": \"channel_in\", \"codes\": [\"fax\"]}, \"action\": \"archive\", \"weight\": 3}]}",
+    "valid": false
+  },
+  {
+    "name": "case 22: priority codes as numbers",
+    "block": "{\"rules\": [{\"condition\": {\"op\": \"priority_in\", \"codes\": [1, 2]}, \"action\": \"escalate\", \"weight\": 7}]}",
+    "valid": true
+  },
+  {
+    "name": "case 23: priority code that does not exist",
+    "block": "{\"rules\": [{\"condition\": {\"op\": \"priority_in\", \"codes\": [\"critical\"]}, \"action\": \"escalate\", \"weight\": 7}]}",
+    "valid": false
+  },
+  {
+    "name": "case 24: weight 0",
+    "block": "{\"rules\": [{\"condition\": {\"op\": \"subject_has\", \"terms\": [\"a\"]}, \"action\": \"escalate\", \"weight\": 0}]}",
+    "valid": false
+  },
+  {
+    "name": "case 25: weight 11",
+    "block": "{\"rules\": [{\"condition\": {\"op\": \"subject_has\", \"terms\": [\"a\"]}, \"action\": \"escalate\", \"weight\": 11}]}",
+    "valid": false
+  },
+  {
+    "name": "case 26: weight as a string",
+    "block": "{\"rules\": [{\"condition\": {\"op\": \"subject_has\", \"terms\": [\"a\"]}, \"action\": \"escalate\", \"weight\": \"5\"}]}",
+    "valid": false
+  },
+  {
+    "name": "case 27: weight missing",
+    "block": "{\"summary\": \"Label password resets.\",\n\"rules\": [{\"condition\": {\"op\": \"subject_has\", \"terms\": [\"password reset\"]}, \"action\": \"label\", \"label\": \"account\"}]}",
+    "valid": false
+  },
+  {
+    "name": "case 28: invented action",
+    "block": "{\"rules\": [{\"condition\": {\"op\": \"from_is\", \"addresses\": [\"noreply@example.com\"]}, \"action\": \"delete\", \"weight\": 3}]}",
+    "valid": false
+  },
+  {
+    "name": "case 29: invented pseudo-op negate wrapping a list",
+    "block": "{\"rules\": [{\"predicate\": {\"op\": \"negate\", \"predicates\": [{\"op\": \"subject_has\", \"terms\": [\"a\"]}]}, \"action\": \"archive\", \"weight\": 3}]}",
+    "valid": false
+  },
+  {
+    "name": "case 30: negate as a boolean flag on a predicate",
+    "block": "{\"rules\": [{\"condition\": {\"op\": \"from_domain_in\", \"domains\": [\"example.com\"], \"negate\": true}, \"action\": \"label\", \"label\": \"external\", \"weight\": 2}]}",
+    "valid": true
+  },
+  {
+    "name": "case 31: negate as a string",
+    "block": "{\"rules\": [{\"condition\": {\"op\": \"from_domain_in\", \"domains\": [\"example.com\"], \"negate\": \"yes\"}, \"action\": \"label\", \"label\": \"external\", \"weight\": 2}]}",
+    "valid": false
+  },
+  {
+    "name": "case 32: both predicate and predicates",
+    "block": "{\"rules\": [{\"predicate\": {\"op\": \"subject_has\", \"terms\": [\"a\"]}, \"predicates\": [{\"op\": \"subject_has\", \"terms\": [\"a\"]}], \"action\": \"escalate\", \"weight\": 1}]}",
+    "valid": false
+  },
+  {
+    "name": "case 33: condition and predicate at once",
+    "block": "{\"rules\": [{\"condition\": {\"op\": \"subject_has\", \"terms\": [\"a\"]}, \"predicate\": {\"op\": \"subject_has\", \"terms\": [\"a\"]}, \"action\": \"escalate\", \"weight\": 1}]}",
+    "valid": false
+  },
+  {
+    "name": "case 34: key \".predicate\" (a GigaChat tokenizer artifact)",
+    "block": "{\"rules\": [{\".predicate\": {\"op\": \"subject_has\", \"terms\": [\"refund request\"]}, \"action\": \"label\", \"label\": \"billing\", \"weight\": 6}]}",
+    "valid": false
+  },
+  {
+    "name": "case 35: removal of a compound rule with match",
+    "block": "{\"remove_rules\": [{\"match\": \"any\", \"predicates\": [{\"op\": \"subject_has\", \"terms\": [\"newsletter\"]}, {\"op\": \"from_domain_in\", \"domains\": [\"promo.example.net\"]}], \"action\": \"archive\"}]}",
+    "valid": true
+  },
+  {
+    "name": "case 36: removal of a compound rule without match",
+    "block": "{\"remove_rules\": [{\"predicates\": [{\"op\": \"subject_has\", \"terms\": [\"a\"]}, {\"op\": \"subject_has\", \"terms\": [\"b\"]}], \"action\": \"archive\"}]}",
+    "valid": false
+  },
+  {
+    "name": "case 37: removal with condition",
+    "block": "{\"remove_rules\": [{\"condition\": {\"op\": \"channel_in\", \"codes\": [\"social\"]}, \"action\": \"archive\"}]}",
+    "valid": true
+  },
+  {
+    "name": "case 38: empty block",
+    "block": "{\"rules\": []}",
+    "valid": null
+  },
+  {
+    "name": "case 39: superquote tokens instead of quotes",
+    "block": "{<|superquote|>summary<|superquote|>: <|superquote|>Escalate chat tickets about outages.<|superquote|>,\n<|superquote|>rules<|superquote|>: [\n{<|superquote|>condition<|superquote|>: {<|superquote|>op<|superquote|>: <|superquote|>channel_in<|superquote|>, <|superquote|>codes<|superquote|>: [<|superquote|>chat<|superquote|>]}, <|superquote|>action<|superquote|>: <|superquote|>escalate<|superquote|>, <|superquote|>weight<|superquote|>: 4}\n]}",
+    "valid": true
+  },
+  {
+    "name": "case 40: superquote tokens and a trailing comma",
+    "block": "{<|superquote|>rules<|superquote|>: [\n{<|superquote|>condition<|superquote|>: {<|superquote|>op<|superquote|>: <|superquote|>subject_has<|superquote|>, <|superquote|>terms<|superquote|>: [<|superquote|>outage<|superquote|>]}, <|superquote|>action<|superquote|>: <|superquote|>escalate<|superquote|>, <|superquote|>weight<|superquote|>: 4},\n]}",
+    "valid": false
+  },
+  {
+    "name": "case 41: trailing comma in the rules list",
+    "block": "{\"summary\": \"Escalate outages.\",\n\"rules\": [\n{\"condition\": {\"op\": \"subject_has\", \"terms\": [\"outage\"]}, \"action\": \"escalate\", \"weight\": 6},\n]}",
+    "valid": false
+  },
+  {
+    "name": "case 42: empty terms list",
+    "block": "{\"rules\": [{\"condition\": {\"op\": \"subject_has\", \"terms\": []}, \"action\": \"escalate\", \"weight\": 6}]}",
+    "valid": false
+  },
+  {
+    "name": "case 43: whitespace-only term",
+    "block": "{\"rules\": [{\"condition\": {\"op\": \"body_has\", \"terms\": [\"   \"]}, \"action\": \"label\", \"label\": \"misc\", \"weight\": 1}]}",
+    "valid": false
+  },
+  {
+    "name": "case 44: values copied as value/name objects",
+    "block": "{\"summary\": \"Label mail from partner domains.\",\n\"rules\": [\n{\"condition\": {\"op\": \"from_domain_in\", \"domains\": [{\"value\": \"partner.example.com\", \"name\": \"Partner Inc.\"}, \"reseller.example.net\"]}, \"action\": \"label\", \"label\": \"partner\", \"weight\": 3}\n]}",
+    "valid": true
+  },
+  {
+    "name": "case 45: rules sent as an object",
+    "block": "{\"summary\": \"Escalate outages.\",\n\"rules\": {\"condition\": {\"op\": \"subject_has\", \"terms\": [\"outage\"]}, \"action\": \"escalate\", \"weight\": 6}}",
+    "valid": false
+  },
+  {
+    "name": "case 46: six rules, more than the limit",
+    "block": "{\"summary\":\"Label everything by topic.\",\"rules\":[{\"condition\":{\"op\":\"subject_has\",\"terms\":[\"login\"]},\"action\":\"label\",\"label\":\"login\",\"weight\":2},{\"condition\":{\"op\":\"subject_has\",\"terms\":[\"billing\"]},\"action\":\"label\",\"label\":\"billing\",\"weight\":2},{\"condition\":{\"op\":\"subject_has\",\"terms\":[\"shipping\"]},\"action\":\"label\",\"label\":\"shipping\",\"weight\":2},{\"condition\":{\"op\":\"subject_has\",\"terms\":[\"returns\"]},\"action\":\"label\",\"label\":\"returns\",\"weight\":2},{\"condition\":{\"op\":\"subject_has\",\"terms\":[\"warranty\"]},\"action\":\"label\",\"label\":\"warranty\",\"weight\":2},{\"condition\":{\"op\":\"subject_has\",\"terms\":[\"feedback\"]},\"action\":\"label\",\"label\":\"feedback\",\"weight\":2}]}",
+    "valid": false
+  },
+  {
+    "name": "case 47: summary longer than 400 characters",
+    "block": "{\"summary\":\"We will escalate every ticket that mentions an outage. We will escalate every ticket that mentions an outage. We will escalate every ticket that mentions an outage. We will escalate every ticket that mentions an outage. We will escalate every ticket that mentions an outage. We will escalate every ticket that mentions an outage. We will escalate every ticket that mentions an outage. We will escalate every ticket that mentions an outage.\",\"rules\":[{\"condition\":{\"op\":\"subject_has\",\"terms\":[\"outage\"]},\"action\":\"escalate\",\"weight\":6}]}",
+    "valid": false
+  },
+  {
+    "name": "case 48: note as a number",
+    "block": "{\"rules\": [{\"condition\": {\"op\": \"from_is\", \"addresses\": [\"ceo@example.com\"]}, \"action\": \"escalate\", \"weight\": 9, \"note\": 1}]}",
+    "valid": false
+  },
+  {
+    "name": "case 49: several valid rules with different actions",
+    "block": "{\"summary\": \"Escalate outages, label refunds, archive auto-replies.\",\n\"rules\": [\n{\"condition\": {\"op\": \"subject_has\", \"terms\": [\"outage\"]}, \"action\": \"escalate\", \"weight\": 6},\n{\"condition\": {\"op\": \"body_has\", \"terms\": [\"refund\"]}, \"action\": \"label\", \"label\": \"billing\", \"weight\": 3},\n{\"condition\": {\"op\": \"subject_has\", \"terms\": [\"automatic reply\", \"out of office\"]}, \"action\": \"archive\", \"weight\": 1, \"note\": \"Auto-replies need no answer\"}\n]\n}",
+    "valid": true
+  },
+  {
+    "name": "case 50: an extra top-level key is tolerated",
+    "block": "{\"summary\": \"Escalate phone tickets.\", \"comment\": \"draft\",\n\"rules\": [{\"condition\": {\"op\": \"channel_in\", \"codes\": [\"phone\"]}, \"action\": \"escalate\", \"weight\": 2}]}",
+    "valid": true
+  },
+  {
+    "name": "case 51: the whole block is a list",
+    "block": "[{\"condition\": {\"op\": \"subject_has\", \"terms\": [\"outage\"]}, \"action\": \"escalate\", \"weight\": 6}]",
+    "valid": false
+  },
+  {
+    "name": "case 52: condition without op",
+    "block": "{\"rules\": [{\"condition\": {\"terms\": [\"outage\"]}, \"action\": \"escalate\", \"weight\": 6}]}",
+    "valid": false
+  },
+  {
+    "name": "case 53: removal of a routing change",
+    "block": "{\"summary\": \"Stop routing to the legacy queue.\",\n\"remove_routing\": [{\"type\": \"team_adjust\", \"add\": [\"legacy\"]}]}",
+    "valid": true
+  }
+]

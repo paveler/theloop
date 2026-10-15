@@ -1,0 +1,624 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/rule-card.json",
+  "title": "rule-card block: a proposal of inbox rules for a help desk",
+  "description": "Contract of the ```rule-card block a help-desk assistant ends its answer with; the client renders it as a card the user can apply. Semantics the schema cannot express (min <= max, a team that exists) are checked by the client only. A new rule has exactly one condition in the condition field; predicate and a one-item predicates list are accepted for compatibility with older answers.",
+  "type": "object",
+  "properties": {
+    "summary": {
+      "type": "string",
+      "maxLength": 400
+    },
+    "routing": {
+      "type": "array",
+      "maxItems": 6,
+      "items": {
+        "$ref": "#/$defs/routingChange"
+      }
+    },
+    "remove_routing": {
+      "type": "array",
+      "maxItems": 5,
+      "items": {
+        "$ref": "#/$defs/routingChange"
+      }
+    },
+    "rules": {
+      "type": "array",
+      "maxItems": 5,
+      "items": {
+        "$ref": "#/$defs/rule"
+      }
+    },
+    "remove_rules": {
+      "type": "array",
+      "maxItems": 5,
+      "items": {
+        "$ref": "#/$defs/ruleRemoval"
+      }
+    }
+  },
+  "$defs": {
+    "value": {
+      "description": "A string or { value, name }: the rules tool returns values this way, and the model copies them.",
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "pattern": "\\S"
+        },
+        {
+          "type": "object",
+          "required": [
+            "value"
+          ],
+          "properties": {
+            "value": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 80,
+              "pattern": "\\S"
+            }
+          }
+        }
+      ]
+    },
+    "values": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "$ref": "#/$defs/value"
+      }
+    },
+    "nonEmptyValues": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 20,
+      "items": {
+        "$ref": "#/$defs/value"
+      }
+    },
+    "quantity": {
+      "description": "A bound: a number >= 0, a numeric string, or null for no bound.",
+      "anyOf": [
+        {
+          "type": "number",
+          "minimum": 0
+        },
+        {
+          "type": "string",
+          "pattern": "^\\s*\\d[\\d\\s]*([.,]\\d+)?\\s*$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "note": {
+      "type": "string",
+      "maxLength": 300
+    },
+    "routingChange": {
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "enum": [
+            "team_adjust",
+            "language_adjust"
+          ]
+        },
+        "add": {
+          "$ref": "#/$defs/values"
+        },
+        "remove": {
+          "$ref": "#/$defs/values"
+        },
+        "note": {
+          "$ref": "#/$defs/note"
+        }
+      },
+      "anyOf": [
+        {
+          "required": [
+            "add"
+          ],
+          "properties": {
+            "add": {
+              "minItems": 1
+            }
+          }
+        },
+        {
+          "required": [
+            "remove"
+          ],
+          "properties": {
+            "remove": {
+              "minItems": 1
+            }
+          }
+        }
+      ]
+    },
+    "predicate": {
+      "type": "object",
+      "required": [
+        "op"
+      ],
+      "properties": {
+        "op": {
+          "enum": [
+            "subject_has",
+            "body_has",
+            "from_is",
+            "from_domain_in",
+            "category_in",
+            "priority_in",
+            "channel_in",
+            "size_range",
+            "age_range"
+          ]
+        },
+        "negate": {
+          "type": "boolean"
+        }
+      },
+      "discriminator": {
+        "propertyName": "op"
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "op": {
+              "const": "subject_has"
+            },
+            "terms": {
+              "$ref": "#/$defs/nonEmptyValues"
+            }
+          },
+          "required": [
+            "op",
+            "terms"
+          ]
+        },
+        {
+          "properties": {
+            "op": {
+              "const": "body_has"
+            },
+            "terms": {
+              "$ref": "#/$defs/nonEmptyValues"
+            }
+          },
+          "required": [
+            "op",
+            "terms"
+          ]
+        },
+        {
+          "properties": {
+            "op": {
+              "const": "from_is"
+            },
+            "addresses": {
+              "$ref": "#/$defs/nonEmptyValues"
+            }
+          },
+          "required": [
+            "op",
+            "addresses"
+          ]
+        },
+        {
+          "properties": {
+            "op": {
+              "const": "from_domain_in"
+            },
+            "domains": {
+              "$ref": "#/$defs/nonEmptyValues"
+            }
+          },
+          "required": [
+            "op",
+            "domains"
+          ]
+        },
+        {
+          "properties": {
+            "op": {
+              "const": "category_in"
+            },
+            "codes": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 20,
+              "items": {
+                "type": "string",
+                "pattern": "^\\d{2}(\\.\\d+)*$"
+              }
+            }
+          },
+          "required": [
+            "op",
+            "codes"
+          ]
+        },
+        {
+          "properties": {
+            "op": {
+              "const": "priority_in"
+            },
+            "codes": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 20,
+              "items": {
+                "enum": [
+                  "p1",
+                  "p2",
+                  "p3",
+                  "p4",
+                  1,
+                  2,
+                  3,
+                  4
+                ]
+              }
+            }
+          },
+          "required": [
+            "op",
+            "codes"
+          ]
+        },
+        {
+          "properties": {
+            "op": {
+              "const": "channel_in"
+            },
+            "codes": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 20,
+              "items": {
+                "enum": [
+                  "email",
+                  "chat",
+                  "phone",
+                  "web_form",
+                  "social",
+                  "other"
+                ]
+              }
+            }
+          },
+          "required": [
+            "op",
+            "codes"
+          ]
+        },
+        {
+          "properties": {
+            "op": {
+              "const": "size_range"
+            },
+            "min": {
+              "$ref": "#/$defs/quantity"
+            },
+            "max": {
+              "$ref": "#/$defs/quantity"
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "anyOf": [
+            {
+              "required": [
+                "min"
+              ],
+              "properties": {
+                "min": {
+                  "not": {
+                    "type": "null"
+                  }
+                }
+              }
+            },
+            {
+              "required": [
+                "max"
+              ],
+              "properties": {
+                "max": {
+                  "not": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        {
+          "properties": {
+            "op": {
+              "const": "age_range"
+            },
+            "since": {
+              "enum": [
+                "opened",
+                "last_reply"
+              ]
+            },
+            "min": {
+              "$ref": "#/$defs/quantity"
+            },
+            "max": {
+              "$ref": "#/$defs/quantity"
+            }
+          },
+          "required": [
+            "op",
+            "since"
+          ],
+          "anyOf": [
+            {
+              "required": [
+                "min"
+              ],
+              "properties": {
+                "min": {
+                  "not": {
+                    "type": "null"
+                  }
+                }
+              }
+            },
+            {
+              "required": [
+                "max"
+              ],
+              "properties": {
+                "max": {
+                  "not": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "action": {
+      "enum": [
+        "escalate",
+        "label",
+        "archive"
+      ]
+    },
+    "rule": {
+      "description": "A new rule has exactly one condition: the condition field (the primary form); predicate or a one-item predicates list are accepted for compatibility. match is not needed.",
+      "type": "object",
+      "required": [
+        "action",
+        "weight"
+      ],
+      "properties": {
+        "condition": {
+          "$ref": "#/$defs/predicate"
+        },
+        "predicate": {
+          "$ref": "#/$defs/predicate"
+        },
+        "predicates": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "$ref": "#/$defs/predicate"
+          }
+        },
+        "match": {
+          "enum": [
+            "all",
+            "any"
+          ]
+        },
+        "action": {
+          "$ref": "#/$defs/action"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "weight": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 10
+        },
+        "note": {
+          "$ref": "#/$defs/note"
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "condition"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "predicate"
+                ]
+              },
+              {
+                "required": [
+                  "predicates"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "required": [
+            "predicate"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "condition"
+                ]
+              },
+              {
+                "required": [
+                  "predicates"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "required": [
+            "predicates"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "condition"
+                ]
+              },
+              {
+                "required": [
+                  "predicate"
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "ruleRemoval": {
+      "description": "Removal of an existing rule: a copy from the getInboxRules answer as is, including an older compound rule with match and several conditions.",
+      "type": "object",
+      "required": [
+        "action"
+      ],
+      "properties": {
+        "condition": {
+          "$ref": "#/$defs/predicate"
+        },
+        "predicate": {
+          "$ref": "#/$defs/predicate"
+        },
+        "predicates": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 6,
+          "items": {
+            "$ref": "#/$defs/predicate"
+          }
+        },
+        "match": {
+          "enum": [
+            "all",
+            "any"
+          ]
+        },
+        "action": {
+          "$ref": "#/$defs/action"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "note": {
+          "$ref": "#/$defs/note"
+        }
+      },
+      "if": {
+        "required": [
+          "predicates"
+        ],
+        "properties": {
+          "predicates": {
+            "minItems": 2
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "match"
+        ]
+      },
+      "oneOf": [
+        {
+          "required": [
+            "condition"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "predicate"
+                ]
+              },
+              {
+                "required": [
+                  "predicates"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "required": [
+            "predicate"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "condition"
+                ]
+              },
+              {
+                "required": [
+                  "predicates"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "required": [
+            "predicates"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "condition"
+                ]
+              },
+              {
+                "required": [
+                  "predicate"
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

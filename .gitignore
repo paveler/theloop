@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.log
+.env
+.env.local
+.DS_Store
+
+# Private keys and local bundles never go into the repository.
+# certs/*.crt are PUBLIC root certificates of the Russian Trusted Root CA and are committed:
+# images are built from git, and GigaChat does not work without them.
+certs/*.pem
+certs/*.key

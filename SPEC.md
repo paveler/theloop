@@ -1,7 +1,8 @@
 # theloop — Specification
 
-> **Status:** v1.0 · `contract_version: "1"` · the contract is frozen.
-> Reference implementation: Node 22 + TypeScript, Hono, Vercel AI SDK 5. License: Apache 2.0.
+> **Status:** v1.0 · `contract_version: "1"` · the contract is frozen and implemented.
+> Reference implementation (this repository): Node 22 + TypeScript, Hono, Vercel AI SDK 5.
+> License: Apache 2.0.
 >
 > This document is normative for the HTTP contract, the message format and the loop
 > semantics. Whatever it does not describe is an implementation detail. Plans and
