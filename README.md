@@ -11,6 +11,8 @@ and executes.
 
 > Status: v1.0 — the contract is frozen ([SPEC.md](SPEC.md)) and implemented: Node 22,
 > TypeScript, Hono, Vercel AI SDK 5. Tests run without network or keys.
+> "1.0" is a promise about the contract (semver: no breaking changes within 1.x), not a claim
+> of operational maturity — the implementation is young; expect fixes, not contract changes.
 
 ## Why
 
@@ -19,8 +21,9 @@ and executes.
 - **One result, at-least-once.** Callback with retries, deduplication by `run_id`, results
   readable via `GET /runs/{id}` for recovery, late results placed by history revision.
 - **Writes are intents.** A tool with `effect: "write"` answers `deferred` with an operation
-  id; the mutation happens in your system after approval — never inside a tool call. A
-  prompt-injected model can ask, it cannot act.
+  id; the mutation happens in your system after approval — never inside a tool call. With
+  tools built that way, a prompt-injected model can request an action but cannot carry it
+  out — see [Trust model](#trust-model) for what that depends on.
 - **Usage you can bill.** Every provider attempt, including failed and interrupted ones, with
   uncached input, cache read / write and an explicit `estimated` flag. Optional cost from your
   price list, with token and cost budgets.
@@ -37,7 +40,7 @@ and executes.
 git clone https://github.com/paveler/theloop.git && cd theloop
 npm install
 cp .env.example .env      # set ENGINE_TOKEN and at least one provider key
-npm run dev               # http://localhost:8080
+npm run dev               # reads .env; http://localhost:8080 (Node 22.9+)
 ```
 
 One synchronous run (`wait: true`), with the Anthropic key taken from `ANTHROPIC_API_KEY`:
@@ -60,6 +63,30 @@ Docker:
 docker build -t theloop .
 docker run -p 8080:8080 --env-file .env theloop
 ```
+
+## Trust model
+
+The engine enforces what it can see; your tool endpoints carry the rest. The "a model can ask,
+not act" property holds only if all of the following are true:
+
+- **Write endpoints only register an intent** (SPEC §6.4): create or find an operation, answer
+  `deferred` with its id, change nothing. The engine flags a write tool that answers anything
+  else as `tool_protocol_error`, but it detects after the call — it cannot undo a mutation the
+  endpoint already made.
+- **Tools marked `read` really have no side effects.** The engine trusts `effect`: a mutating
+  tool labelled `read` is executed synchronously, with no `deferred` and no approval. This is
+  the easiest way to break the model.
+- **Approval and execution happen in your system**, with the operation version checked and the
+  operation id passed downstream as the idempotency key (§6.4).
+- **Tool endpoints scope data by `meta`** (tenant, user) from the engine call, never by ids in
+  `args` — the model can put any id there.
+- **Only trusted servers hold `ENGINE_TOKEN`**: whoever has it chooses prompts, tools and
+  endpoints. End-user clients get run-scoped tokens only.
+
+What the engine guarantees on its side: it never executes a mutation itself, it does not
+execute two calls of one write tool in one step, it refuses write tools without the context
+needed for idempotency (`write_context_missing`), it validates tool arguments before calling
+an endpoint, and all outbound requests go through the egress allowlist.
 
 ## How it fits
 

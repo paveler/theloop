@@ -26,7 +26,7 @@ Documents, in order of authority:
 ```bash
 npm install
 cp .env.example .env      # ENGINE_TOKEN + provider keys, only for dev / smoke
-npm run dev               # tsx watch, http://localhost:8080
+npm run dev               # tsx watch, reads .env, http://localhost:8080 (Node 22.9+)
 npm test                  # vitest — no network, no keys
 npm run typecheck         # src and tests
 npm run smoke             # live run against real providers (needs keys; never in CI)
@@ -135,5 +135,7 @@ The SPEC is authoritative; this is the short list of rules that are easy to brea
 - Commit messages: English, conventional prefix (`feat:`, `fix:`, `docs:`, `test:`,
   `chore:`), a subject that says what changed, a body that says why.
 - Releases are git tags `vX.Y.Z` on `main` (semver) with the matching `version` in
-  `package.json` — `/health` reports it. Downstream deployments consume tags, not `main`, so
-  `main` may move between releases but must stay green.
+  `package.json` — `/health` reports it. Pushing a tag runs `.github/workflows/release.yml`:
+  tests, then the image `ghcr.io/paveler/theloop:X.Y.Z`. Each release also gets a GitHub
+  Release with notes. Downstream deployments consume tags, not `main`, so `main` may move
+  between releases but must stay green.
