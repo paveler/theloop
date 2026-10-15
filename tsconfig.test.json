@@ -3,7 +3,15 @@
   "compilerOptions": {
     "noEmit": true,
     "rootDir": ".",
-    "types": ["node"]
+    "types": [
+      "node"
+    ]
   },
-  "include": ["src/**/*.ts", "test/**/*.ts", "scripts/**/*.ts", "vitest.config.ts"]
+  "include": [
+    "src/**/*.ts",
+    "test/**/*.ts",
+    "scripts/**/*.ts",
+    "examples/**/*.ts",
+    "vitest.config.ts"
+  ]
 }
