@@ -262,6 +262,7 @@ export function createEngine(
   /* -------------------------------------------------- GET /runs/id/stream */
 
   app.get('/runs/:id/stream', (c) => {
+    requireSomeCredential(c.req.header('authorization'), c.req.query('token'), config, RUN_AUTH_MESSAGE)
     const run = mustGetRun(registry, c.req.param('id'))
     authorizeRunAccess(c.req.header('authorization'), c.req.query('token'), run, config)
 
@@ -284,6 +285,7 @@ export function createEngine(
   /* -------------------------------------------------- POST /runs/id/cancel */
 
   app.post('/runs/:id/cancel', async (c) => {
+    requireSomeCredential(c.req.header('authorization'), c.req.query('token'), config, RUN_AUTH_MESSAGE)
     const run = mustGetRun(registry, c.req.param('id'))
     const auth = authorizeRunAccess(c.req.header('authorization'), c.req.query('token'), run, config)
 
@@ -312,6 +314,7 @@ export function createEngine(
   /* --------------------------------------------- POST /runs/id/tool-result */
 
   app.post('/runs/:id/tool-result', async (c) => {
+    requireSomeCredential(c.req.header('authorization'), c.req.query('token'), config, CALL_AUTH_MESSAGE)
     const id = c.req.param('id')
     const run = id ? registry.get(id) : undefined
     // run deleted or call_id unknown — both are 404 call_not_found (SPEC §4.5)
@@ -321,7 +324,7 @@ export function createEngine(
     const byEngine = bearer != null && matchesEngineToken(bearer, config)
     if (!byEngine) {
       if (!token || !registry.callByToken(run, token)) {
-        throw new EngineError('unauthorized', 'requires the per-call token from result_url or Bearer')
+        throw new EngineError('unauthorized', CALL_AUTH_MESSAGE)
       }
     }
 
@@ -536,6 +539,23 @@ function requireEngineToken(header: string | undefined, config: Config): void {
 
 type RunAuth = 'engine' | 'run-token'
 
+const RUN_AUTH_MESSAGE = 'requires a run token or Bearer <ENGINE_TOKEN>'
+const CALL_AUTH_MESSAGE = 'requires the per-call token from result_url or Bearer'
+
+/**
+ * No credential at all → 401 before the run lookup: otherwise 404 vs 401 would tell an
+ * anonymous caller whether a run exists. A token is checked against the run after the lookup.
+ */
+function requireSomeCredential(
+  header: string | undefined,
+  token: string | undefined,
+  config: Config,
+  message: string,
+): void {
+  if (token || matchesEngineToken(header, config)) return
+  throw new EngineError('unauthorized', message)
+}
+
 function authorizeRunAccess(
   header: string | undefined,
   token: string | undefined,
@@ -544,7 +564,7 @@ function authorizeRunAccess(
 ): RunAuth {
   if (matchesEngineToken(header, config)) return 'engine'
   if (token && timingSafeEqualStr(run.token, token)) return 'run-token'
-  throw new EngineError('unauthorized', 'requires a run token or Bearer <ENGINE_TOKEN>')
+  throw new EngineError('unauthorized', RUN_AUTH_MESSAGE)
 }
 
 /**

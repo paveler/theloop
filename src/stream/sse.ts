@@ -78,7 +78,7 @@ export class SseHub {
     if (this.closed) return this.lastId
     const id = this.nextId++
     const payload = JSON.stringify(data)
-    const stored: StoredEvent = { id, event, data: payload, bytes: payload.length + 32 }
+    const stored: StoredEvent = { id, event, data: payload, bytes: Buffer.byteLength(payload, 'utf8') + 32 }
 
     this.applyToSnapshot(event, data)
 

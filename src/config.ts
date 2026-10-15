@@ -1,6 +1,6 @@
 /**
  * Configuration from env (SPEC §14). Values are read once at startup;
- * tests build their own Config via createConfig(overrides) and pass it to createApp.
+ * tests build their own Config via createConfig(env) and pass it to createEngine.
  */
 import { PROVIDER_IDS, type ProviderId } from './contracts.js'
 import { DEFAULT_LOCALE, isLocale, LOCALES, type Locale } from './i18n.js'

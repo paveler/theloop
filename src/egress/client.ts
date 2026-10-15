@@ -22,7 +22,7 @@ import { EngineError } from '../errors.js'
 import { log, safeUrl } from '../log.js'
 import { isLocalHostname, isPrivateAddress } from './ip.js'
 
-/** Headers the engine lets out (SPEC §11.4). */
+/** X-* headers the engine never lets out, although the X- prefix is otherwise allowed (SPEC §11.4). */
 const HEADER_DENY = [/^x-forwarded-/i, /^x-original-/i, /^x-real-ip$/i, /^x-http-method-override$/i]
 
 export function filterEgressHeaders(

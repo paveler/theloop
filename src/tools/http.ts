@@ -93,6 +93,11 @@ export async function callTool(
       }
       if (ctx.signal.aborted) return { kind: 'error', error: 'cancelled', status: 'error' }
       lastError = describeNetworkError(err)
+      // a private address is a deterministic refusal (SPEC §11.4): a retry would get the same answer
+      if (lastError === 'egress_denied') {
+        log.warn('tool_http', { ...ids, attempt, duration_ms: durationMs, error: 'egress_denied: private address' })
+        return { kind: 'error', error: 'egress_denied: private address', status: 'http_error' }
+      }
       const retry = canRetry && lastError !== 'tool_timeout'
       log.warn('tool_http', { ...ids, attempt, duration_ms: durationMs, error: lastError, retry })
       if (lastError === 'tool_timeout') {
@@ -241,11 +246,23 @@ export class ToolWaitTimeout extends Error {
 
 function describeNetworkError(err: unknown): string {
   const message = err instanceof Error ? err.message : String(err)
-  if (/egress_timeout|timeout|UND_ERR_(HEADERS|BODY)_TIMEOUT/i.test(message)) return 'tool_timeout'
-  if (/EGRESS_PRIVATE_IP/i.test(message)) return 'egress_denied'
   const code = (err as { cause?: { code?: string }; code?: string })?.cause?.code ??
     (err as { code?: string })?.code
+  // fetch wraps the lookup error two or three levels deep ("fetch failed" → connect error →
+  // our error), so the private-address code is looked up along the whole cause chain
+  if (causeCodes(err).includes('EGRESS_PRIVATE_IP')) return 'egress_denied'
+  if (/egress_timeout|timeout|UND_ERR_(HEADERS|BODY)_TIMEOUT/i.test(message)) return 'tool_timeout'
   return code ? `tool_network_${code}` : 'tool_network_error'
+}
+
+function causeCodes(err: unknown): string[] {
+  const codes: string[] = []
+  for (let e = err, depth = 0; e != null && depth < 6; depth++) {
+    const code = (e as { code?: unknown }).code
+    if (typeof code === 'string') codes.push(code)
+    e = (e as { cause?: unknown }).cause
+  }
+  return codes
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {

@@ -337,7 +337,8 @@ export class RunRegistry {
     call.deliveredResult = null
     if (call.waiter) {
       clearTimeout(call.waiter.timer)
-      call.waiter.reject(new ToolWaitTimeout())
+      // the run went terminal while the call was waiting: it is cancelled, not timed out (SPEC §6.5)
+      call.waiter.reject(new Error('call_closed'))
       call.waiter = null
     }
     if (call.state === 'open') call.state = 'closed'
@@ -360,6 +361,7 @@ export class RunRegistry {
     }
     return new Promise<AsyncToolResult>((resolve, reject) => {
       const timer = setTimeout(() => {
+        signal.removeEventListener('abort', onAbort)
         call.waiter = null
         call.state = 'closed'
         reject(new ToolWaitTimeout())

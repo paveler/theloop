@@ -233,7 +233,9 @@ maximum size of any incoming request body is `MAX_REQUEST_BYTES` (env, default 1
   from the `POST /runs` response, valid until the run is deleted, scoped to that run
   only. Passed as `?token=` (EventSource cannot set headers). Responses to `?token=`
   requests carry `Cache-Control: no-store` and `Referrer-Policy: no-referrer`; the
-  access log strips query strings.
+  access log strips query strings. A request to a run route with no credential at all
+  (no `ENGINE_TOKEN`, no token) gets `401` before the run is looked up, so an anonymous
+  caller cannot tell whether a run exists.
 - **Async tool → engine** (`tool-result`): a per-call token embedded in `result_url`
   (§6.1). `ENGINE_TOKEN` is accepted too.
 - **Engine → tools / callback / provider**: controlled egress (§11.4): HTTPS only,
@@ -766,6 +768,7 @@ be a new one. Business idempotency of mutations lives in the harness, on `operat
 | `2xx` any other body | the whole body = `result` (endpoints are not forced to wrap) |
 | network / 5xx | retried ×2 with the same `call_id` (1 s, 3 s), then a tool error |
 | 4xx | tool error, no retry |
+| egress refused (host not in the allowlist, a private address after DNS, §11.4) | tool error `egress_denied: …`, no retry — the answer is deterministic |
 | timeout (including waiting for `accepted`) | `tool_timeout` → tool error |
 | a write tool answered anything but `deferred` | `tool_protocol_error` → tool error, endpoint logged |
 
