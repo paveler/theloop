@@ -62,12 +62,13 @@ harness on SQLite with no dependencies — history, a read tool, a write tool wi
 continuation of the conversation, recovery — and a chat in the terminal:
 `npm run example:sqlite`.
 
-Docker:
+Docker, without cloning — images are published on every release:
 
 ```bash
-docker build -t theloop .
-docker run -p 8080:8080 --env-file .env theloop
+docker run -p 8080:8080 -e ENGINE_TOKEN=change-me -e ANTHROPIC_API_KEY=sk-ant-… ghcr.io/paveler/theloop:1
 ```
+
+Or build your own: `docker build -t theloop . && docker run -p 8080:8080 --env-file .env theloop`.
 
 ## Trust model
 
