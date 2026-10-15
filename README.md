@@ -9,8 +9,8 @@ Built for teams that ship assistants to many users: multi-tenant by construction
 keys, one usage record per provider attempt, write tools as intents that your system approves
 and executes.
 
-> Status: the v1 contract is frozen ([SPEC.md](SPEC.md)). The reference implementation
-> (Node 22, TypeScript, Hono, Vercel AI SDK 5) is being prepared for publication.
+> Status: v1.0 — the contract is frozen ([SPEC.md](SPEC.md)) and implemented: Node 22,
+> TypeScript, Hono, Vercel AI SDK 5. Tests run without network or keys.
 
 ## Why
 
@@ -31,6 +31,36 @@ and executes.
 - **Debuggable.** An in-memory event journal per run and session (`GET /logs`), with content,
   without shipping prompts to your log pipeline.
 
+## Quickstart
+
+```bash
+git clone https://github.com/paveler/theloop.git && cd theloop
+npm install
+cp .env.example .env      # set ENGINE_TOKEN and at least one provider key
+npm run dev               # http://localhost:8080
+```
+
+One synchronous run (`wait: true`), with the Anthropic key taken from `ANTHROPIC_API_KEY`:
+
+```bash
+curl -s http://localhost:8080/runs \
+  -H "Authorization: Bearer $ENGINE_TOKEN" -H 'Content-Type: application/json' \
+  -d '{ "contract_version": "1",
+        "llm": { "provider": "anthropic", "model": "claude-sonnet-5" },
+        "messages": [ { "role": "user", "content": [ { "type": "text", "text": "Hello!" } ] } ],
+        "wait": true }'
+```
+
+Without `wait`, the response carries `stream_url` (SSE) and `cancel_url`, and the result goes to
+`callback.url`. Tools, write intents, limits and everything else — [SPEC.md](SPEC.md).
+
+Docker:
+
+```bash
+docker build -t theloop .
+docker run -p 8080:8080 --env-file .env theloop
+```
+
 ## How it fits
 
 ```
@@ -44,6 +74,44 @@ end-user client ── SSE, cancel (run token) ──► theloop ◄── POST 
 The **harness** is your backend (or a low-code platform, or a workflow tool): it stores
 history, assistants, tools and operations, and owns approvals and billing. Its obligations
 are listed in [SPEC.md, Appendix A](SPEC.md#appendix-a-harness-obligations).
+
+## Code map
+
+```
+src/
+  index.ts              entry point: env → engine → HTTP, SIGTERM
+  app.ts                Hono routes, CORS, auth, body limit, graceful shutdown
+  config.ts             env (SPEC §14)
+  contracts.ts          zod: RunRequest, StoredMessage, ToolResponse, RunResult
+  errors.ts             error codes and their HTTP statuses (§12.1)
+  i18n.ts               engine-injected text, en / ru (Appendix B)
+  log.ts, log-buffer.ts structured events; the in-memory journal for GET /logs (§12.4)
+  alerts.ts             error webhook (§12.3)
+  runs/registry.ts      in-memory runs: status, SSE buffer, tokens, session lock, idempotency
+  runs/runner.ts        the loop, step by step: one streamText per step → finish-step →
+                        limits → tools → next step
+  runs/provider.ts      one provider attempt, error classification
+  runs/messages.ts      StoredMessage ↔ ModelMessage, context estimate and trimming, dates
+  runs/output-checks.ts the format gate for fenced blocks (§5.4)
+  runs/usage.ts         attempts ok / failed / unknown, normalization, cost, budgets
+  runs/callback.ts      at-least-once result delivery
+  runs/validate.ts      request validation
+  runs/images.ts        image validation and download through egress
+  tools/http.ts         tool calls: ok / error / accepted / deferred, effect control, retries
+  tools/args.ts         conservative argument validation against input_schema
+  egress/               the single outbound HTTP client: allowlist, private IPs, no redirects
+  stream/sse.ts         SSE with replay, snapshot, gap, backpressure
+  providers/            allowlist, model factory, GigaChat OAuth and translator, per-key queue
+```
+
+## Development
+
+```bash
+npm test                  # vitest, no network, no keys
+npm run typecheck
+npm run smoke             # live run against real providers, keys from .env (not in CI)
+npm run build && npm start
+```
 
 ## Documents
 

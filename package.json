@@ -1,0 +1,48 @@
+{
+  "name": "theloop",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The agent loop as a stateless HTTP service. See SPEC.md.",
+  "license": "Apache-2.0",
+  "author": "Pavel Ershov",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/paveler/theloop.git"
+  },
+  "homepage": "https://github.com/paveler/theloop#readme",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "smoke": "tsx scripts/smoke.ts",
+    "sse-check": "tsx scripts/sse-check.ts",
+    "smoke:gigachat": "awk 1 certs/*.crt > certs/russian_bundle.pem && NODE_EXTRA_CA_CERTS=certs/russian_bundle.pem tsx scripts/smoke.ts gigachat",
+    "spike:reasoning": "tsx scripts/spike-reasoning.ts"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "^2.0.0",
+    "@ai-sdk/openai-compatible": "^1.0.0",
+    "@hono/node-server": "^1.13.0",
+    "ai": "^5.0.0",
+    "ajv": "^8.20.0",
+    "ajv-i18n": "^4.2.0",
+    "hono": "^4.6.0",
+    "pino": "^10.3.1",
+    "undici": "^7.29.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "msw": "^2.15.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^5.0.0"
+  }
+}

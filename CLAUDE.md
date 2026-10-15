@@ -10,6 +10,21 @@ usage go out by callback, and the engine forgets the run. Backend only, no UI.
 contract). Before any task, read the relevant SPEC section. A change to the API, the message
 format or status semantics updates `SPEC.md` in the same branch.
 
+## Commands
+
+```bash
+npm install
+cp .env.example .env      # ENGINE_TOKEN + provider keys
+npm run dev               # tsx watch, :8080
+npm test                  # vitest, no network, no keys
+npm run typecheck
+npm run smoke             # live run with keys from .env
+npm run build && npm start
+```
+
+CI (`.github/workflows/check.yml`) runs typecheck and tests on every PR and on `main`. Merge on
+green only. The code map is in README.md.
+
 ## This repository is public
 
 - English everywhere: code, comments, docs, commit messages, PR descriptions.

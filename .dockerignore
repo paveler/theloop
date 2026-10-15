@@ -1,0 +1,12 @@
+node_modules
+dist
+.git
+.env
+.env.local
+*.log
+npm-debug.log*
+certs/*.pem
+certs/README.md
+test
+docs
+scripts
