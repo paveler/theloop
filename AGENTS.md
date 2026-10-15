@@ -126,6 +126,9 @@ The SPEC is authoritative; this is the short list of rules that are easy to brea
 - Default engine locale is `en` and default time zone `UTC`; tests about other locales or
   zones set them explicitly (`meta.locale`, `meta.timezone`).
 - Format-gate fixtures are synthetic (`test/fixtures/rule-card.*`); keep them neutral.
+- `examples/` are part of the suite (`test/example-*.test.ts`) and of typecheck: a contract
+  change that breaks an example is fixed in the example in the same PR. Keep examples free of
+  dependencies beyond Node itself.
 
 ## Changes, commits, releases
 

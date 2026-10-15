@@ -57,6 +57,11 @@ curl -s http://localhost:8080/runs \
 Without `wait`, the response carries `stream_url` (SSE) and `cancel_url`, and the result goes to
 `callback.url`. Tools, write intents, limits and everything else — [SPEC.md](SPEC.md).
 
+**Next: a whole integration.** [`examples/sqlite-harness`](examples/sqlite-harness) is a complete
+harness on SQLite with no dependencies — history, a read tool, a write tool with approval, the
+continuation of the conversation, recovery — and a chat in the terminal:
+`npm run example:sqlite`.
+
 Docker:
 
 ```bash
@@ -145,6 +150,8 @@ npm run build && npm start
 - [SPEC.md](SPEC.md) — the contract: API, message format, loop semantics, limits, reliability.
 - [ROADMAP.md](ROADMAP.md) — proposals: MCP, more providers, skills, compaction, sub-runs, a
   reference harness with channels and memory.
+- [examples/sqlite-harness](examples/sqlite-harness) — a complete harness: what your backend does
+  around the engine, obligation by obligation.
 - [AGENTS.md](AGENTS.md) — how to work on the code: commands, architecture rules, conventions,
   tests, releases. Written for AI coding agents; a good short version for contributors too.
 
