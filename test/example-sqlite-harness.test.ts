@@ -99,10 +99,12 @@ describe('example harness: the whole path', () => {
     expect(store.history(SESSION)[6]).toMatchObject({ call_id: 'c2', operation_id: op!.id, result: { refunded: 120 } })
     expect(store.session(SESSION, USER).state).toBe('idle')
 
-    // every result reached the harness by callback, and the 2xx was the ack (SPEC §3.1)
+    // every result reached the harness by callback, and the 2xx was the ack (SPEC §3.1). The
+    // harness records the result before it answers, the engine marks the ack once the 2xx
+    // arrives — so the engine side is awaited, not asserted at once
     for (const runId of [first.runId, second.runId, next!.runId]) {
       expect(store.run(runId)!.acked).toBe(true)
-      expect(engine.deps.registry.get(runId)!.acked).toBe(true)
+      await waitFor(() => engine.deps.registry.get(runId)!.acked)
     }
   })
 
