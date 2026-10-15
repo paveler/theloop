@@ -10,3 +10,6 @@ dist/
 # images are built from git, and GigaChat does not work without them.
 certs/*.pem
 certs/*.key
+
+# example harness state (examples/sqlite-harness)
+*.db
