@@ -1,18 +1,68 @@
-# theloop
+<p align="center">
+  <a href="https://theloopengine.com">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset=".github/assets/banner-dark.png">
+      <img alt="theloop: an agent loop with excellent amnesia. POST /runs, model, tools, model, forget." src=".github/assets/banner-light.png" width="880">
+    </picture>
+  </a>
+</p>
 
-**The agent loop as a stateless HTTP service.** One `POST /runs` is one run. The request
-carries everything: provider, model, key, prompt, full history, tools (URL + schema), limits.
-theloop runs "model → tools → model", streams text over SSE, delivers the result and
+<p align="center">
+  <b>The agent loop as a stateless HTTP service.</b><br>
+  One <code>POST /runs</code> is one run: model → tools → model, streamed, billed per attempt, then forgotten.
+</p>
+
+<p align="center">
+  <a href="https://github.com/paveler/theloop/actions/workflows/check.yml"><img alt="Check" src="https://github.com/paveler/theloop/actions/workflows/check.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/paveler/theloop/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/paveler/theloop?label=release&color=3f6bff"></a>
+  <a href="LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/license-Apache%202.0-17150f"></a>
+  <img alt="Node 22.9+" src="https://img.shields.io/badge/node-22.9%2B-17150f">
+  <a href="https://github.com/paveler/theloop/pkgs/container/theloop"><img alt="Docker image on GHCR" src="https://img.shields.io/badge/docker-ghcr.io%2Fpaveler%2Ftheloop-3f6bff"></a>
+</p>
+
+<p align="center">
+  <a href="https://theloopengine.com"><b>Website</b></a> ·
+  <a href="#quickstart"><b>Quickstart</b></a> ·
+  <a href="SPEC.md"><b>SPEC</b></a> ·
+  <a href="#trust-model"><b>Trust model</b></a> ·
+  <a href="examples/sqlite-harness"><b>Example harness</b></a> ·
+  <a href="ROADMAP.md"><b>Roadmap</b></a>
+</p>
+
+---
+
+The request carries everything: provider, model, key, prompt, full history, tools (URL + schema),
+limits. theloop runs "model → tools → model", streams text over SSE, delivers the result and
 billing-grade usage by callback — and forgets the run.
 
 Built for teams that ship assistants to many users: multi-tenant by construction, per-request
 keys, one usage record per provider attempt, write tools as intents that your system approves
 and executes.
 
-> Status: v1.0 — the contract is frozen ([SPEC.md](SPEC.md)) and implemented: Node 22,
+> [!NOTE]
+> **Status: v1.0** — the contract is frozen ([SPEC.md](SPEC.md)) and implemented: Node 22,
 > TypeScript, Hono, Vercel AI SDK 5. Tests run without network or keys.
 > "1.0" is a promise about the contract (semver: no breaking changes within 1.x), not a claim
 > of operational maturity — the implementation is young; expect fixes, not contract changes.
+
+## One run, the whole story
+
+With the engine running ([Quickstart](#quickstart)), one synchronous run (`wait: true`), with the
+Anthropic key taken from `ANTHROPIC_API_KEY`:
+
+```bash
+curl -s http://localhost:8080/runs \
+  -H "Authorization: Bearer $ENGINE_TOKEN" -H 'Content-Type: application/json' \
+  -d '{ "contract_version": "1",
+        "llm": { "provider": "anthropic", "model": "claude-sonnet-5" },
+        "messages": [ { "role": "user", "content": [ { "type": "text", "text": "Hello!" } ] } ],
+        "wait": true }'
+```
+
+The answer is a synchronous `200` with the result body, usage included. No database was harmed.
+Without `wait`, the response
+carries `stream_url` (SSE) and `cancel_url`, and the result goes to `callback.url`. Tools, write
+intents, limits and everything else — [SPEC.md](SPEC.md).
 
 ## Why
 
@@ -36,33 +86,16 @@ and executes.
 
 ## Quickstart
 
+**From source** (Node 22.9+):
+
 ```bash
 git clone https://github.com/paveler/theloop.git && cd theloop
 npm install
 cp .env.example .env      # set ENGINE_TOKEN and at least one provider key
-npm run dev               # reads .env; http://localhost:8080 (Node 22.9+)
+npm run dev               # reads .env; http://localhost:8080
 ```
 
-One synchronous run (`wait: true`), with the Anthropic key taken from `ANTHROPIC_API_KEY`:
-
-```bash
-curl -s http://localhost:8080/runs \
-  -H "Authorization: Bearer $ENGINE_TOKEN" -H 'Content-Type: application/json' \
-  -d '{ "contract_version": "1",
-        "llm": { "provider": "anthropic", "model": "claude-sonnet-5" },
-        "messages": [ { "role": "user", "content": [ { "type": "text", "text": "Hello!" } ] } ],
-        "wait": true }'
-```
-
-Without `wait`, the response carries `stream_url` (SSE) and `cancel_url`, and the result goes to
-`callback.url`. Tools, write intents, limits and everything else — [SPEC.md](SPEC.md).
-
-**Next: a whole integration.** [`examples/sqlite-harness`](examples/sqlite-harness) is a complete
-harness on SQLite with no dependencies — history, a read tool, a write tool with approval, the
-continuation of the conversation, recovery — and a chat in the terminal:
-`npm run example:sqlite`.
-
-Docker, without cloning — images are published on every release:
+**Docker, without cloning** — images are published on every release:
 
 ```bash
 docker run -p 8080:8080 -e ENGINE_TOKEN=change-me -e ANTHROPIC_API_KEY=sk-ant-… ghcr.io/paveler/theloop:1
@@ -70,10 +103,19 @@ docker run -p 8080:8080 -e ENGINE_TOKEN=change-me -e ANTHROPIC_API_KEY=sk-ant-�
 
 Or build your own: `docker build -t theloop . && docker run -p 8080:8080 --env-file .env theloop`.
 
+Then send the run from [One run, the whole story](#one-run-the-whole-story).
+
+**Next: a whole integration.** [`examples/sqlite-harness`](examples/sqlite-harness) is a complete
+harness on SQLite with no dependencies — history, a read tool, a write tool with approval, the
+continuation of the conversation, recovery — and a chat in the terminal:
+`npm run example:sqlite`.
+
 ## Trust model
 
-The engine enforces what it can see; your tool endpoints carry the rest. The "a model can ask,
-not act" property holds only if all of the following are true:
+A model can ask. It can't act. The engine enforces what it can see; your tool endpoints carry
+the rest. The "a model can ask, not act" property holds only if all of the following are true.
+
+**What you guarantee**
 
 - **Write endpoints only register an intent** (SPEC §6.4): create or find an operation, answer
   `deferred` with its id, change nothing. The engine flags a write tool that answers anything
@@ -89,19 +131,22 @@ not act" property holds only if all of the following are true:
 - **Only trusted servers hold `ENGINE_TOKEN`**: whoever has it chooses prompts, tools and
   endpoints. End-user clients get run-scoped tokens only.
 
-What the engine guarantees on its side: it never executes a mutation itself, it does not
-execute two calls of one write tool in one step, it refuses write tools without the context
-needed for idempotency (`write_context_missing`), it validates tool arguments before calling
-an endpoint, and all outbound requests go through the egress allowlist.
+**What the engine guarantees**
+
+- It never executes a mutation itself.
+- It does not execute two calls of one write tool in one step.
+- It refuses write tools without the context needed for idempotency (`write_context_missing`).
+- It validates tool arguments before calling an endpoint.
+- All outbound requests go through the egress allowlist.
 
 ## How it fits
 
-```
-end-user client ── SSE, cancel (run token) ──► theloop ◄── POST /runs, GET, ack ── your harness
-                                               │     │                               ▲
-                                    tool calls │     └── callback: result + usage ───┘
-                                               ▼
-                                     your tool endpoints
+```mermaid
+flowchart LR
+    client["End-user client"] -- "SSE, cancel<br/>(run token)" --> engine(["theloop"])
+    harness["Your harness"] -- "POST /runs, GET, ack" --> engine
+    engine -- "tool calls" --> tools["Your tool endpoints"]
+    engine -. "callback:<br/>result + usage" .-> harness
 ```
 
 The **harness** is your backend (or a low-code platform, or a workflow tool): it stores
@@ -109,6 +154,9 @@ history, assistants, tools and operations, and owns approvals and billing. Its o
 are listed in [SPEC.md, Appendix A](SPEC.md#appendix-a-harness-obligations).
 
 ## Code map
+
+<details>
+<summary>Where everything lives in <code>src/</code></summary>
 
 ```
 src/
@@ -137,6 +185,8 @@ src/
   providers/            allowlist, model factory, GigaChat OAuth and translator, per-key queue
 ```
 
+</details>
+
 ## Development
 
 ```bash
@@ -159,3 +209,7 @@ npm run build && npm start
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+---
+
+<p align="center"><sub>It forgets. You don't have to. · <a href="https://theloopengine.com">theloopengine.com</a></sub></p>
