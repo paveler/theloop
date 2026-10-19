@@ -25,6 +25,7 @@
   <a href="#quickstart"><b>Quickstart</b></a> ·
   <a href="SPEC.md"><b>SPEC</b></a> ·
   <a href="#trust-model"><b>Trust model</b></a> ·
+  <a href="#how-it-compares"><b>Compare</b></a> ·
   <a href="examples/sqlite-harness"><b>Example harness</b></a> ·
   <a href="ROADMAP.md"><b>Roadmap</b></a>
 </p>
@@ -152,6 +153,25 @@ flowchart LR
 The **harness** is your backend (or a low-code platform, or a workflow tool): it stores
 history, assistants, tools and operations, and owns approvals and billing. Its obligations
 are listed in [SPEC.md, Appendix A](SPEC.md#appendix-a-harness-obligations).
+
+## How it compares
+
+Most agent tools solve a neighbouring problem, not this one. Each link is a two-minute page that
+also says where the other tool wins.
+
+| Tool | What it is | Pick it when… | Full comparison |
+|---|---|---|---|
+| **LangChain** | A framework you build into a Python or JS app | the agent should live inside your code, with RAG and a big ecosystem | [vs LangChain](https://theloopengine.com/vs/langchain/) |
+| **LangGraph** | Agents as graphs, every step checkpointed | long, branching workflows must resume mid-step after a crash | [vs LangGraph](https://theloopengine.com/vs/langgraph/) |
+| **OpenAI Responses / Agents API** | OpenAI's hosted loop; conversations stored by default | you're all-in on OpenAI and want hosted web search or code interpreter | [vs OpenAI](https://theloopengine.com/vs/openai/) |
+| **Vercel AI SDK** | A TypeScript library with an in-process tool loop — theloop is built on it | your backend is TypeScript and serves a single tenant | [vs AI SDK](https://theloopengine.com/vs/ai-sdk/) |
+| **LiteLLM** | A gateway in front of 100+ model providers | you need central keys, budgets and fallbacks for model calls — it can also sit behind theloop's `openai-compatible` provider | [vs LiteLLM](https://theloopengine.com/vs/litellm/) |
+| **n8n** | A visual workflow builder with AI nodes | you automate your own team's work on a canvas | [vs n8n](https://theloopengine.com/vs/n8n/) |
+
+**Pick theloop when** the assistant ships inside your product to many customers, your backend
+already owns the data, any language or low-code platform should drive it over HTTP, writes must
+wait for your approval, and usage must be billable per attempt. All comparisons:
+[theloopengine.com/vs](https://theloopengine.com/vs/).
 
 ## Code map
 
