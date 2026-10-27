@@ -4,7 +4,7 @@ All notable changes to theloop. The contract is versioned separately (`contract_
 [SPEC.md](SPEC.md)); every change below is additive to it. Releases follow semver: no breaking
 changes within 1.x.
 
-## Unreleased
+## v1.1.2 — 2026-10-27
 
 No breaking contract changes. SPEC §6.5 now spells out the cancelled deferred call, and
 Appendix A gains H21.
@@ -28,6 +28,19 @@ Appendix A gains H21.
 - **Prompt estimate and date lines** (SPEC §5.1, §9.4). The per-message date lines from
   `created_at` were added to the prompt after the estimate, so trimming and
   `max_total_tokens` ran on a smaller number than the prompt actually sent.
+
+### Example harness
+
+- **A new amount updates the pending operation** (SPEC §6.4). "Refund 60 instead of 120"
+  created a second operation and left the card for 120 confirmable. The pending comparison
+  now matches by the subject (the order); a changed amount updates the operation and bumps
+  its version.
+- **A callback before the `POST /runs` response** is recorded and applied once the run row
+  exists; it used to be lost until recovery.
+- **An operation that is already closed** (rejected at registration, executed before a
+  replay) continues the conversation at once instead of leaving the session in
+  `awaiting_tool`.
+- **H21:** a deferred call closed by `cancel` cancels its operation.
 
 ### Security
 
