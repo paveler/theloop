@@ -598,10 +598,12 @@ describe('search_tools (SPEC §6.8)', () => {
 
     expect(toolOutputs(model, 0)[0]).toEqual({
       type: 'content',
-      value: [
-        { type: 'custom', providerOptions: { anthropic: { type: 'tool-reference', toolName: 'exportReport' } } },
-        { type: 'text', text: '[engine] Tools available from the next step: exportReport, goneTool.' },
-      ],
+      value: [{ type: 'custom', providerOptions: { anthropic: { type: 'tool-reference', toolName: 'exportReport' } } }],
+    })
+    const prompt = model.doStreamCalls[0]!.prompt
+    expect(prompt[prompt.findIndex((m) => m.role === 'tool') + 1]).toMatchObject({
+      role: 'user',
+      content: [{ type: 'text', text: '[engine] Tools available from the next step: exportReport, goneTool.' }],
     })
     const restored = (await journal(engine, result.run_id)).find((e) => e.event === 'skills_restored')
     expect(restored).toMatchObject({ skills: [], tools: ['exportReport'] })
