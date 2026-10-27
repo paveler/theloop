@@ -28,6 +28,8 @@ export interface ResolvedModel {
   honorsToolChoiceNone: boolean
   /** The model accepts temperature / top_p; if not, they are not sent to the provider (SPEC §9.3). */
   acceptsSampling: boolean
+  /** Anthropic tool search: deferred tools activate through tool_reference (SPEC §6.8, §9.2). */
+  toolReferences: boolean
   /** The provider's cache session header; the runner sets the value (SPEC §9.1). */
   sessionHeader?: string
   /** providerOptions for streamText (thinking and the like). */
@@ -67,6 +69,18 @@ const NEW_CLAUDE =
 
 export function isNewClaude(model: string): boolean {
   return NEW_CLAUDE.test(model)
+}
+
+/**
+ * Claude models with tool search (SPEC §9.2): the model table of the tool search docs —
+ * Opus / Sonnet / Haiku 4.5 and later, every Fable and Mythos — with later versions of the
+ * same lines matched in advance, like NEW_CLAUDE. MiniMax uses the Anthropic adapter but
+ * its API has no defer_loading.
+ */
+const TOOL_REFERENCE_CLAUDE = /^claude-(fable|mythos)-|^claude-(opus|sonnet|haiku)-(4-[5-9]|[5-9]|\d{2,})/i
+
+export function supportsToolReferences(provider: string, model: string): boolean {
+  return provider === 'anthropic' && TOOL_REFERENCE_CLAUDE.test(model)
 }
 
 /**
@@ -201,6 +215,7 @@ export function buildModel(llm: Llm, config: Config, egress: EgressClient): Reso
     supportsCacheControl: entry.kind === 'anthropic',
     honorsToolChoiceNone: entry.honorsToolChoiceNone,
     acceptsSampling,
+    toolReferences: supportsToolReferences(llm.provider, llm.model),
     ...(entry.sessionHeader ? { sessionHeader: entry.sessionHeader } : {}),
     providerOptions,
     throttleKey,

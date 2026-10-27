@@ -101,12 +101,8 @@ todo lists. Synchronous answers allowed; the endpoint MUST be idempotent by `cal
 approval; no effects outside the agent. Today such tools must either pretend to be `read` or
 pay the full `deferred` round trip. — **S**
 
-**2.2 Skills on demand.** `skills[]` in the request: `{ name, description, body }`, compatible
-with the `SKILL.md` format. The engine puts an index (name + description) into the static part
-of the prompt and exposes a built-in `load_skill` tool that returns the body — no network, no
-code execution. All tools are still declared up front: adding tools mid-run would reset the
-prompt cache. Skills come from the harness, which is trusted, so the kernel has no
-supply-chain surface. — **M**
+**2.2 Skills on demand.** Moved to [RFC 0001](docs/rfcs/0001-skills-and-deferred-tools.md):
+`skills[]`, `defer_loading` and `load_skill` in v1.3.0 (SPEC §6.8), `search_tools` next.
 
 **2.3 Compaction as a call.** `POST /compact`: the engine summarizes a history prefix by a
 prompt from the request and returns `{ summary_message, replaces_through_seq }`. The harness

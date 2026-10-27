@@ -111,6 +111,7 @@ export function mockFactory(
     supportsCacheControl: false,
     honorsToolChoiceNone: true,
     acceptsSampling: true,
+    toolReferences: false,
     providerOptions: {},
     throttleKey: { provider: 'anthropic', hash: 'test-key-hash' },
     ...overrides,

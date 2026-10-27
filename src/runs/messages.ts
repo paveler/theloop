@@ -13,7 +13,7 @@ import type {
   ToolResultPart,
   UserModelMessage,
 } from '@ai-sdk/provider-utils'
-import type { StoredMessage, ToolDef } from '../contracts.js'
+import type { StoredMessage, ToolMessage } from '../contracts.js'
 import { EngineError } from '../errors.js'
 import { sdkKeyFor } from '../providers/allowlist.js'
 import { texts, type Texts } from '../i18n.js'
@@ -61,7 +61,9 @@ export function estimateMessageTokens(message: StoredMessage): number {
   return sum
 }
 
-export function estimateToolSchemaTokens(tools: readonly ToolDef[]): number {
+export function estimateToolSchemaTokens(
+  tools: ReadonlyArray<{ name: string; description?: string; input_schema: unknown }>,
+): number {
   let sum = 0
   for (const tool of tools) {
     sum += estimateTokens(tool.name) + estimateTokens(tool.description ?? '')
@@ -125,6 +127,8 @@ export interface TrimInput {
   /** Reserved for the model's answer. */
   reserveTokens: number
   contextWindow: number
+  /** A block that must never be dropped: an activation in effect (SPEC §6.8). */
+  pinned?: (block: readonly StoredMessage[]) => boolean
 }
 
 export interface TrimResult {
@@ -188,7 +192,7 @@ export function trimHistory(input: TrimInput): TrimResult {
     block.some((m) => {
       const idx = indexOf.get(m)!
       return idx === firstUserIndex || idx >= keepTailFrom
-    })
+    }) || input.pinned?.(block) === true
 
   const alive = blocks.map((b) => ({ block: b, dropped: false }))
   let trimmed = false
@@ -228,6 +232,11 @@ export interface ConvertOptions {
   cacheBreakpoints?: boolean
   /** Engine texts in the run locale (SPEC Appendix B); absent — the default locale. */
   texts?: Texts
+  /**
+   * Built-in results (SPEC §6.8): text plus the deferred tools to reference; null — an
+   * ordinary result. Gets the args of the paired tool call.
+   */
+  renderBuiltin?: (message: ToolMessage, args: unknown) => { text: string; references: string[] } | null
 }
 
 /** cache_control on top of the part's providerOptions: reasoning keeps its signature there, do not overwrite it. */
@@ -313,6 +322,7 @@ export async function toModelMessages(
 ): Promise<ModelMessage[]> {
   const out: ModelMessage[] = []
   let anchorOut: ModelMessage | null = null
+  const callArgs = new Map<string, unknown>()
 
   for (const message of messages) {
     if (message.role === 'user') {
@@ -348,6 +358,7 @@ export async function toModelMessages(
         if (part.type === 'text') {
           if (part.text.length > 0) content.push({ type: 'text', text: part.text })
         } else if (part.type === 'tool_call') {
+          callArgs.set(part.call_id, part.args)
           content.push({
             type: 'tool-call',
             toolCallId: part.call_id,
@@ -377,7 +388,7 @@ export async function toModelMessages(
       toolName: message.tool,
       output: message.is_error
         ? { type: 'error-text', value: message.error ?? 'tool error' }
-        : toolOutput(message.result, options.texts),
+        : (builtinOutput(message, callArgs.get(message.call_id), options) ?? toolOutput(message.result, options.texts)),
     }
     const last = out[out.length - 1]
     if (last && last.role === 'tool') {
@@ -439,6 +450,30 @@ export function isEmptyToolResult(result: unknown): boolean {
   if (Array.isArray(result)) return result.length === 0
   if (typeof result === 'object') return Object.keys(result).length === 0
   return false
+}
+
+/**
+ * A built-in result (SPEC §6.8): with references — one `tool_reference` per deferred tool,
+ * then the text, so the API expands the definitions inside the conversation; otherwise text.
+ */
+function builtinOutput(
+  message: ToolMessage,
+  args: unknown,
+  options: ConvertOptions,
+): ToolResultPart['output'] | null {
+  const rendered = options.renderBuiltin?.(message, args)
+  if (!rendered) return null
+  if (rendered.references.length === 0) return { type: 'text', value: rendered.text }
+  return {
+    type: 'content',
+    value: [
+      ...rendered.references.map((toolName) => ({
+        type: 'custom' as const,
+        providerOptions: { anthropic: { type: 'tool-reference', toolName } },
+      })),
+      { type: 'text' as const, text: rendered.text },
+    ],
+  }
 }
 
 function toolOutput(result: unknown, t: Texts = texts()): ToolResultPart['output'] {
