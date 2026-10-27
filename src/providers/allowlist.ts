@@ -111,7 +111,12 @@ export const PROVIDERS: Record<ProviderId, ProviderEntry> = {
 
 /** Context window profiles by model name (SPEC §5.1). */
 const CONTEXT_PROFILES: Array<[RegExp, number]> = [
-  [/^claude-/i, 200_000],
+  // 200k: Claude 3, Opus / Sonnet 4.0 (incl. the dated ids), Opus 4.1, Opus / Sonnet / Haiku 4.5;
+  // 1M by default from Opus / Sonnet 4.6 and Haiku 5.5 on
+  [/^claude-3/i, 200_000],
+  [/^claude-(opus|sonnet)-4-\d{8}/i, 200_000],
+  [/^claude-(opus|sonnet|haiku)-4-[015](?!\d)/i, 200_000],
+  [/^claude-/i, 1_000_000],
   [/^gpt-5/i, 400_000],
   [/^gpt-4\.1/i, 1_047_576],
   [/^gpt-/i, 128_000],

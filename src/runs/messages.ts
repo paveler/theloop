@@ -209,6 +209,25 @@ export function trimHistory(input: TrimInput): TrimResult {
   return { messages: current, trimmed, estimatedTokens: estimated }
 }
 
+/**
+ * Did the engine change the prefix that this provider's thinking blocks were signed over
+ * (SPEC §9.3)? Two engine transforms do: trimming cuts turns from the middle and may move
+ * the date into system (§5.1), and a user message without a valid `created_at` had the
+ * current-time line while it was the last one and has lost it since (§9.4). Only blocks
+ * after the change are affected, so it counts only with reasoning of this provider after it.
+ */
+export function editsSignedPrefix(
+  messages: readonly StoredMessage[],
+  options: { provider: string; trimmed: boolean; anchor: StoredMessage | null },
+): boolean {
+  const signed = (m: StoredMessage) =>
+    m.role === 'assistant' && m.content.some((p) => p.type === 'reasoning' && p.provider === options.provider)
+  const lostDate = (m: StoredMessage) =>
+    m.role === 'user' && m !== options.anchor && (!m.created_at || Number.isNaN(new Date(m.created_at).getTime()))
+  const from = options.trimmed ? 0 : messages.findIndex(lostDate)
+  return from >= 0 && messages.slice(from).some(signed)
+}
+
 /* --------------------------------------------------- StoredMessage → SDK */
 
 export type ImageResolver = (url: string) => Promise<{ data: Uint8Array; mediaType: string }>
