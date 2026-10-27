@@ -140,10 +140,95 @@ describe('example harness: write intents', () => {
     expect(a.status).toBe('deferred')
     expect(replay.operation_id).toBe(a.operation_id)
     expect(sameFields.operation_id).toBe(a.operation_id)
-    expect(otherAmount.operation_id).not.toBe(a.operation_id)
+    // a new amount for the same order updates the pending operation (SPEC §6.4)
+    expect(otherAmount.operation_id).toBe(a.operation_id)
     // another customer's order: still an intent, rejected at once, still deferred
     expect(foreignOrder.status).toBe('deferred')
     expect(harness.store.operation(String(foreignOrder.operation_id))!.status).toBe('rejected')
+  })
+
+  it('a changed amount bumps operation_version: the card for the old amount cannot be confirmed', async () => {
+    const { harness, store } = await setup(mockModel([]))
+    const call = (origin: string, amount: number) =>
+      callToolOverHttp(harness, 'refundOrder', { call_id: 'x', origin_request_id: origin, args: { orderId: '1042', amount }, meta: { session_id: SESSION, user_id: USER } })
+
+    const first = await call('msg_1', 120)
+    await call('msg_2', 60)
+    const op = store.operation(String(first.operation_id))!
+    expect(op).toMatchObject({ status: 'pending', version: 2, fields: { amount: 60 } })
+    await expect(harness.decide(op.id, 'approve', 1)).rejects.toThrow(/changed/)
+    expect(store.order('1042', USER)!.refunded).toBe(0)
+  })
+
+  it('an operation rejected at registration closes its call and the conversation goes on', async () => {
+    const model = mockModel([
+      streamFrom([START, toolCall('c1', 'refundOrder', { orderId: '2001', amount: 80 }), finish('tool-calls')]),
+      streamFrom([START, ...textChunks('I cannot find that order.'), finish('stop')]),
+    ])
+    const { harness, store } = await setup(model)
+
+    await harness.send(SESSION, USER, 'Refund order 2001.')
+    await waitFor(() => store.history(SESSION).at(-1)?.role === 'assistant' && store.session(SESSION, USER).state === 'idle')
+    expect(store.session(SESSION, USER).pending_call_ids).toEqual([])
+    expect(store.history(SESSION).find((m) => m.call_id === 'c1')).toMatchObject({ is_error: true, error: 'order not found' })
+    expect(harness.pendingApprovals(SESSION)).toEqual([])
+  })
+})
+
+describe('example harness: cancel', () => {
+  it('a deferred call closed by cancel cancels its operation (H21)', async () => {
+    const { harness, store } = await setup(mockModel([]))
+    const answer = await callToolOverHttp(harness, 'refundOrder', {
+      call_id: 'c1',
+      origin_request_id: 'msg_1',
+      args: { orderId: '1042', amount: 120 },
+      meta: { session_id: SESSION, user_id: USER },
+    })
+    const operationId = String(answer.operation_id)
+    harness.applyResult({
+      run_id: 'run_cancelled',
+      status: 'cancelled',
+      history_revision: 0,
+      meta: { session_id: SESSION },
+      messages: [],
+      tool_calls: [{ call_id: 'c1', tool: 'refundOrder', effect: 'write', status: 'cancelled', duration_ms: 0, truncated: false, operation_id: operationId }],
+      error: null,
+    } as never)
+    expect(store.operation(operationId)!.status).toBe('rejected')
+    expect(harness.pendingApprovals(SESSION)).toEqual([])
+  })
+})
+
+describe('example harness: delivery order', () => {
+  it('a terminal callback that arrives before the POST /runs response still moves the session on', async () => {
+    const store = openStore(':memory:')
+    let harness: Harness | undefined
+    const fetchImpl = async (_input: unknown, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body))
+      harness!.applyResult({
+        run_id: 'run_early',
+        status: 'completed',
+        history_revision: body.history_revision,
+        meta: { session_id: SESSION },
+        messages: [{ role: 'assistant', seq: 0, content: [{ type: 'text', text: 'Answer' }] }],
+        tool_calls: [],
+        error: null,
+      } as never)
+      return new Response(JSON.stringify({ run_id: 'run_early', stream_url: 'https://engine.example.com/stream' }), { status: 202 })
+    }
+    harness = createHarness({
+      store,
+      engineUrl: ENGINE_URL,
+      engineToken: ENGINE_TOKEN,
+      publicUrl: 'https://harness.example.com',
+      llm: { provider: 'anthropic', model: 'claude-sonnet-5' },
+      fetch: fetchImpl as typeof fetch,
+    })
+
+    await harness.send(SESSION, USER, 'hello')
+    expect(store.run('run_early')?.status).toBe('completed')
+    expect(store.session(SESSION, USER)).toMatchObject({ state: 'idle', active_run_id: null })
+    expect(roles(store)).toEqual(['user', 'assistant'])
   })
 })
 
