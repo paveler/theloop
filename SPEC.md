@@ -525,7 +525,8 @@ AssistantPart = TextPart
 
 The engine estimates the size of the **whole request**: system + date lines + tool JSON
 schemas + history + the `max_tokens` reserve for the answer. The window is
-`llm.context_window_tokens`, else a built-in model profile (`claude-*`, `gpt-*`,
+`llm.context_window_tokens`, else a built-in model profile (`claude-*` — 1M, 200k for
+`claude-3-*`, Opus / Sonnet 4.0, Opus 4.1 and Opus / Sonnet / Haiku 4.5; `gpt-*`,
 `deepseek-*`, `glm-*` — 1M for `glm-5.2` / `5.3*`, 200k for `glm-5` / `5.1` / `4.6` /
 `4.7`; `GigaChat*`, `MiniMax-M3*` — 1M, `MiniMax-M2*` — 204 800), else
 `MAX_CONTEXT_FALLBACK`. The estimate is a **heuristic**: `chars / 3` for Cyrillic,
@@ -535,7 +536,9 @@ punctuation can be underestimated — the margin covers that.
 Does not fit → drop the oldest messages, as `tool_call` + `tool` pairs together with the
 `reasoning` of the same turn; the first `user` message, the last 4 messages and the turns
 that carry a skill activation in effect (§6.8) always stay. With skills, `system` includes
-the skill index and only the visible tools are counted. The result carries `context_trimmed: true`. If the provider still answers
+the skill index and only the visible tools are counted. Trimming changes the prefix that
+signed Claude thinking blocks are bound to; the engine asks the provider to drop the stale
+ones (§9.3). The result carries `context_trimmed: true`. If the provider still answers
 "context too long" → `failed / context_too_large`, no automatic retry. Summarization is
 out of scope (§15). How much context is used after the run and which window the engine
 assumed — `result.context` (§7).
@@ -1459,6 +1462,24 @@ Some prefix changes still reset the cache entirely — changed tool descriptions
 changed `system` text. The engine does not fix those; the harness makes them for its own
 reasons.
 
+**Signed thinking after an engine-made edit.** Claude Fable 5.1, Opus 5.5, Sonnet 5.5 and
+Haiku 5.5 (later versions of these lines matched in advance; not Mythos) bind every thinking
+block to the exact prefix that produced it: `system`, `tools` and every earlier message.
+Replaying a block after that prefix changed is a `400` on accounts Anthropic enforces by
+default (created on or after 2026-08-31) and on any request that opts in; on other accounts
+the stale block silently reaches the model. Two of the engine's own transforms change the
+prefix: trimming cuts turns from the middle and may move the date into `system` (§5.1), and
+a user message without a valid `created_at` loses its current-time line once it is no
+longer the last one (§9.4). On a step where either happened and the prompt carries
+Anthropic `reasoning` after the change, the engine sends `thinking: { type: "adaptive",
+block_binding: { prefix_mismatch_behavior: "drop_block" } }` under the
+`thinking-binding-controls-2026-08-01` beta. Adaptive is these models' default, so the
+thinking mode does not change. The provider drops the first stale block and every thinking
+block after it, unbilled, and the step goes on without that reasoning; the count goes to the
+journal (`thinking_blocks_dropped`). Edits the harness makes are its own: the engine sends
+nothing for them. A harness that sets `created_at` (H2) and a window that fits keep every
+block.
+
 ### 9.4 Dates and time
 
 Models without a date are useless for anything with deadlines, so the engine always tells
@@ -1845,6 +1866,7 @@ a log pipeline. There is no database (§2): a restart or deploy means an empty j
 | `run_start` | info | start: model, tools as `name:effect`, limits, window, cache, history by role, `meta`, callback | `system`, `history_tail` (the last 6 messages as a string) |
 | `step_start` | debug | before a step: messages in the prompt, token estimate, `tools_disabled`, `tool_calls_used` | — |
 | `context_trimmed` | warn | context trimmed (§5.1): messages before / after, estimate, window | — |
+| `thinking_blocks_dropped` | info | the provider dropped stale thinking blocks after an engine-made prefix edit (§9.3): `step`, `dropped`, `reasons` | — |
 | `provider_attempt` | info | every provider attempt (§8): status, `finish_reason`, tokens, `provider_request_id` | — |
 | `provider_failure` | warn | an attempt failed: `kind`, `code`, `message`, `provider_status`, `retry_in_ms`, `retry_after_ms` (the provider's `Retry-After`), `retry_skipped` — `retries_exhausted \| run_deadline`; for 429 — `rate_limit_retry` (429 retries so far) | `provider_body`, `partial_text` |
 | `provider_queue_wait` | info / warn | an attempt waited in the provider queue (§11.6): `outcome` — `granted \| timeout \| aborted`, `wait_ms`, `queue_depth`, `limit`, `active`, `queue_timeout_ms`, `throttle_key`; no event for an immediate slot | — |

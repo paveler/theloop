@@ -30,6 +30,8 @@ export interface ResolvedModel {
   acceptsSampling: boolean
   /** Anthropic tool search: deferred tools activate through tool_reference (SPEC §6.8, §9.2). */
   toolReferences: boolean
+  /** Thinking blocks are bound to the prefix: an engine-made edit needs `drop_block` (SPEC §9.3). */
+  thinkingPrefixBinding?: boolean
   /** The provider's cache session header; the runner sets the value (SPEC §9.1). */
   sessionHeader?: string
   /** providerOptions for streamText (thinking and the like). */
@@ -81,6 +83,20 @@ const TOOL_REFERENCE_CLAUDE = /^claude-(fable|mythos)-|^claude-(opus|sonnet|haik
 
 export function supportsToolReferences(provider: string, model: string): boolean {
   return provider === 'anthropic' && TOOL_REFERENCE_CLAUDE.test(model)
+}
+
+/**
+ * Claude models that bind a thinking block to the exact prefix that produced it — system,
+ * tools, every earlier message (SPEC §9.3, Anthropic docs as of 2026-10-27): Fable 5.1,
+ * Opus 5.5, Sonnet 5.5, Haiku 5.5, later versions of the same lines matched in advance.
+ * Mythos does not run the check. Thinking is adaptive by default on all of them, so the
+ * engine can send `block_binding` without changing the thinking mode.
+ */
+const THINKING_PREFIX_CLAUDE =
+  /^claude-fable-(5-[1-9]|[6-9]|\d{2,})|^claude-(opus|sonnet|haiku)-(5-[5-9]|[6-9]|\d{2,})/i
+
+export function bindsThinkingToPrefix(provider: string, model: string): boolean {
+  return provider === 'anthropic' && THINKING_PREFIX_CLAUDE.test(model)
 }
 
 /**
@@ -216,6 +232,7 @@ export function buildModel(llm: Llm, config: Config, egress: EgressClient): Reso
     honorsToolChoiceNone: entry.honorsToolChoiceNone,
     acceptsSampling,
     toolReferences: supportsToolReferences(llm.provider, llm.model),
+    ...(bindsThinkingToPrefix(llm.provider, llm.model) ? { thinkingPrefixBinding: true } : {}),
     ...(entry.sessionHeader ? { sessionHeader: entry.sessionHeader } : {}),
     providerOptions,
     throttleKey,

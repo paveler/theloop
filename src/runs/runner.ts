@@ -47,6 +47,7 @@ import { createImageResolver } from './images.js'
 import {
   buildSystemMessages,
   describeMessage,
+  editsSignedPrefix,
   engineDateLine,
   estimateMessageTokens,
   estimateTokens,
@@ -112,6 +113,13 @@ export interface RunPlan {
 type RepairOutcome =
   | { ok: true; attempts: number; raw: string }
   | { ok: false; attempts: number; reason: OutputCheckFailReason; issues: Issue[] }
+
+interface Prompt {
+  messages: ModelMessage[]
+  historyTokens: number
+  /** The engine edited a prefix that thinking blocks are bound to (SPEC §9.3). */
+  dropStaleThinking: boolean
+}
 
 /** Starts the loop; the terminal state is observed via record.terminal. */
 export function startRun(record: RunRecord, plan: RunPlan, deps: RunnerDeps): Promise<void> {
@@ -404,7 +412,7 @@ class RunExecution {
   private async buildPrompt(
     step: number,
     extra: readonly StoredMessage[] = [],
-  ): Promise<{ messages: ModelMessage[]; historyTokens: number }> {
+  ): Promise<Prompt> {
     const { plan } = this
     const history = [...plan.request.messages, ...this.newMessages, ...extra]
     this.refreshTools()
@@ -456,7 +464,11 @@ class RunExecution {
       ...(this.skills.enabled ? { tools_visible: this.skills.visibleTools(plan.request.tools).map((t) => t.name) } : {}),
       ...this.repairFields(),
     })
-    return { messages: [...system, ...converted], historyTokens }
+    // the engine's own edit of a signed prefix: stale thinking blocks are dropped, not a 400 (SPEC §9.3)
+    const dropStaleThinking =
+      plan.resolved.thinkingPrefixBinding === true &&
+      editsSignedPrefix(trim.messages, { provider: plan.resolved.providerId, trimmed: trim.trimmed, anchor })
+    return { messages: [...system, ...converted], historyTokens, dropStaleThinking }
   }
 
   /**
@@ -468,7 +480,7 @@ class RunExecution {
    * do NOT end the run — the gate decides the outcome, the model's answer already exists.
    */
   private async callProvider(
-    prompt: { messages: ModelMessage[]; historyTokens: number },
+    prompt: Prompt,
     step: number,
     repair = false,
   ): Promise<StepOutcome | 'budget_exceeded' | 'aborted' | 'failed'> {
@@ -551,7 +563,9 @@ class RunExecution {
           topP: plan.resolved.acceptsSampling ? params.top_p : undefined,
           stopSequences: params.stop,
           seed: params.seed,
-          providerOptions: plan.resolved.providerOptions,
+          providerOptions: prompt.dropStaleThinking
+            ? withDropBlock(plan.resolved.providerOptions)
+            : plan.resolved.providerOptions,
           ...(this.providerHeaders ? { headers: this.providerHeaders } : {}),
           abortSignal: record.abort.signal,
           onTextDelta: (text) => {
@@ -595,6 +609,7 @@ class RunExecution {
 
       if (!outcome.failure) {
         this.recordAttempt(outcome, 'ok', prompt.historyTokens, attempt)
+        if (prompt.dropStaleThinking) this.logDroppedThinking(outcome, step)
         return outcome
       }
 
@@ -1439,6 +1454,23 @@ class RunExecution {
     return this.repairing ? { repair: this.repairing.fence, repair_attempt: this.repairing.attempt } : {}
   }
 
+  /** What the provider dropped under `drop_block` (SPEC §9.3): the step went on without it. */
+  private logDroppedThinking(outcome: StepOutcome, step: number): void {
+    const transformations = outcome.providerMetadata?.anthropic?.inputTransformations
+    if (!Array.isArray(transformations)) return
+    const dropped = transformations.filter(
+      (t): t is { type: string; reason: string } =>
+        typeof t === 'object' && t !== null && (t as { type?: unknown }).type === 'thinking_dropped',
+    )
+    if (dropped.length === 0) return
+    log.info('thinking_blocks_dropped', {
+      run_id: this.record.runId,
+      step,
+      dropped: dropped.length,
+      reasons: [...new Set(dropped.map((t) => t.reason))],
+    })
+  }
+
   /* ------------------------------------------------------------ history */
 
   private pushAssistant(parts: AssistantPart[], partial: boolean): AssistantMessage | null {
@@ -1722,6 +1754,21 @@ function stableJson(value: unknown): string {
     .sort()
     .map((key) => `${JSON.stringify(key)}:${stableJson((value as Record<string, unknown>)[key])}`)
   return `{${entries.join(',')}}`
+}
+
+/**
+ * `thinking.block_binding.prefix_mismatch_behavior: "drop_block"` on top of the run's options
+ * (SPEC §9.3). The models that bind thinking to the prefix think adaptively by default, and
+ * the factory sends them nothing or `adaptive`, so the thinking mode stays the same. The SDK
+ * adds the `thinking-binding-controls-2026-08-01` beta itself.
+ */
+function withDropBlock(options: Record<string, Record<string, unknown>>): Record<string, Record<string, unknown>> {
+  const anthropic = options.anthropic ?? {}
+  const thinking = (anthropic.thinking as Record<string, unknown> | undefined) ?? { type: 'adaptive' }
+  return {
+    ...options,
+    anthropic: { ...anthropic, thinking: { ...thinking, blockBinding: { prefixMismatchBehavior: 'drop_block' } } },
+  }
 }
 
 /**

@@ -6,6 +6,19 @@ changes within 1.x.
 
 ## Unreleased
 
+### Fixed
+
+- **Signed Claude thinking after the engine's own edits** (SPEC §9.3). Claude Fable 5.1,
+  Opus 5.5, Sonnet 5.5 and Haiku 5.5 bind each thinking block to the exact prefix before it;
+  on accounts created on or after 2026-08-31 a replayed block after a change is a `400`.
+  Trimming (§5.1) and a user message without `created_at` that lost its current-time line
+  (§9.4) are such changes. On those steps the engine now sends
+  `block_binding: { prefix_mismatch_behavior: "drop_block" }`: the provider drops the stale
+  blocks and the run goes on. Drops are journaled as `thinking_blocks_dropped`.
+- **Claude context window: 1M.** The built-in profile assumed 200k for every `claude-*`, so
+  the engine trimmed Claude histories five times too early. Now 1M, 200k only for Claude 3,
+  Opus / Sonnet 4.0, Opus 4.1 and the 4.5 models.
+
 ### Security
 
 - **Dependencies with known advisories updated:** `hono` 4.13, `@hono/node-server` 1.19.17,
