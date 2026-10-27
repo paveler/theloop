@@ -4,6 +4,38 @@ All notable changes to theloop. The contract is versioned separately (`contract_
 [SPEC.md](SPEC.md)); every change below is additive to it. Releases follow semver: no breaking
 changes within 1.x.
 
+## Unreleased
+
+No breaking contract changes. SPEC §6.5 now spells out the cancelled deferred call, and
+Appendix A gains H21.
+
+### Fixed
+
+- **Cancel with a deferred call in the batch** (SPEC §6.5). When a write tool had already
+  answered `deferred` and a parallel read was still running, cancel left the deferred
+  `tool_call` without a tool message, and the next run with that history was refused with
+  `unresolved_tool_call`. Every terminal status other than `awaiting_tool` now closes such
+  a call with `cancelled`; its `tool_calls[]` entry keeps the `operation_id`, so the
+  harness can cancel the operation (new obligation H21).
+- **Cancel during an image download** (SPEC §6.5). The aborted download surfaced as
+  `image_fetch_failed` and the run ended `failed`; an aborted run now ends by its abort
+  reason (`cancelled`, or `failed` / `run_timeout`).
+- **Repeated calls and `max_tool_calls`** (SPEC §6.7). The limit was checked before repeats
+  were detected, so a repeat could end the run `stopped_limit`. Repeats are not executed
+  and no longer count; the model gets `repeated_call` and goes on.
+- **Output estimate without provider usage** (SPEC §8.2). Generated tool calls (name and
+  arguments) are now counted, not only text and reasoning.
+- **Prompt estimate and date lines** (SPEC §5.1, §9.4). The per-message date lines from
+  `created_at` were added to the prompt after the estimate, so trimming and
+  `max_total_tokens` ran on a smaller number than the prompt actually sent.
+
+### Security
+
+- **Callback diagnostics.** A receiver that echoed the request in its error body could put
+  the `CALLBACK_SECRET` value, a `callback.headers` value or a callback query value into
+  `last_error`, the event journal and stdout. These values are now redacted wherever they
+  occur, raw, JSON-escaped or URL-encoded.
+
 ## v1.1.1 — 2026-10-27
 
 No contract changes.
