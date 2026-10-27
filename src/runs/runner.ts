@@ -303,6 +303,9 @@ class RunExecution {
     try {
       await this.loop()
     } catch (err) {
+      // an abort surfaces as whatever the interrupted operation throws (an image download, say):
+      // the run ends by its abort reason, not as failed (§6.5)
+      if (!this.finished && record.abort.signal.aborted) this.finishAborted()
       if (!this.finished) {
         const engineError = err instanceof EngineError ? err : null
         const code: ErrorCode = engineError?.code ?? 'internal_error'
@@ -378,9 +381,11 @@ class RunExecution {
         this.finish('stopped_limit', 'max_steps')
         return
       }
-      // built-ins and tool_not_loaded rejections never reach an endpoint: they do not count (§6.8)
+      // built-ins, tool_not_loaded rejections (§6.8) and repeats (§6.7) never reach an endpoint: they do not count
       const remaining = limits.max_tool_calls - this.toolCallsUsed
-      const requested = outcome.toolCalls.filter((c) => !this.skills.builtin(c.tool) && !this.skills.isHidden(c.tool)).length
+      const requested = outcome.toolCalls.filter(
+        (c) => !this.skills.builtin(c.tool) && !this.skills.isHidden(c.tool) && !this.seenCalls.has(callKey(c)),
+      ).length
       if (requested > remaining) {
         this.logLimit('max_tool_calls', {
           step,
@@ -423,6 +428,7 @@ class RunExecution {
       toolTokens: this.toolTokens,
       reserveTokens: plan.limits.max_tokens,
       contextWindow: plan.resolved.contextWindow,
+      dates: { timezone: this.timezone, texts: this.texts },
       ...(this.skills.enabled ? { pinned: (block) => this.skills.isPinned(block) } : {}),
     })
     if (trim.trimmed) {
@@ -806,7 +812,10 @@ class RunExecution {
     }
 
     // the provider did not report usage (§8.2) or the attempt was cut off — count it as an estimate
-    const estimatedOutput = estimateTokens(outcome.text) + estimateTokens(outcome.reasoningText)
+    const estimatedOutput =
+      estimateTokens(outcome.text) +
+      estimateTokens(outcome.reasoningText) +
+      outcome.toolCalls.reduce((acc, c) => acc + estimateTokens(c.tool) + estimateTokens(stableJson(c.args)), 0)
     const tokens = {
       input_tokens: hasReported ? reported.input_tokens : historyTokens + this.systemTokens + this.toolTokens,
       output_tokens: hasReported ? reported.output_tokens : estimatedOutput,
@@ -844,7 +853,7 @@ class RunExecution {
   private contextUsage(): RunContext {
     const window_tokens = this.plan.resolved.contextWindow
     const sum = (messages: readonly StoredMessage[]) =>
-      messages.reduce((acc, m) => acc + estimateMessageTokens(m), 0)
+      messages.reduce((acc, m) => acc + estimateMessageTokens(m, { timezone: this.timezone, texts: this.texts }), 0)
     const base = this.contextBase
     if (!base) {
       const history = [...this.plan.request.messages, ...this.newMessages]
@@ -1524,21 +1533,21 @@ class RunExecution {
 
   /**
    * The §5 invariant: every tool_call has a paired tool message. Unclosed ones
-   * get a synthetic error; deferred ones (with operation_id) are skipped — their
-   * result arrives in the next run.
+   * get a synthetic error. A deferred call (with operation_id) gets `cancelled`: the
+   * run ends without `awaiting_tool`, so no continuation will bring its result, and the
+   * harness cancels the operation (§6.5, Appendix A).
    */
   private sealUnresolvedToolCalls(errorText: string, status: ToolCallStatus): void {
     const answered = new Set<string>()
     for (const m of this.newMessages) if (m.role === 'tool') answered.add(m.call_id)
 
-    const pending: Array<{ callId: string; tool: string }> = []
+    const pending: Array<{ callId: string; tool: string; deferred: boolean }> = []
     for (const message of this.newMessages) {
       if (message.role !== 'assistant') continue
       for (const part of message.content) {
         if (part.type !== 'tool_call') continue
-        if (part.operation_id) continue
         if (answered.has(part.call_id)) continue
-        pending.push({ callId: part.call_id, tool: part.tool })
+        pending.push({ callId: part.call_id, tool: part.tool, deferred: Boolean(part.operation_id) })
       }
     }
 
@@ -1554,12 +1563,12 @@ class RunExecution {
       this.pushToolMessage({
         call_id: item.callId,
         tool: item.tool,
-        error: errorText,
+        error: item.deferred ? 'cancelled' : errorText,
         is_error: true,
       })
       const existing = this.toolSummaries.find((s) => s.call_id === item.callId)
       if (existing) {
-        existing.status = status
+        existing.status = item.deferred ? 'cancelled' : status
       } else {
         this.toolSummaries.push({
           call_id: item.callId,

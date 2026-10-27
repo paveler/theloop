@@ -903,7 +903,12 @@ no approval logic in the engine and there will not be.
 2. Generated text is kept: an assistant message with `partial: true`.
 3. Every `tool_call` without a result gets a synthetic
    `{ role: "tool", call_id, tool, is_error: true, error: "cancelled" }`. The §5
-   invariant holds.
+   invariant holds. This includes a write call that already answered `deferred` while
+   another call of its batch was still running: the run does not end `awaiting_tool`, so
+   no continuation will bring that result. Its `tool_calls[]` entry keeps the
+   `operation_id` with `status: "cancelled"`, and the harness cancels the operation (H21).
+   The same holds for any other terminal status reached with a deferred call open
+   (`run_timeout`, an engine failure).
 4. Usage: finished attempts — exact; the interrupted one — `unknown` with an estimate
    (§8.2).
 5. SSE `done { status: "cancelled" }`; `cancel` returns the §7 result; the callback is
@@ -2101,6 +2106,7 @@ come from skipping one of these.
 | H18 | Hand `stream_url` / `cancel_url` to end-user clients as is; never expose `ENGINE_TOKEN`. | §4.1 |
 | H19 | Reconcile `Σ usage.total` with provider billing periodically. | §8.4 |
 | H20 | Store the `tool` messages of `load_skill` and `search_tools` verbatim, `result` and `builtin` included: the engine restores loaded skills from them on the next run, and only marked messages count. | §5, §6.8 |
+| H21 | A run that ends other than `awaiting_tool` with a `tool_calls[]` entry carrying `operation_id` and `status: "cancelled"`: cancel that operation, so its approval can no longer execute; the history already closes the call. | §6.5 |
 
 A reference harness, a conformance test kit for harnesses and examples for common platforms
 are on the roadmap.

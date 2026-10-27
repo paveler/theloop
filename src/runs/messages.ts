@@ -37,9 +37,18 @@ export const IMAGE_TOKENS = 1600
 /** Overhead of the service fields of one message. */
 const MESSAGE_OVERHEAD_TOKENS = 4
 
-export function estimateMessageTokens(message: StoredMessage): number {
+/** Where §9.4 date lines go: a user message with `created_at` gets one in the prompt. */
+export interface DateEstimate {
+  timezone: string
+  texts: Texts
+}
+
+export function estimateMessageTokens(message: StoredMessage, dates?: DateEstimate): number {
   let sum = MESSAGE_OVERHEAD_TOKENS
   if (message.role === 'user') {
+    if (dates && message.created_at) {
+      sum += estimateTokens(messageDateLine(message.created_at, dates.timezone, dates.texts) ?? '')
+    }
     for (const part of message.content) {
       if (part.type === 'text') sum += estimateTokens(part.text)
       else if (part.type === 'image') sum += IMAGE_TOKENS
@@ -129,6 +138,8 @@ export interface TrimInput {
   contextWindow: number
   /** A block that must never be dropped: an activation in effect (SPEC §6.8). */
   pinned?: (block: readonly StoredMessage[]) => boolean
+  /** Count the date lines the prompt will carry (§9.4). */
+  dates?: DateEstimate
 }
 
 export interface TrimResult {
@@ -172,7 +183,7 @@ function toBlocks(messages: StoredMessage[]): StoredMessage[][] {
 export function trimHistory(input: TrimInput): TrimResult {
   const base = input.systemTokens + input.toolTokens + input.reserveTokens
   const total = (msgs: StoredMessage[]) =>
-    base + msgs.reduce((acc, m) => acc + estimateMessageTokens(m), 0)
+    base + msgs.reduce((acc, m) => acc + estimateMessageTokens(m, input.dates), 0)
 
   let current = input.messages
   let estimated = total(current)

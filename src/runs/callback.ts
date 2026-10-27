@@ -79,6 +79,8 @@ export async function deliverCallback(run: RunRecord, result: RunResult, deps: D
   const url = delivery.url
   const headers = buildCallbackHeaders(delivery.headers, deps.config.callbackSecret)
   const body = JSON.stringify(buildCallbackBody(result))
+  // a receiver may echo what it got — header values and query values must not reach last_error
+  const redactSent = (text: string) => redactValues(redactSecrets(text), [...Object.values(headers ?? {}), ...queryValues(url)])
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     delivery.attempts = attempt
@@ -115,10 +117,10 @@ export async function deliverCallback(run: RunRecord, result: RunResult, deps: D
         return
       }
       // the refusal reason is in the receiver's response body; without it "HTTP 400" cannot be diagnosed
-      const snippet = redactSecrets(res.text).replace(/\s+/g, ' ').trim().slice(0, CALLBACK_ERROR_BODY_CHARS)
+      const snippet = redactSent(res.text).replace(/\s+/g, ' ').trim().slice(0, CALLBACK_ERROR_BODY_CHARS)
       delivery.lastError = snippet ? `HTTP ${res.status}: ${snippet}` : `HTTP ${res.status}`
     } catch (err) {
-      delivery.lastError = err instanceof Error ? err.message : String(err)
+      delivery.lastError = redactSent(err instanceof Error ? err.message : String(err))
     }
 
     // engine stopping: this attempt was the last one (SPEC §11.1)
@@ -173,4 +175,30 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
     if (typeof t.unref === 'function') t.unref()
     signal?.addEventListener('abort', done, { once: true })
   })
+}
+
+/** Values shorter than this are not treated as secrets: they would redact ordinary words. */
+const MIN_SECRET_CHARS = 8
+
+/** Replaces every occurrence of each value (raw and JSON-escaped) with `<redacted>`. */
+export function redactValues(text: string, values: readonly string[]): string {
+  const forms = new Set<string>()
+  for (const value of values) {
+    if (value.length < MIN_SECRET_CHARS) continue
+    forms.add(value)
+    forms.add(JSON.stringify(value).slice(1, -1))
+    forms.add(encodeURIComponent(value))
+  }
+  let out = text
+  // longest first, so a value containing another one is redacted whole
+  for (const form of [...forms].sort((a, b) => b.length - a.length)) out = out.split(form).join('<redacted>')
+  return out
+}
+
+function queryValues(url: string): string[] {
+  try {
+    return [...new URL(url).searchParams.values()]
+  } catch {
+    return []
+  }
 }
