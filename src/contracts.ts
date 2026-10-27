@@ -43,7 +43,7 @@ export const ReasoningPartSchema = z.object({
   type: z.literal('reasoning'),
   text: z.string().optional(),
   provider: z.string().min(1),
-  provider_metadata: z.record(z.unknown()).default({}),
+  provider_metadata: z.record(z.string(), z.unknown()).default({}),
 })
 
 export const AssistantPartSchema = z.discriminatedUnion('type', [
@@ -198,7 +198,7 @@ export const LlmParamsSchema = z
     thinking: z.object({ budget_tokens: z.number().int().positive() }).optional(),
     cache: z.boolean().optional(),
   })
-  .passthrough() // unknown ones — warn and dropped (SPEC §9.3)
+  .loose() // unknown ones — warn and dropped (SPEC §9.3)
   .default({})
 
 export const LlmSchema = z.object({
@@ -223,9 +223,9 @@ export type ToolEffect = z.infer<typeof ToolEffectSchema>
 export const ToolDefSchema = z.object({
   name: z.string().min(1),
   description: z.string().optional(),
-  input_schema: z.record(z.unknown()).default({ type: 'object' }),
+  input_schema: z.record(z.string(), z.unknown()).default({ type: 'object' }),
   endpoint: z.string().min(1),
-  headers: z.record(z.string()).optional(),
+  headers: z.record(z.string(), z.string()).optional(),
   timeout_ms: z.number().int().positive().optional(),
   effect: ToolEffectSchema, // required (SPEC §6.4)
   /** Hidden from the model until a skill or search activates it (SPEC §6.8). */
@@ -252,7 +252,7 @@ export const SkillSchema = z.object({
     .string()
     .min(1)
     .refine((body) => Buffer.byteLength(body, 'utf8') <= SKILL_LIMITS.body_max_bytes, {
-      message: `body: at most ${SKILL_LIMITS.body_max_bytes} bytes`,
+      error: `body: at most ${SKILL_LIMITS.body_max_bytes} bytes`,
     }),
   tools: z.array(z.string().min(1)).default([]),
 })
@@ -279,10 +279,10 @@ export const StreamFlagsSchema = z
 
 export const CallbackSchema = z.object({
   url: z.string().min(1),
-  headers: z.record(z.string()).optional(),
+  headers: z.record(z.string(), z.string()).optional(),
 })
 
-export const MetaSchema = z.record(z.unknown()).default({})
+export const MetaSchema = z.record(z.string(), z.unknown()).default({})
 
 /* --------------------------------------------------------- output checks */
 
@@ -299,7 +299,7 @@ export const OUTPUT_CHECK_LIMITS = {
 
 export const OutputCheckSchema = z.object({
   fence: z.string().regex(/^[a-z0-9-]{1,40}$/, 'fence: ^[a-z0-9-]{1,40}$'),
-  schema: z.record(z.unknown()),
+  schema: z.record(z.string(), z.unknown()),
   max_repairs: z.number().int().nonnegative().optional(),
 })
 
@@ -334,7 +334,7 @@ export const ToolResultBodySchema = z
     is_error: z.boolean().optional(),
   })
   .refine((v) => v.result !== undefined || v.error !== undefined || v.is_error === true, {
-    message: 'result or error is required',
+    error: 'result or error is required',
   })
 
 /* ------------------------------------------------------------------ result */

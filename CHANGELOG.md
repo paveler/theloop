@@ -4,6 +4,18 @@ All notable changes to theloop. The contract is versioned separately (`contract_
 [SPEC.md](SPEC.md)); every change below is additive to it. Releases follow semver: no breaking
 changes within 1.x.
 
+## Unreleased
+
+### Security
+
+- **Dependencies with known advisories updated:** `hono` 4.13, `@hono/node-server` 1.19.17,
+  `undici` 7.30.1, `fast-uri` 3.1.9 (transitive). `npm audit` reports none.
+- **Zod 4.** Zod 3 accumulates an issue for every failing array element without a cap
+  (GHSA-mrhx-c7xc-m3w5), so a large invalid body could exhaust memory before the request
+  is refused. Error codes and paths in `400 bad_request` are unchanged; the human-readable
+  part of the message now comes from Zod 4 (`Invalid input: expected string, received
+  number` instead of `Expected string, received number`).
+
 ## v1.1.0 — 2026-10-27
 
 Contract changes are additive: a request that does not use the new fields behaves exactly as
