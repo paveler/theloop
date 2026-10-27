@@ -27,6 +27,7 @@
   <a href="#trust-model"><b>Trust model</b></a> ·
   <a href="#how-it-compares"><b>Compare</b></a> ·
   <a href="examples/sqlite-harness"><b>Example harness</b></a> ·
+  <a href="CHANGELOG.md"><b>Changelog</b></a> ·
   <a href="ROADMAP.md"><b>Roadmap</b></a>
 </p>
 
@@ -41,8 +42,9 @@ keys, one usage record per provider attempt, write tools as intents that your sy
 and executes.
 
 > [!NOTE]
-> **Status: v1.0** — the contract is frozen ([SPEC.md](SPEC.md)) and implemented: Node 22,
-> TypeScript, Hono, Vercel AI SDK 6. Tests run without network or keys.
+> **Status: v1** — the contract is frozen ([SPEC.md](SPEC.md)) and implemented: Node 22,
+> TypeScript, Hono, Vercel AI SDK 6. Tests run without network or keys. New features arrive as
+> additive fields, like skills and deferred tools ([CHANGELOG.md](CHANGELOG.md)).
 > "1.0" is a promise about the contract (semver: no breaking changes within 1.x), not a claim
 > of operational maturity — the implementation is young; expect fixes, not contract changes.
 
@@ -82,13 +84,38 @@ intents, limits and everything else — [SPEC.md](SPEC.md).
   filtering; provider keys never in logs, SSE, callbacks or error bodies.
 - **Providers.** Anthropic, OpenAI, DeepSeek, GLM (z.ai), GigaChat, MiniMax and any
   OpenAI-compatible endpoint, with per-key queues and AIMD rate limiting.
-- **Skills and deferred tools.** `skills[]` in the `SKILL.md` shape: the model sees an index,
-  loads a skill's instructions and tools mid-run with `load_skill`, finds deferred tools
-  with `search_tools` (BM25), and the prompt cache
-  survives (`tool_reference` on Anthropic). Still stateless: what is loaded comes from the
-  history.
+- **Skills and deferred tools.** `skills[]` in the `SKILL.md` shape: the model sees an index
+  and loads a skill's instructions and tools mid-run. Deferred tools stay out of the context
+  until a skill or `search_tools` (BM25) brings them in, and the prompt cache survives
+  (`tool_reference` on Anthropic). Still stateless: what is loaded comes from the history.
+  See [Skills and deferred tools](#skills-and-deferred-tools).
 - **Debuggable.** An in-memory event journal per run and session (`GET /logs`), with content,
   without shipping prompts to your log pipeline.
+
+## Skills and deferred tools
+
+A request can carry instructions and tools the model pulls in only when it needs them:
+
+```jsonc
+"tools": [
+  { "name": "getOrder", "...": "...", "effect": "read" },
+  { "name": "createReturn", "...": "...", "effect": "write", "defer_loading": true }
+],
+"skills": [
+  { "name": "order-returns",
+    "description": "Return and refund policy. Use when the user asks about a return.",
+    "body": "# Returns\n\nCheck the order status first ...",
+    "tools": ["createReturn"] }
+]
+```
+
+The model sees `getOrder`, a built-in `load_skill` and a one-line index of skills in the system
+prompt. When the conversation turns to returns, it calls `load_skill("order-returns")`, gets the
+instructions, and `createReturn` is callable from the next step. A deferred tool that belongs to
+no skill is found with the built-in `search_tools`. Built-ins cost a step but not a tool call,
+and the harness only has to store the engine's `tool` messages as usual: the next run restores
+what was loaded from the history. Details: [SPEC §6.8](SPEC.md),
+[RFC 0001](docs/rfcs/0001-skills-and-deferred-tools.md).
 
 ## Quickstart
 
@@ -226,8 +253,11 @@ npm run build && npm start
 ## Documents
 
 - [SPEC.md](SPEC.md) — the contract: API, message format, loop semantics, limits, reliability.
-- [ROADMAP.md](ROADMAP.md) — proposals: MCP, more providers, skills, compaction, sub-runs, a
-  reference harness with channels and memory.
+- [CHANGELOG.md](CHANGELOG.md) — what changed in each release and what is on `main`.
+- [ROADMAP.md](ROADMAP.md) — proposals: MCP, more providers, compaction, sub-runs, a reference
+  harness with channels and memory.
+- [docs/rfcs](docs/rfcs) — design documents for larger features, starting with
+  [RFC 0001](docs/rfcs/0001-skills-and-deferred-tools.md), skills and deferred tools.
 - [examples/sqlite-harness](examples/sqlite-harness) — a complete harness: what your backend does
   around the engine, obligation by obligation.
 - [AGENTS.md](AGENTS.md) — how to work on the code: commands, architecture rules, conventions,
