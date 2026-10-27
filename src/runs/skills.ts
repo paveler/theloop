@@ -28,7 +28,7 @@ export interface ModelTool {
 
 /** The request uses skills or deferred tools; without either the loop is exactly as before. */
 export function usesSkills(request: Pick<RunRequest, 'skills' | 'tools'>): boolean {
-  return request.skills.length > 0 || request.tools.some((t) => t.defer_loading)
+  return request.skills.length > 0 || request.tools.some((t) => t.defer_loading === true)
 }
 
 export interface LoadSkillOutcome {
@@ -64,6 +64,8 @@ export class SkillState {
   private readonly owner = new Map<string, string>()
   private readonly activated = new Set<string>()
   private readonly loaded = new Set<string>()
+  /** Skills loaded in earlier runs: a load of one of them is `reloaded` (SPEC §6.8). */
+  private readonly loadedBefore = new Set<string>()
   /** Bumped on every activation: the runner rebuilds the tool set when it changes. */
   private revision = 0
 
@@ -74,7 +76,7 @@ export class SkillState {
   ) {
     this.enabled = usesSkills(request)
     this.mechanism = this.enabled && toolReferences ? 'tool_reference' : 'tools_array'
-    for (const tool of request.tools) if (tool.defer_loading) this.deferred.add(tool.name)
+    for (const tool of request.tools) if (tool.defer_loading === true) this.deferred.add(tool.name)
     for (const skill of [...request.skills].sort((a, b) => byName(a.name, b.name))) {
       this.skills.set(skill.name, skill)
       for (const tool of skill.tools) {
@@ -173,7 +175,10 @@ export class SkillState {
       this.loaded.add(name)
       restored.skills.push(name)
     }
-    for (const name of restored.skills) this.activate(this.skillTools(name))
+    for (const name of restored.skills) {
+      this.loadedBefore.add(name)
+      this.activate(this.skillTools(name))
+    }
     restored.tools = this.activatedTools()
     return restored
   }
@@ -185,7 +190,7 @@ export class SkillState {
     if (!skill) {
       return { ok: false, name, text: this.texts.unknownSkill(name, this.skillNames()), tools: [], reloaded: false }
     }
-    const reloaded = this.loaded.has(name)
+    const reloaded = this.loadedBefore.has(name)
     this.loaded.add(name)
     return { ok: true, name, text: skill.body, tools: this.skillTools(name), reloaded }
   }
@@ -254,7 +259,7 @@ function toModelTool(def: ToolDef): ModelTool {
     name: def.name,
     ...(def.description ? { description: def.description } : {}),
     input_schema: def.input_schema,
-    deferred: def.defer_loading,
+    deferred: def.defer_loading === true,
   }
 }
 

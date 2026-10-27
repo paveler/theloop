@@ -249,7 +249,7 @@ class RunExecution {
         history_revision: request.history_revision ?? null,
         wait: request.wait,
         callback: request.callback ? safeUrl(request.callback.url) : null,
-        tools: request.tools.map((t) => `${t.name}:${t.effect}${t.defer_loading ? ':deferred' : ''}`),
+        tools: request.tools.map((t) => `${t.name}:${t.effect}${t.defer_loading === true ? ':deferred' : ''}`),
         ...(this.skills.enabled
           ? { skills: this.skills.skillNames(), activation: this.skills.mechanism, tool_search: false }
           : {}),
@@ -947,6 +947,7 @@ class RunExecution {
           call,
           outcome: { kind: 'error', error: this.texts.repeatedCall, status: 'error' },
           durationMs: 0,
+          ...(this.skills.builtin(call.tool) ? { builtin: true as const } : {}),
         }
       }
       const rejection = rejected.get(call.callId)

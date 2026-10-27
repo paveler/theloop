@@ -82,8 +82,11 @@ export const ToolMessageSchema = z.object({
   is_error: z.boolean(),
   operation_id: z.string().nullish(),
   truncated: z.boolean().optional(),
-  /** Written by the engine for its own tools (§6.8); the only mark of a built-in result. */
-  builtin: z.literal(true).optional(),
+  /**
+   * Written by the engine for its own tools (§6.8); the only mark of a built-in result. Only
+   * `true` counts: a harness that stores the column as false / null on HTTP tool messages is fine.
+   */
+  builtin: z.boolean().nullish(),
   ...MessageEnvelope,
 })
 
@@ -226,7 +229,7 @@ export const ToolDefSchema = z.object({
   timeout_ms: z.number().int().positive().optional(),
   effect: ToolEffectSchema, // required (SPEC §6.4)
   /** Hidden from the model until a skill or search activates it (SPEC §6.8). */
-  defer_loading: z.boolean().default(false),
+  defer_loading: z.boolean().nullish(),
 })
 
 export type ToolDef = z.infer<typeof ToolDefSchema>

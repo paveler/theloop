@@ -222,6 +222,8 @@ describe('skills: load_skill (SPEC §6.8)', () => {
     const second = result.messages.find((m) => m.role === 'tool' && m.call_id === 'c2') as Record<string, any>
     expect(second.is_error).toBe(true)
     expect(second.error).toMatch(/^repeated_call:/)
+    expect(second.builtin).toBe(true)
+    expect(result.tool_calls[1]).toMatchObject({ builtin: true, status: 'error' })
   })
 
   it('a load on the last allowed step is not executed (§10.1)', async () => {
@@ -407,6 +409,26 @@ describe('skills: trimming keeps activations (SPEC §5.1, §6.8)', () => {
 })
 
 describe('skills: the contract stays additive (SPEC §4.2)', () => {
+  it('builtin and defer_loading accept false / null from a harness that stores them as columns', async () => {
+    const tools = await toolServer()
+    const model = mockModel([streamFrom([START, ...textChunks('ok'), finish('stop')])])
+    const engine = track(createEngine(testConfig(), { modelFactory: mockFactory(model) }))
+    const history: StoredMessage[] = [
+      { role: 'user', content: [{ type: 'text', text: 'status?' }] },
+      { role: 'assistant', content: [{ type: 'tool_call', call_id: 'h1', tool: 'getStatus', args: {} }] },
+      { role: 'tool', call_id: 'h1', tool: 'getStatus', builtin: false, is_error: false, result: { ok: 1 } },
+      { role: 'tool', call_id: 'h2', tool: 'getStatus', builtin: null, is_error: false, result: { ok: 2 } },
+    ]
+    history.splice(3, 0, { role: 'assistant', content: [{ type: 'tool_call', call_id: 'h2', tool: 'getStatus', args: {} }] })
+
+    const result = await runWait(
+      engine,
+      runRequest({ messages: history as never, tools: [{ ...tool(tools.url, 'getStatus'), defer_loading: null }] as never }),
+    )
+
+    expect(result.status).toBe('completed')
+  })
+
   it('without skills an HTTP tool named load_skill is an ordinary tool', async () => {
     const tools = await toolServer()
     const model = mockModel([
