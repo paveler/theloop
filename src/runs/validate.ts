@@ -5,6 +5,7 @@
  */
 import type { Config } from '../config.js'
 import {
+  BUILTIN_TOOLS,
   LIMIT_CAPS,
   LIMIT_DEFAULTS,
   PROVIDER_IDS,
@@ -19,6 +20,7 @@ import type { ModelFactory, ResolvedModel } from '../providers/factory.js'
 import { validateImages } from './images.js'
 import { assertLastMessage, assertToolInvariant } from './messages.js'
 import { compileOutputChecks, type CompiledOutputCheck } from './output-checks.js'
+import { usesSkills } from './skills.js'
 
 export interface ValidatedRun {
   request: RunRequest
@@ -69,6 +71,8 @@ export function validateRunRequest(
     }
   }
 
+  assertSkills(request)
+
   if (!request.callback && !request.wait) {
     throw new EngineError('bad_request', 'callback.url or wait: true is required')
   }
@@ -92,6 +96,42 @@ export function validateRunRequest(
       : null
 
   return { request, resolved, limits, sessionId, outputChecks }
+}
+
+/**
+ * Skills and deferred tools (SPEC §4.2, §6.8). Checked only when the request uses the
+ * feature: a request without it keeps working with an HTTP tool named like a built-in.
+ */
+function assertSkills(request: RunRequest): void {
+  if (!usesSkills(request)) return
+  const reserved = new Set<string>(Object.values(BUILTIN_TOOLS))
+  request.tools.forEach((tool, index) => {
+    if (reserved.has(tool.name)) {
+      throw new EngineError(
+        'bad_request',
+        `tools[${index}].name "${tool.name}" is reserved when skills or deferred tools are used`,
+      )
+    }
+  })
+
+  const toolNames = new Set(request.tools.map((t) => t.name))
+  const seen = new Set<string>()
+  const inSkills = new Set<string>()
+  request.skills.forEach((skill, index) => {
+    if (seen.has(skill.name)) throw new EngineError('bad_request', `skills[${index}].name "${skill.name}" is duplicated`)
+    seen.add(skill.name)
+    for (const name of skill.tools) {
+      if (!toolNames.has(name)) throw new EngineError('bad_request', `skills[${index}].tools: unknown tool "${name}"`)
+      inSkills.add(name)
+    }
+  })
+
+  // until search_tools ships, nothing could activate such a tool (RFC 0001, 4.4)
+  request.tools.forEach((tool, index) => {
+    if (tool.defer_loading && !inSkills.has(tool.name)) {
+      throw new EngineError('bad_request', `tools[${index}] "${tool.name}" is deferred but listed in no skill`)
+    }
+  })
 }
 
 const KNOWN_PARAMS = new Set(['temperature', 'top_p', 'stop', 'seed', 'thinking', 'cache'])

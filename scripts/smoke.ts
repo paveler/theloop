@@ -1,5 +1,5 @@
 /**
- * Live smoke run (SPEC §13, item 6): keys from .env, real network, not run in CI.
+ * Live smoke run (SPEC §13, item 7): keys from .env, real network, not run in CI.
  *
  *   npm run smoke                 # every provider with a key
  *   npm run smoke -- anthropic    # just one
@@ -28,6 +28,11 @@ interface Case {
   vision?: boolean
   /** limits.max_tokens; default 4096. MiniMax counts thinking toward max_tokens. */
   maxTokens?: number
+  /**
+   * getWeather is deferred behind a skill (SPEC §6.8): the tool must arrive through
+   * load_skill (tool_reference on Anthropic), and a second run on that history must read the cache.
+   */
+  skills?: boolean
 }
 
 const CASES: Case[] = [
@@ -39,6 +44,7 @@ const CASES: Case[] = [
     thinking: true,
     vision: true,
   },
+  { id: 'anthropic-skills', provider: 'anthropic', model: 'claude-sonnet-5', envKey: 'ANTHROPIC_API_KEY', skills: true },
   { id: 'openai', provider: 'openai', model: 'gpt-4o-mini', envKey: 'OPENAI_API_KEY', vision: true },
   { id: 'deepseek', provider: 'deepseek', model: 'deepseek-chat', envKey: 'DEEPSEEK_API_KEY' },
   // GLM: without params.thinking the engine turns thinking off; 5.3 cannot turn it off — depth low (SPEC §9.3)
@@ -119,6 +125,7 @@ async function main(): Promise<void> {
         console.log('  tool not called — the provider ignored tools or the model answered from memory')
       }
       if (result.error) console.log(`  error: ${JSON.stringify(result.error)}`)
+      if (testCase.skills) failures += await skillsFollowUp(engine, testCase, toolUrl, result)
     } catch (err) {
       failures++
       console.log(`✗ ${testCase.id}: ${err instanceof Error ? err.message : String(err)}`)
@@ -151,6 +158,26 @@ async function main(): Promise<void> {
   process.exit(failures > 0 ? 1 : 0)
 }
 
+/** The skill was loaded and the tool called; the next turn on that history reads the cache. */
+async function skillsFollowUp(
+  engine: ReturnType<typeof createEngine>,
+  testCase: Case,
+  toolUrl: string,
+  first: RunResult,
+): Promise<number> {
+  const loaded = first.tool_calls.some((c) => c.tool === 'load_skill' && c.builtin && c.status === 'ok')
+  const called = first.tool_calls.some((c) => c.tool === 'getWeather' && c.status === 'ok')
+  console.log(`  ${loaded && called ? '✓' : '✗'} load_skill then getWeather: ${first.tool_calls.map((c) => c.tool).join(', ')}`)
+  const history = [
+    { role: 'user', content: [{ type: 'text', text: 'What is the weather in Berlin? Answer in one sentence.' }] },
+    ...first.messages,
+  ]
+  const second = await runCase(engine, testCase, toolUrl, [{ type: 'text', text: 'And in Paris?' }], history)
+  const cacheRead = second.usage.calls[0]?.cache_read_tokens ?? 0
+  console.log(`  ${cacheRead > 0 ? '✓' : '✗'} second turn: ${second.status}, step 1 cache read ${cacheRead}`)
+  return (loaded && called ? 0 : 1) + (cacheRead > 0 ? 0 : 1)
+}
+
 function reasoningParts(result: RunResult): number {
   return result.messages
     .filter((m) => m.role === 'assistant')
@@ -172,6 +199,7 @@ async function runCase(
   testCase: Case,
   toolUrl: string,
   content: Array<Record<string, unknown>> = [{ type: 'text', text: 'What is the weather in Berlin? Answer in one sentence.' }],
+  history: unknown[] = [],
 ): Promise<RunResult> {
   const res = await engine.app.request('/runs', {
     method: 'POST',
@@ -183,8 +211,11 @@ async function runCase(
         model: testCase.model,
         ...(testCase.thinking ? { params: { thinking: { budget_tokens: 2048 } } } : {}),
       },
-      system: 'You are a concise assistant. If you need the weather, call the getWeather tool.',
-      messages: [{ role: 'user', content }],
+      // the skills case needs a prefix above the provider's minimum cacheable size
+      system: testCase.skills
+        ? `You are a concise assistant.\n\n${'Weather answers are short, factual and name the city. '.repeat(250)}`
+        : 'You are a concise assistant. If you need the weather, call the getWeather tool.',
+      messages: [...history, { role: 'user', content }],
       tools: [
         {
           name: 'getWeather',
@@ -196,8 +227,21 @@ async function runCase(
           },
           endpoint: toolUrl,
           effect: 'read',
+          ...(testCase.skills ? { defer_loading: true } : {}),
         },
       ],
+      ...(testCase.skills
+        ? {
+            skills: [
+              {
+                name: 'weather',
+                description: 'Current weather lookups. Use when the user asks about the weather.',
+                body: '# Weather\n\nCall getWeather with the city name and answer in one sentence.',
+                tools: ['getWeather'],
+              },
+            ],
+          }
+        : {}),
       limits: { max_steps: 4, max_tokens: testCase.maxTokens ?? 4096, timeout_ms: 120_000 },
       wait: true,
     }),

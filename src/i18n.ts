@@ -36,6 +36,15 @@ export interface Texts {
   argMissingField(where: string, key: string): string
   argMinItems(where: string, min: number): string
 
+  /* skills and deferred tools (§6.8); machine prefixes and names do not depend on the locale */
+  skillIndexHeader: string
+  loadSkillDescription: string
+  loadSkillNameDescription: string
+  skillLoaded(name: string, tools: readonly string[]): string
+  unknownSkill(name: string, available: readonly string[]): string
+  toolNotLoadedSkill(tool: string, skill: string): string
+  toolNotLoaded(tool: string): string
+
   /* format gate (§5.4); field names arrive already quoted */
   checkHeader(fence: string): string
   checkFooter(fence: string): string
@@ -94,6 +103,22 @@ const ru: Texts = {
   argMissingField: (where, key) => `${where}: нет обязательного поля "${key}"`,
   argMinItems: (where, min) => `${where}: нужно минимум ${min} элементов`,
 
+  skillIndexHeader:
+    '[engine] Скиллы. Прежде чем браться за тему, которую покрывает скилл, вызови load_skill с его ' +
+    'именем: инструкции и тулы скилла придут на следующем шаге.',
+  loadSkillDescription:
+    'Загрузить скилл из списка в системном промпте: возвращает его инструкции, а его тулы ' +
+    'становятся доступны со следующего шага.',
+  loadSkillNameDescription: 'Имя скилла, ровно как в списке.',
+  skillLoaded: (name, tools) =>
+    tools.length > 0
+      ? `[engine] Скилл "${name}" загружен. Тулы, доступные со следующего шага: ${tools.join(', ')}.`
+      : `[engine] Скилл "${name}" загружен.`,
+  unknownSkill: (name, available) => `unknown_skill: ${name}. Доступные скиллы: ${available.join(', ')}.`,
+  toolNotLoadedSkill: (tool, skill) =>
+    `tool_not_loaded: ${tool} входит в скилл "${skill}". Сначала вызови load_skill("${skill}").`,
+  toolNotLoaded: (tool) => `tool_not_loaded: ${tool} не загружен. Сначала найди его через search_tools.`,
+
   checkHeader: (fence) => `[Проверка формата] Блок ${fence} не прошёл проверку:`,
   checkFooter: (fence) => `Пришли только исправленный блок \`\`\`${fence}\`\`\`, без текста до и после.`,
   blockUnclosed: 'блок не закрыт: после JSON нет строки ```',
@@ -146,6 +171,22 @@ const en: Texts = {
   argWrongTypeOneOf: (where, expected, got) => `${where}: expected one of [${expected.join(', ')}], got ${got}`,
   argMissingField: (where, key) => `${where}: missing required field "${key}"`,
   argMinItems: (where, min) => `${where}: at least ${min} items required`,
+
+  skillIndexHeader:
+    '[engine] Skills. Before working on a topic a skill covers, call load_skill with its name: ' +
+    'the instructions, and the tools the skill unlocks, arrive on the next step.',
+  loadSkillDescription:
+    'Load a skill listed in the system prompt: returns its instructions and makes its tools ' +
+    'available from the next step.',
+  loadSkillNameDescription: 'Skill name, exactly as listed.',
+  skillLoaded: (name, tools) =>
+    tools.length > 0
+      ? `[engine] Skill "${name}" loaded. Tools available from the next step: ${tools.join(', ')}.`
+      : `[engine] Skill "${name}" loaded.`,
+  unknownSkill: (name, available) => `unknown_skill: ${name}. Available skills: ${available.join(', ')}.`,
+  toolNotLoadedSkill: (tool, skill) =>
+    `tool_not_loaded: ${tool} belongs to skill "${skill}". Call load_skill("${skill}") first.`,
+  toolNotLoaded: (tool) => `tool_not_loaded: ${tool} is not loaded. Find it with search_tools first.`,
 
   checkHeader: (fence) => `[Format check] The ${fence} block failed validation:`,
   checkFooter: (fence) => `Send only the corrected \`\`\`${fence}\`\`\` block, with no text before or after.`,

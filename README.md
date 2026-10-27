@@ -82,6 +82,10 @@ intents, limits and everything else — [SPEC.md](SPEC.md).
   filtering; provider keys never in logs, SSE, callbacks or error bodies.
 - **Providers.** Anthropic, OpenAI, DeepSeek, GLM (z.ai), GigaChat, MiniMax and any
   OpenAI-compatible endpoint, with per-key queues and AIMD rate limiting.
+- **Skills and deferred tools.** `skills[]` in the `SKILL.md` shape: the model sees an index,
+  loads a skill's instructions and tools mid-run with `load_skill`, and the prompt cache
+  survives (`tool_reference` on Anthropic). Still stateless: what is loaded comes from the
+  history.
 - **Debuggable.** An in-memory event journal per run and session (`GET /logs`), with content,
   without shipping prompts to your log pipeline.
 
@@ -194,6 +198,7 @@ src/
   runs/provider.ts      one provider attempt, error classification
   runs/messages.ts      StoredMessage ↔ ModelMessage, context estimate and trimming, dates
   runs/output-checks.ts the format gate for fenced blocks (§5.4)
+  runs/skills.ts        skills, deferred tools, load_skill, activation from history (§6.8)
   runs/usage.ts         attempts ok / failed / unknown, normalization, cost, budgets
   runs/callback.ts      at-least-once result delivery
   runs/validate.ts      request validation

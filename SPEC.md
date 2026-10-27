@@ -273,7 +273,16 @@ maximum size of any incoming request body is `MAX_REQUEST_BYTES` (env, default 1
       "endpoint": "https://api.example.com/tools/getOrderStatus",
       "headers": { "Authorization": "Bearer …" },
       "timeout_ms": 30000,
-      "effect": "read" }
+      "effect": "read" },
+    { "name": "createReturn", "description": "…", "input_schema": { "…": "…" },
+      "endpoint": "https://api.example.com/tools/createReturn", "effect": "write",
+      "defer_loading": true }
+  ],
+  "skills": [
+    { "name": "order-returns",
+      "description": "Return and refund policy. Use when the user asks about a return.",
+      "body": "# Returns\n\nCheck the order status first …",
+      "tools": ["createReturn"] }
   ],
   "limits": { "max_steps": 8, "max_tokens": 4096, "max_tool_calls": 16,
               "max_total_tokens": 150000, "max_cost": 0.5,
@@ -303,7 +312,8 @@ maximum size of any incoming request body is `MAX_REQUEST_BYTES` (env, default 1
 | `llm.pricing` | no | If present, the engine returns `usage.cost` and can enforce `limits.max_cost` (§8.3). |
 | `system` | no | Dates are never put here by the engine (§9.4). |
 | `messages` | yes | The full history; at least one `user` message. |
-| `tools[]` | no | `effect: "read" \| "write"` is **mandatory** (§6.4). |
+| `tools[]` | no | `effect: "read" \| "write"` is **mandatory** (§6.4). `defer_loading: true` hides the tool from the model until a skill activates it (§6.8). |
+| `skills[]` | no | Up to 64 instruction bundles `{ name, description, body, tools? }` the model loads on demand (§6.8). `name`: `^[a-z0-9][a-z0-9_-]{0,63}$`, unique; `description`: 1 to 1024 characters; `body`: 1 byte to 32 KiB UTF-8; `tools`: names from `tools[]`. |
 | `limits` | no | Defaults and server ceilings — §10. |
 | `stream` | no | What SSE reveals beyond text (§6.6). Default — nothing. |
 | `callback` | no if `wait: true` | Where to deliver the result: `{ url, headers? }`. The callback body is `{ "payload": <result> }` (§7). |
@@ -331,7 +341,10 @@ Missing any → `400 write_context_missing` listing the missing fields; no run i
 created.
 
 Refusals: `400 bad_request` (including `output_checks`: invalid schema, schema over
-64 KB, more than 4 checks, repeated `fence` — §5.4) `| unresolved_tool_call |
+64 KB, more than 4 checks, repeated `fence` — §5.4; and, only when the request uses
+skills or deferred tools: a `tools[]` entry named `load_skill` or `search_tools`, a
+duplicated skill name, a skill listing a tool absent from `tools[]`, a deferred tool
+listed in no skill — §6.8) `| unresolved_tool_call |
 history_ends_with_assistant` (§5) `| write_context_missing | provider_not_allowed |
 provider_key_missing | egress_denied | unsupported_media_type | image_too_large`,
 `401 unauthorized`, `409 session_busy` (+ `active_run_id`, the run is still going)
@@ -469,7 +482,7 @@ StoredMessage =
   | { role: "user",      content: ContentPart[], created_at?: string }
   | { role: "assistant", content: AssistantPart[], partial?: true }
   | { role: "tool",      call_id, tool, result?: any, error?: string, is_error: boolean,
-                         operation_id?: string }
+                         operation_id?: string, builtin?: true }
 
 ContentPart   = TextPart | { type: "image", url } | { type: "event", name, data }
 TextPart      = { type: "text", text }
@@ -487,6 +500,9 @@ AssistantPart = TextPart
   shows the model the message date from it (§9.4): the line is identical on every turn,
   so provider caches and signed thinking blocks stay valid. Without it, the last user
   message gets the current time, which lives for one turn only.
+- `builtin: true` on a `tool` message — the engine wrote it for one of its own tools
+  (`load_skill`, §6.8). It is the only thing that makes such a pair a built-in one; the
+  harness stores it with the rest of the message (H20).
 - `partial: true` — the answer was cut (cancel / timeout / shutdown / limit). It goes
   into the next run as is.
 - An `event` part in a `user` message is how the harness delivers an event outside the
@@ -517,8 +533,9 @@ schemas + history + the `max_tokens` reserve for the answer. The window is
 punctuation can be underestimated — the margin covers that.
 
 Does not fit → drop the oldest messages, as `tool_call` + `tool` pairs together with the
-`reasoning` of the same turn; the first `user` message and the last 4 messages always
-stay. The result carries `context_trimmed: true`. If the provider still answers
+`reasoning` of the same turn; the first `user` message, the last 4 messages and the turns
+that carry a skill activation in effect (§6.8) always stay. With skills, `system` includes
+the skill index and only the visible tools are counted. The result carries `context_trimmed: true`. If the provider still answers
 "context too long" → `failed / context_too_large`, no automatic retry. Summarization is
 out of scope (§15). How much context is used after the run and which window the engine
 assumed — `result.context` (§7).
@@ -751,6 +768,9 @@ are skipped). If not, the endpoint is **not called**; the model gets
 with missing fields and create a half-baked operation (§6.4). Rejected calls do not
 count toward `duplicate_write_intent` (§6.3) — they never reach an endpoint.
 
+A call to a deferred tool the model cannot see yet is refused the same way with
+`tool_not_loaded: …` (§6.8).
+
 `call_id` is unique within the run and serves as **transport** idempotency: an engine
 retry on network / 5xx uses the same `call_id`, and the tool may return its previous
 answer. **`call_id` is not stable across runs** — after a crash and a retry there will
@@ -970,6 +990,64 @@ engine cuts this without a new status:
 Calls with **different** arguments are not repeats: iterating over queries is
 legitimate work, bounded by rule 4 and `max_steps`.
 
+### 6.8 Skills and deferred tools
+
+The model can pull instructions and tools **within a run**, between steps (RFC 0001).
+Everything here applies only to a request with a non-empty `skills[]` or at least one
+tool with `defer_loading: true`; any other request runs exactly as before.
+
+**Skill index.** The engine appends to `system`, after a blank line, an index of the
+skills sorted by name: the header `[engine] Skills. …` (Appendix B) and one line
+`- <name>: <description>` per skill. It is stable between turns and sits inside the
+cached `system` block (§9.3).
+
+**Built-in tool `load_skill`** `{ "name": string }`, offered when `skills[]` is non-empty.
+Built-ins have no endpoint, are never retried or truncated, are `effect: read`, and **do
+not count toward `max_tool_calls`**; each still takes a step. Names `load_skill` and
+`search_tools` are reserved while the feature is used.
+
+- Known skill → `ok`. The stored `result` is the body, verbatim, in a `tool` message with
+  `builtin: true`. The model sees a header, a blank line and the body:
+  `[engine] Skill "<name>" loaded. Tools available from the next step: <a>, <b>.`
+  Every deferred tool listed in the skill becomes visible **from the next step**.
+- Unknown skill → tool error `unknown_skill: <name>. Available skills: …`; the run goes on.
+- The same skill twice in a run is a §6.7 repeat. A skill loaded in an earlier run loads
+  again normally (`reloaded: true` in the journal).
+
+**Deferred tools.** A deferred tool is validated, egress-checked and executed like any
+other once visible; deferral is a context optimisation, not an authorization boundary. A
+call to one that is not visible yet is not executed: `tool_not_loaded: <tool> belongs to
+skill "<skill>". Call load_skill("<skill>") first.` It does not count toward
+`max_tool_calls` and is not a repeat candidate (§6.7), so the same call on the next step,
+once the skill is loaded, executes. Until `search_tools` ships, every deferred tool must be
+listed in a skill.
+
+**Activation mechanisms**, one per run, chosen from the model (§9.2) and written to
+`run_start` as `activation`:
+
+- `tool_reference` — Anthropic models with tool search. Every step carries every tool:
+  non-deferred by name (built-ins among them), then deferred by name with
+  `defer_loading: true`; `cache_control` goes on the last non-deferred one. A built-in
+  result that activates tools is a `tool_result` of `tool_reference` blocks only, one per
+  tool; its text follows as a `text` block in the same user turn, after the tool results
+  (the API refuses a `tool_result` that mixes `tool_reference` with text). The API expands the definitions inside the conversation, so the
+  cached prefix never changes. `tool_choice: none` steps keep the tools.
+- `tools_array` — every other provider. A step carries the visible tools by name; an
+  activation adds tools to the next step's array (one prefix cache miss). The text is the
+  whole `tool_result`.
+
+**Statelessness.** Before step 1 the engine derives what is loaded from `messages`: every
+`load_skill` pair whose `tool` message has `builtin: true` and `is_error: false`, whose
+skill is still in `skills[]`, makes that skill's deferred tools visible (`skills_restored`).
+Unmarked pairs — an HTTP tool that was called `load_skill` before the harness adopted
+skills — stay ordinary history. A marked message with the wrong shape (`args.name` and
+`result` must be strings) is ordinary history with a `builtin_history_invalid` warning.
+Historical results render deterministically from the stored message and the current
+request: byte for byte as in the run that produced them while tools, skills and locale do
+not change. The body in the history is the body as loaded then; the history is never
+rewritten (§9.3). Trimming (§5.1) never drops a turn that carries an activation in
+effect, so the model's tools always match the engine's visible set.
+
 ## 7. Result and callback
 
 `POST callback.url` after the terminal status. **One logical result, at-least-once
@@ -1047,6 +1125,8 @@ endpoints are **not** covered by the signature — they have their own `tools[].
   `done` and run-token `cancel` return `error` without it (§4.4, §6.6).
 - `tool_calls[].status`: `ok | error | timeout | deferred | cancelled | not_executed |
   duplicate_write_intent | http_error | protocol_error`.
+- `tool_calls[].builtin: true` — a call of an engine tool (§6.8): `effect: "read"`,
+  in-process `duration_ms`. Absent on HTTP tool calls.
 - `history_revision` — an echo of the request (§4.2), for ordering late results (§3).
 - `output_checks` — the format gate outcome per fence (§5.4). Only if the request had
   `output_checks`; `[]` — the run never reached a final text. Absent otherwise.
@@ -1279,7 +1359,10 @@ some tiers; the default `PROVIDER_MAX_CONCURRENCY_GLM` is 4 (§11.6).
 | openai-compatible | as declared | `capabilities.parallel_tools`, default no | `capabilities.usage_in_stream`, default no | — | — |
 
 The engine branches on two axes: parallel tools and usage in stream (otherwise
-`estimated`). The rest is informational.
+`estimated`). The rest is informational. One more, internal: **tool references** —
+Anthropic models with tool search (Opus / Sonnet / Haiku 4.5 and later, every Fable and
+Mythos, later versions of the same lines matched in advance) activate deferred tools
+through `tool_reference` (§6.8); every other model, MiniMax included, uses `tools_array`.
 
 ### 9.3 Model parameters
 
@@ -1337,7 +1420,7 @@ that breaks the cache, and on newer Claude models also breaks signed thinking bl
 
 Anthropic and MiniMax: `cache_control` is placed at four points — the Anthropic maximum:
 
-1. the tail of `tools` (the last tool by name);
+1. the tail of `tools` (the last non-deferred tool by name; deferred tools follow it, §6.8);
 2. `system`;
 3. the last part of the last user message **before the current-time line** — only if that
    message has no `created_at` (§9.4);
@@ -1756,7 +1839,11 @@ a log pipeline. There is no database (§2): a restart or deploy means an empty j
 | `tool_result_received` | info / warn | `POST /runs/{id}/tool-result`: accepted, duplicate, refused | `result` / `error` |
 | `tool_result` | info | call outcome: `outcome`, `status`, `error`, `truncated`, `empty`, `operation_id` | `result` |
 | `tool_call_repeated` | warn | a repeat of a previous step's call (§6.7) | `args` |
-| `tool_call_rejected` | warn | invalid args / unknown tool (§6.1) | `args` |
+| `tool_call_rejected` | warn | invalid args / unknown tool (§6.1); `reason: tool_not_loaded` — a hidden deferred tool (§6.8) | `args` |
+| `skills_restored` | info | before step 1, when the history loaded skills (§6.8): `skills`, `tools` | — |
+| `builtin_history_invalid` | warn | a `builtin: true` message of the wrong shape, treated as ordinary history: `call_id`, `tool` | — |
+| `skill_loaded` | info | `load_skill` ok: `name`, `step`, `tools` (activated), `reloaded` | — |
+| `skill_unknown` | warn | `load_skill` with an unknown name | `name` (model text) |
 | `duplicate_write_intent` | warn | two calls of one write tool in a step (§6.3) | `args` |
 | `tools_disabled` | warn | `tool_choice: none` from now on (§6.7): `reason`, repeat and empty counters | — |
 | `output_check` | debug / info / warn | a format gate decision (§5.4): `fence`, `attempt` (0 — the original answer), `outcome` — `absent \| passed \| invalid` for 0, `repaired \| invalid \| missing` for repairs, `failed` + `reason` — gave up; `errors` — paths. `step_start`, `provider_attempt`, `provider_failure`, `limit_hit` of a repair step carry `repair: <fence>`, `repair_attempt` | `issues` (error lines), `block` (original block), `draft` (repair answer) |
@@ -1787,7 +1874,7 @@ equivalent of the following suites.
    MiniMax through the real Anthropic adapter (URL, key, `adaptive`, signed thinking →
    history → next step unchanged, MiniMax and Anthropic signatures never mixed); tool
    ordering by name; date lines from `created_at` and the current-time anchor.
-2. **Loop on `MockLanguageModelV2`** (AI SDK): text without tools; one tool call; parallel
+2. **Loop on `MockLanguageModelV3`** (AI SDK): text without tools; one tool call; parallel
    calls (result order = call order); a tool error → the model continues; `accepted` +
    `tool-result` (first, duplicate with the same body, `result_mismatch`, `call_closed`
    after the call timeout and after the terminal status); `deferred` with `operation_id`;
@@ -1818,14 +1905,22 @@ equivalent of the following suites.
    `409 result_pending`; `history_revision` echoed in the callback and `GET`; `seq`
    monotonic within a run; only `acked` runs evicted, `MAX_RETAINED_BYTES` and `429` with
    non-acked runs only.
-4. **Format gate** (§5.4): block search (last block, inline fence, unclosed,
+4. **Skills** (§6.8): the index in `system`, sorted, `en` / `ru`; `load_skill` returns
+   header and body, the skill's tools are callable from the next step only, and
+   `max_tool_calls` is untouched; `tool_not_loaded`, not a repeat; unknown skill; the same
+   skill twice is `repeated_call`; restoration from history and a reload; an unmarked or
+   malformed pair activates nothing; on `tool_reference` every step carries every tool with
+   `deferLoading`, `cache_control` on the last non-deferred, a `tool_result` of references only with the text after it, tools on
+   `none` steps; trimming keeps the activating turn; without the feature an HTTP tool named
+   `load_skill` is ordinary, with it the name is a `400`; the other `400`s of §4.2.
+5. **Format gate** (§5.4): block search (last block, inline fence, unclosed,
    `<|superquote|>`); schema parity with the client on a corpus of real model outputs;
    model-facing errors (unknown keys, `oneOf` branches, ≤ 8 lines); `passed` without extra
    steps, `repaired` with the final text, `failed` after `max_repairs`, `absent`; a step
    with a tool call is not checked; `tool_choice: none` on repair; `400` on an invalid
    schema; budget, timeout and cancel during repair; SSE order; `output_checks` in the
    callback, `GET` and journal.
-5. **Provider queue** (§11.3, §11.6): concurrency never above the ceiling, FIFO, timeout
+6. **Provider queue** (§11.3, §11.6): concurrency never above the ceiling, FIFO, timeout
    and abort while queued, different keys — different queues; AIMD — a 429 halves the
    ceiling and sets a pause, a burst from old slots decreases once, a success streak
    restores the ceiling, `Retry-After` stretches the pause up to its cap; `Retry-After`
@@ -1834,7 +1929,7 @@ equivalent of the following suites.
    env and by `timeout_ms`, cancel while queued, 429 retry by `Retry-After` and with
    jitter, retry limit, a pause that does not fit `timeout_ms`, a retry queues again, a 429
    after content is not retried, `/health`; the limiter key never contains the key.
-6. **Live smoke** (`npm run smoke`, keys in `.env`, not in CI): Anthropic with a tool call
+7. **Live smoke** (`npm run smoke`, keys in `.env`, not in CI): Anthropic with a tool call
    and thinking; GigaChat OAuth + TLS; an image with a code in it at Anthropic, OpenAI,
    GigaChat and MiniMax-M3 — the model must read the code; MiniMax M2.7 and M3 with a tool —
    the signed thinking block goes back on the second step.
@@ -1961,6 +2056,7 @@ come from skipping one of these.
 | H17 | Keep tool results compact; the engine truncates at `tool_result_max_bytes`. | §6.2 |
 | H18 | Hand `stream_url` / `cancel_url` to end-user clients as is; never expose `ENGINE_TOKEN`. | §4.1 |
 | H19 | Reconcile `Σ usage.total` with provider billing periodically. | §8.4 |
+| H20 | Store the `tool` messages of `load_skill` verbatim, `result` and `builtin` included: the engine restores loaded skills from them on the next run, and only marked messages count. | §5, §6.8 |
 
 A reference harness, a conformance test kit for harnesses and examples for common platforms
 are on the roadmap.
@@ -1984,6 +2080,11 @@ providers, the network and tools is passed through as received.
 | Empty tool result (§6.2) | `[engine] The tool succeeded and returned an empty result — there is no data. Calling it again with the same arguments will return the same.` |
 | Repeated call (§6.7) | `repeated_call: this exact call was already executed in this run; its result is above. Repeating it returns the same — use the result you have or answer the user.` |
 | Invalid tool input (§6.1) | `invalid_tool_input: <reason>`, e.g. `arguments: missing required field "id"`, `n: expected integer, got string` |
+| Skill index header (§6.8) | `[engine] Skills. Before working on a topic a skill covers, call load_skill with its name: the instructions, and the tools the skill unlocks, arrive on the next step.` |
+| `load_skill` description (§6.8) | `Load a skill listed in the system prompt: returns its instructions and makes its tools available from the next step.`; argument `name`: `Skill name, exactly as listed.` |
+| Skill loaded (§6.8) | `[engine] Skill "<name>" loaded. Tools available from the next step: <a>, <b>.` or `[engine] Skill "<name>" loaded.` |
+| Unknown skill (§6.8) | `unknown_skill: <name>. Available skills: <a>, <b>.` |
+| Tool not loaded (§6.8) | `tool_not_loaded: <tool> belongs to skill "<skill>". Call load_skill("<skill>") first.` |
 | Format check header (§5.4) | `[Format check] The <fence> block failed validation:` |
 | Format check footer (§5.4) | ``Send only the corrected ```<fence>``` block, with no text before or after.`` |
 | Invalid JSON in a block (§5.4) | `JSON did not parse: <reason>` |

@@ -67,6 +67,7 @@ import {
   type Issue,
 } from './output-checks.js'
 import { streamStep, type StepOutcome, type StepToolCall } from './provider.js'
+import { SkillState, type ModelTool, type Restored } from './skills.js'
 import { validateToolArgs } from '../tools/args.js'
 import { callTool, type ToolOutcome } from '../tools/http.js'
 import { checkBudgets, normalizeUsage, UsageTracker } from './usage.js'
@@ -120,11 +121,18 @@ export function startRun(record: RunRecord, plan: RunPlan, deps: RunnerDeps): Pr
 class RunExecution {
   private readonly usage: UsageTracker
   private readonly toolsByName = new Map<string, ToolDef>()
-  private readonly toolSet: ToolSet
+  /** The step's tool set; rebuilt when an activation changes it (SPEC §6.8). */
+  private toolSet: ToolSet = {}
+  private toolSetVersion = -1
   private readonly resolveImage: (url: string) => Promise<{ data: Uint8Array; mediaType: string }>
+  /** `system` with the skill index (SPEC §6.8). */
+  private readonly systemText: string | null
   private readonly systemTokens: number
-  private readonly toolTokens: number
+  /** Schemas of the visible tools only: deferred tools cost nothing until activated. */
+  private toolTokens = 0
   private readonly cacheEnabled: boolean
+  private readonly skills: SkillState
+  private readonly restored: Restored
 
   private seq = 0
   private newMessages: StoredMessage[] = []
@@ -167,16 +175,18 @@ class RunExecution {
     for (const def of plan.request.tools) this.toolsByName.set(def.name, def)
 
     this.cacheEnabled = plan.resolved.supportsCacheControl && plan.request.llm.params.cache !== false
-    // tools by name, not in request order (SPEC §9.3): Anthropic and GLM put them at the start
-    // of the prompt, and reordering them from turn to turn wipes the whole cache
-    const sortedTools = [...plan.request.tools].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
-    this.toolSet = buildToolSet(sortedTools, this.cacheEnabled)
     // engine text locale (SPEC Appendix B) — before anything that writes text for the model
     const locale = resolveLocale(plan.request.meta.locale, deps.config.engineLocale)
     if (locale.unsupported) {
       log.warn('locale_unsupported', { run_id: record.runId, requested: locale.unsupported, locale: locale.locale })
     }
     this.texts = texts(locale.locale)
+    this.skills = new SkillState(plan.request, plan.resolved.toolReferences, this.texts)
+    this.restored = this.skills.restore(plan.request.messages)
+    this.refreshTools()
+    const index = this.skills.index()
+    const system = plan.request.system && plan.request.system.trim().length > 0 ? plan.request.system : null
+    this.systemText = index ? (system ? `${system}\n\n${index}` : index) : (plan.request.system ?? null)
     this.resolveImage = createImageResolver(
       deps.egress,
       deps.config,
@@ -192,8 +202,7 @@ class RunExecution {
     this.timezone = timezone
     this.dateLine = engineDateLine(timezone, new Date(), this.texts)
     this.dateAnchor = plan.request.messages.findLast((m) => m.role === 'user') ?? null
-    this.systemTokens = estimateTokens(plan.request.system ?? '') + estimateTokens(this.dateLine)
-    this.toolTokens = estimateToolSchemaTokens(plan.request.tools)
+    this.systemTokens = estimateTokens(this.systemText ?? '') + estimateTokens(this.dateLine)
 
     // GigaChat's cache lives in a session (SPEC §9.1): all steps and chat turns go into one. Hashed so
     // the client's id never reaches the provider and the header does not break on non-ASCII
@@ -212,6 +221,18 @@ class RunExecution {
   private readonly dateAnchor: StoredMessage | null
   private readonly providerHeaders: Record<string, string> | undefined
 
+  /**
+   * The tool set and its token estimate, rebuilt only when the visible set changed. Tools go
+   * by name, not in request order (SPEC §9.3): Anthropic and GLM put them at the start of the
+   * prompt, and reordering them from turn to turn wipes the whole cache.
+   */
+  private refreshTools(): void {
+    if (this.toolSetVersion === this.skills.version) return
+    this.toolSetVersion = this.skills.version
+    this.toolSet = buildToolSet(this.skills.providerTools(this.plan.request.tools), this.cacheEnabled)
+    this.toolTokens = estimateToolSchemaTokens(this.skills.visibleTools(this.plan.request.tools))
+  }
+
   async execute(): Promise<void> {
     const { record, plan, deps } = this
     const { request } = plan
@@ -228,7 +249,10 @@ class RunExecution {
         history_revision: request.history_revision ?? null,
         wait: request.wait,
         callback: request.callback ? safeUrl(request.callback.url) : null,
-        tools: request.tools.map((t) => `${t.name}:${t.effect}`),
+        tools: request.tools.map((t) => `${t.name}:${t.effect}${t.defer_loading === true ? ':deferred' : ''}`),
+        ...(this.skills.enabled
+          ? { skills: this.skills.skillNames(), activation: this.skills.mechanism, tool_search: false }
+          : {}),
         limits: plan.limits,
         context_window: plan.resolved.contextWindow,
         cache: this.cacheEnabled,
@@ -239,10 +263,17 @@ class RunExecution {
           : {}),
       },
       {
-        system: request.system,
+        system: this.systemText,
         history_tail: request.messages.slice(-HISTORY_TAIL_IN_LOG).map(describeMessage),
       },
     )
+
+    for (const item of this.restored.invalid) {
+      log.warn('builtin_history_invalid', { run_id: record.runId, call_id: item.call_id, tool: item.tool })
+    }
+    if (this.restored.skills.length > 0) {
+      log.info('skills_restored', { run_id: record.runId, skills: this.restored.skills, tools: this.restored.tools })
+    }
 
     record.sse.emit('start', {
       run_id: record.runId,
@@ -338,12 +369,14 @@ class RunExecution {
         this.finish('stopped_limit', 'max_steps')
         return
       }
+      // built-ins and tool_not_loaded rejections never reach an endpoint: they do not count (§6.8)
       const remaining = limits.max_tool_calls - this.toolCallsUsed
-      if (outcome.toolCalls.length > remaining) {
+      const requested = outcome.toolCalls.filter((c) => !this.skills.builtin(c.tool) && !this.skills.isHidden(c.tool)).length
+      if (requested > remaining) {
         this.logLimit('max_tool_calls', {
           step,
           used: this.toolCallsUsed,
-          requested: outcome.toolCalls.length,
+          requested,
           max_tool_calls: limits.max_tool_calls,
         })
         this.sealUnresolvedToolCalls('not_executed: max_tool_calls', 'not_executed')
@@ -373,6 +406,7 @@ class RunExecution {
   ): Promise<{ messages: ModelMessage[]; historyTokens: number }> {
     const { plan } = this
     const history = [...plan.request.messages, ...this.newMessages, ...extra]
+    this.refreshTools()
 
     const trim = trimHistory({
       messages: history,
@@ -380,6 +414,7 @@ class RunExecution {
       toolTokens: this.toolTokens,
       reserveTokens: plan.limits.max_tokens,
       contextWindow: plan.resolved.contextWindow,
+      ...(this.skills.enabled ? { pinned: (block) => this.skills.isPinned(block) } : {}),
     })
     if (trim.trimmed) {
       this.contextTrimmed = true
@@ -401,8 +436,9 @@ class RunExecution {
       dates: { timezone: this.timezone, anchor, now: this.dateLine },
       cacheBreakpoints: this.cacheEnabled,
       texts: this.texts,
+      ...(this.skills.enabled ? { renderBuiltin: (message, args) => this.skills.render(message, args) } : {}),
     })
-    const system = buildSystemMessages(plan.request.system, anchor ? null : this.dateLine, this.cacheEnabled)
+    const system = buildSystemMessages(this.systemText, anchor ? null : this.dateLine, this.cacheEnabled)
 
     const historyTokens = Math.max(
       0,
@@ -416,6 +452,7 @@ class RunExecution {
       estimated_tokens: trim.estimatedTokens,
       tools_disabled: this.toolsDisabled || undefined,
       tool_calls_used: this.toolCallsUsed,
+      ...(this.skills.enabled ? { tools_visible: this.skills.visibleTools(plan.request.tools).map((t) => t.name) } : {}),
       ...this.repairFields(),
     })
     return { messages: [...system, ...converted], historyTokens }
@@ -867,13 +904,20 @@ class RunExecution {
     // args that fail input_schema. Such a call must not reach a write endpoint —
     // it would create an operation with missing fields (SPEC §6.1, §6.4).
     const rejected = new Map<string, string>()
+    // a deferred tool the model has never seen the schema of (§6.8); not a repeat candidate
+    const notLoaded = new Set<string>()
     for (const call of calls) {
       if (repeated.has(call.callId)) continue
+      if (this.skills.isHidden(call.tool)) {
+        notLoaded.add(call.callId)
+        rejected.set(call.callId, this.skills.notLoadedError(call.tool))
+        continue
+      }
       if (call.invalid) {
         rejected.set(call.callId, `invalid_tool_input: ${call.invalidReason ?? this.texts.invalidCall}`)
         continue
       }
-      const def = this.toolsByName.get(call.tool)
+      const def = this.skills.builtin(call.tool) ?? this.toolsByName.get(call.tool)
       if (!def) {
         rejected.set(call.callId, `unknown_tool: ${call.tool}`)
         continue
@@ -903,13 +947,15 @@ class RunExecution {
           call,
           outcome: { kind: 'error', error: this.texts.repeatedCall, status: 'error' },
           durationMs: 0,
+          ...(this.skills.builtin(call.tool) ? { builtin: true as const } : {}),
         }
       }
       const rejection = rejected.get(call.callId)
       if (rejection) {
+        const reason = notLoaded.has(call.callId) ? 'tool_not_loaded' : rejection
         log.warn(
           'tool_call_rejected',
-          { run_id: this.record.runId, call_id: call.callId, tool: call.tool, reason: rejection },
+          { run_id: this.record.runId, call_id: call.callId, tool: call.tool, reason },
           { args: call.args },
         )
         return {
@@ -917,8 +963,10 @@ class RunExecution {
           outcome: { kind: 'error', error: rejection, status: 'error' },
           status: 'error',
           durationMs: 0,
+          ...(this.skills.builtin(call.tool) ? { builtin: true as const } : {}),
         }
       }
+      if (this.skills.builtin(call.tool)) return this.runBuiltin(call)
       if (duplicated.has(call.tool)) {
         log.warn(
           'duplicate_write_intent',
@@ -950,11 +998,14 @@ class RunExecution {
 
     // duplicate_write_intent asks for one combined call — it may legitimately match a refused one
     for (const result of results) {
-      if (result.status !== 'duplicate_write_intent') this.seenCalls.add(callKey(result.call))
+      if (result.status === 'duplicate_write_intent' || notLoaded.has(result.call.callId)) continue
+      this.seenCalls.add(callKey(result.call))
     }
+    // activations take effect from the next step (§6.8)
+    for (const result of results) if (result.activate) this.skills.activate(result.activate)
     this.repeatedCalls += repeated.size
     for (const result of results) {
-      if (result.outcome.kind !== 'ok' || !isEmptyToolResult(result.outcome.result)) continue
+      if (result.builtin || result.outcome.kind !== 'ok' || !isEmptyToolResult(result.outcome.result)) continue
       this.emptyResults.set(result.call.tool, (this.emptyResults.get(result.call.tool) ?? 0) + 1)
     }
 
@@ -979,7 +1030,8 @@ class RunExecution {
     // results go into the history in the model's tool-call order (SPEC §6.3)
     for (const result of results) {
       const def = this.toolsByName.get(result.call.tool)
-      const effect = def?.effect ?? 'read'
+      const effect = result.builtin ? 'read' : (def?.effect ?? 'read')
+      const builtin = result.builtin ? { builtin: true as const } : {}
 
       if (result.outcome.kind === 'deferred') {
         deferred = true
@@ -1009,6 +1061,7 @@ class RunExecution {
           result: result.outcome.result,
           is_error: false,
           truncated: result.outcome.truncated,
+          ...builtin,
         })
         this.toolSummaries.push({
           call_id: result.call.callId,
@@ -1018,6 +1071,7 @@ class RunExecution {
           duration_ms: result.durationMs,
           truncated: result.outcome.truncated,
           operation_id: null,
+          ...builtin,
         })
         this.record.sse.emit('tool_result', {
           call_id: result.call.callId,
@@ -1035,6 +1089,7 @@ class RunExecution {
         tool: result.call.tool,
         error: result.outcome.error,
         is_error: true,
+        ...builtin,
       })
       this.toolSummaries.push({
         call_id: result.call.callId,
@@ -1044,6 +1099,7 @@ class RunExecution {
         duration_ms: result.durationMs,
         truncated: false,
         operation_id: null,
+        ...builtin,
       })
       this.record.sse.emit('tool_result', {
         call_id: result.call.callId,
@@ -1055,6 +1111,36 @@ class RunExecution {
     }
 
     return deferred
+  }
+
+  /**
+   * An engine tool (§6.8): no endpoint, no retry, no truncation, not counted toward
+   * max_tool_calls. The journal gets its own events, not tool_call / tool_result, which
+   * describe HTTP endpoints.
+   */
+  private runBuiltin(call: StepToolCall): CallResult {
+    const started = Date.now()
+    const loaded = this.skills.loadSkill(call.args)
+    const durationMs = Date.now() - started
+    if (!loaded.ok) {
+      // the name is model text and may carry user data: content only (§12.2)
+      log.warn('skill_unknown', { run_id: this.record.runId, step: this.steps, call_id: call.callId }, { name: loaded.name })
+      return { call, outcome: { kind: 'error', error: loaded.text, status: 'error' }, durationMs, builtin: true }
+    }
+    log.info('skill_loaded', {
+      run_id: this.record.runId,
+      step: this.steps,
+      name: loaded.name,
+      tools: loaded.tools,
+      reloaded: loaded.reloaded,
+    })
+    return {
+      call,
+      outcome: { kind: 'ok', result: loaded.text, truncated: false },
+      durationMs,
+      builtin: true,
+      activate: loaded.tools,
+    }
   }
 
   private async runSingleTool(call: StepToolCall): Promise<CallResult> {
@@ -1354,6 +1440,7 @@ class RunExecution {
     is_error: boolean
     operation_id?: string
     truncated?: boolean
+    builtin?: true
   }): void {
     this.newMessages.push({
       role: 'tool',
@@ -1364,6 +1451,7 @@ class RunExecution {
       is_error: input.is_error,
       ...(input.operation_id ? { operation_id: input.operation_id } : {}),
       ...(input.truncated ? { truncated: true } : {}),
+      ...(input.builtin ? { builtin: true as const } : {}),
       run_id: this.record.runId,
       seq: this.seq++,
       created_at: new Date().toISOString(),
@@ -1426,6 +1514,7 @@ class RunExecution {
           duration_ms: 0,
           truncated: false,
           operation_id: null,
+          ...(this.skills.builtin(item.tool) ? { builtin: true as const } : {}),
         })
       }
     }
@@ -1591,6 +1680,10 @@ interface CallResult {
   outcome: ToolOutcome
   status?: ToolCallStatus
   durationMs: number
+  /** An engine tool (§6.8): marked in the history and in tool_calls[]. */
+  builtin?: true
+  /** Deferred tools to make visible from the next step. */
+  activate?: string[]
 }
 
 /** tool + args with sorted keys: {a, b} and {b, a} are the same call. */
@@ -1608,17 +1701,23 @@ function stableJson(value: unknown): string {
   return `{${entries.join(',')}}`
 }
 
-function buildToolSet(tools: readonly ToolDef[], cacheLast: boolean): ToolSet {
+/**
+ * Tools in the order given. cache_control goes on the last non-deferred tool: the tail of
+ * the schemas that are stable between turns (SPEC §9.3); a deferred tool with cache_control
+ * is a 400 (§6.8).
+ */
+function buildToolSet(tools: readonly ModelTool[], cacheLast: boolean): ToolSet {
   const set: ToolSet = {}
+  const lastEager = tools.findLastIndex((t) => !t.deferred)
   tools.forEach((def, index) => {
-    const isLast = index === tools.length - 1
+    const anthropic = {
+      ...(cacheLast && index === lastEager ? { cacheControl: { type: 'ephemeral' } } : {}),
+      ...(def.deferred ? { deferLoading: true } : {}),
+    }
     set[def.name] = tool({
       ...(def.description ? { description: def.description } : {}),
       inputSchema: jsonSchema(def.input_schema as never),
-      // cache the tail of the tool schemas — they are stable between turns (SPEC §9.3)
-      ...(cacheLast && isLast
-        ? { providerOptions: { anthropic: { cacheControl: { type: 'ephemeral' } } } }
-        : {}),
+      ...(Object.keys(anthropic).length > 0 ? { providerOptions: { anthropic } } : {}),
     })
   })
   return set

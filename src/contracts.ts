@@ -82,6 +82,11 @@ export const ToolMessageSchema = z.object({
   is_error: z.boolean(),
   operation_id: z.string().nullish(),
   truncated: z.boolean().optional(),
+  /**
+   * Written by the engine for its own tools (§6.8); the only mark of a built-in result. Only
+   * `true` counts: a harness that stores the column as false / null on HTTP tool messages is fine.
+   */
+  builtin: z.boolean().nullish(),
   ...MessageEnvelope,
 })
 
@@ -223,9 +228,36 @@ export const ToolDefSchema = z.object({
   headers: z.record(z.string()).optional(),
   timeout_ms: z.number().int().positive().optional(),
   effect: ToolEffectSchema, // required (SPEC §6.4)
+  /** Hidden from the model until a skill or search activates it (SPEC §6.8). */
+  defer_loading: z.boolean().nullish(),
 })
 
 export type ToolDef = z.infer<typeof ToolDefSchema>
+
+/* ----------------------------------------------------------------- skills */
+
+/** Tools the engine implements itself (SPEC §6.8). Reserved names when skills are used. */
+export const BUILTIN_TOOLS = { loadSkill: 'load_skill', searchTools: 'search_tools' } as const
+
+export const SKILL_LIMITS = {
+  max_skills: 64,
+  description_max_chars: 1024,
+  body_max_bytes: 32_768,
+} as const
+
+export const SkillSchema = z.object({
+  name: z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/, 'name: ^[a-z0-9][a-z0-9_-]{0,63}$'),
+  description: z.string().min(1).max(SKILL_LIMITS.description_max_chars),
+  body: z
+    .string()
+    .min(1)
+    .refine((body) => Buffer.byteLength(body, 'utf8') <= SKILL_LIMITS.body_max_bytes, {
+      message: `body: at most ${SKILL_LIMITS.body_max_bytes} bytes`,
+    }),
+  tools: z.array(z.string().min(1)).default([]),
+})
+
+export type Skill = z.infer<typeof SkillSchema>
 
 /** Tool endpoint response (SPEC §6.2). Any other body = result. */
 export const ToolEnvelopeSchema = z.object({
@@ -281,6 +313,7 @@ export const RunRequestSchema = z.object({
   system: z.string().nullish(),
   messages: z.array(StoredMessageSchema).min(1),
   tools: z.array(ToolDefSchema).default([]),
+  skills: z.array(SkillSchema).max(SKILL_LIMITS.max_skills).default([]),
   limits: LimitsSchema,
   stream: StreamFlagsSchema,
   callback: CallbackSchema.nullish(),
@@ -346,6 +379,8 @@ export interface ToolCallSummary {
   duration_ms: number
   truncated: boolean
   operation_id: string | null
+  /** A call of an engine tool (§6.8), not of an HTTP endpoint. */
+  builtin?: true
 }
 
 export interface UsageCall {

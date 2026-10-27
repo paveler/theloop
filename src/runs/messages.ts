@@ -13,7 +13,7 @@ import type {
   ToolResultPart,
   UserModelMessage,
 } from '@ai-sdk/provider-utils'
-import type { StoredMessage, ToolDef } from '../contracts.js'
+import type { StoredMessage, ToolMessage } from '../contracts.js'
 import { EngineError } from '../errors.js'
 import { sdkKeyFor } from '../providers/allowlist.js'
 import { texts, type Texts } from '../i18n.js'
@@ -61,7 +61,9 @@ export function estimateMessageTokens(message: StoredMessage): number {
   return sum
 }
 
-export function estimateToolSchemaTokens(tools: readonly ToolDef[]): number {
+export function estimateToolSchemaTokens(
+  tools: ReadonlyArray<{ name: string; description?: string; input_schema: unknown }>,
+): number {
   let sum = 0
   for (const tool of tools) {
     sum += estimateTokens(tool.name) + estimateTokens(tool.description ?? '')
@@ -125,6 +127,8 @@ export interface TrimInput {
   /** Reserved for the model's answer. */
   reserveTokens: number
   contextWindow: number
+  /** A block that must never be dropped: an activation in effect (SPEC §6.8). */
+  pinned?: (block: readonly StoredMessage[]) => boolean
 }
 
 export interface TrimResult {
@@ -188,7 +192,7 @@ export function trimHistory(input: TrimInput): TrimResult {
     block.some((m) => {
       const idx = indexOf.get(m)!
       return idx === firstUserIndex || idx >= keepTailFrom
-    })
+    }) || input.pinned?.(block) === true
 
   const alive = blocks.map((b) => ({ block: b, dropped: false }))
   let trimmed = false
@@ -228,6 +232,11 @@ export interface ConvertOptions {
   cacheBreakpoints?: boolean
   /** Engine texts in the run locale (SPEC Appendix B); absent — the default locale. */
   texts?: Texts
+  /**
+   * Built-in results (SPEC §6.8): text plus the deferred tools to reference; null — an
+   * ordinary result. Gets the args of the paired tool call.
+   */
+  renderBuiltin?: (message: ToolMessage, args: unknown) => { text: string; references: string[] } | null
 }
 
 /** cache_control on top of the part's providerOptions: reasoning keeps its signature there, do not overwrite it. */
@@ -313,8 +322,17 @@ export async function toModelMessages(
 ): Promise<ModelMessage[]> {
   const out: ModelMessage[] = []
   let anchorOut: ModelMessage | null = null
+  const callArgs = new Map<string, unknown>()
+  // texts of built-in results that carry tool references: they follow the tool results in the
+  // same user turn, since the API refuses a tool_result mixing tool_reference with text (§6.8)
+  const trailing: string[] = []
+  const flushTrailing = () => {
+    if (trailing.length === 0) return
+    out.push({ role: 'user', content: trailing.splice(0).map((text) => ({ type: 'text', text })) } as UserModelMessage)
+  }
 
   for (const message of messages) {
+    if (message.role !== 'tool') flushTrailing()
     if (message.role === 'user') {
       const content: Exclude<UserModelMessage['content'], string> = []
       for (const part of message.content) {
@@ -348,6 +366,7 @@ export async function toModelMessages(
         if (part.type === 'text') {
           if (part.text.length > 0) content.push({ type: 'text', text: part.text })
         } else if (part.type === 'tool_call') {
+          callArgs.set(part.call_id, part.args)
           content.push({
             type: 'tool-call',
             toolCallId: part.call_id,
@@ -371,13 +390,15 @@ export async function toModelMessages(
 
     // tool: consecutive results are merged into one tool message —
     // providers (Anthropic) expect them as one block
+    const builtin = message.is_error ? null : builtinOutput(message, callArgs.get(message.call_id), options)
+    if (builtin?.trailingText) trailing.push(builtin.trailingText)
     const resultPart: ToolResultPart = {
       type: 'tool-result',
       toolCallId: message.call_id,
       toolName: message.tool,
       output: message.is_error
         ? { type: 'error-text', value: message.error ?? 'tool error' }
-        : toolOutput(message.result, options.texts),
+        : (builtin?.output ?? toolOutput(message.result, options.texts)),
     }
     const last = out[out.length - 1]
     if (last && last.role === 'tool') {
@@ -386,6 +407,7 @@ export async function toModelMessages(
       out.push({ role: 'tool', content: [resultPart] } as ToolModelMessage)
     }
   }
+  flushTrailing()
 
   // prompt tail: a tool step within the run and the next turn read everything sent
   // here from the cache. If the tail is the anchor with the current time, the point is already before it
@@ -439,6 +461,31 @@ export function isEmptyToolResult(result: unknown): boolean {
   if (Array.isArray(result)) return result.length === 0
   if (typeof result === 'object') return Object.keys(result).length === 0
   return false
+}
+
+/**
+ * A built-in result (SPEC §6.8). With references — a tool_result of `tool_reference` blocks
+ * only, one per deferred tool, so the API expands the definitions inside the conversation;
+ * the text goes after the tool results of the turn. Without references — the text itself.
+ */
+function builtinOutput(
+  message: ToolMessage,
+  args: unknown,
+  options: ConvertOptions,
+): { output: ToolResultPart['output']; trailingText?: string } | null {
+  const rendered = options.renderBuiltin?.(message, args)
+  if (!rendered) return null
+  if (rendered.references.length === 0) return { output: { type: 'text', value: rendered.text } }
+  return {
+    output: {
+      type: 'content',
+      value: rendered.references.map((toolName) => ({
+        type: 'custom' as const,
+        providerOptions: { anthropic: { type: 'tool-reference', toolName } },
+      })),
+    },
+    trailingText: rendered.text,
+  }
 }
 
 function toolOutput(result: unknown, t: Texts = texts()): ToolResultPart['output'] {
