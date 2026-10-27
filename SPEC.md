@@ -501,7 +501,8 @@ AssistantPart = TextPart
   message gets the current time, which lives for one turn only.
 - `builtin: true` on a `tool` message — the engine wrote it for one of its own tools
   (`load_skill`, `search_tools`, §6.8). It is the only thing that makes such a pair a built-in one; the
-  harness stores it with the rest of the message (H20).
+  harness stores it with the rest of the message (H20). `false` or `null` are accepted and
+  mean the same as absent, as does `null` for `tools[].defer_loading`.
 - `partial: true` — the answer was cut (cancel / timeout / shutdown / limit). It goes
   into the next run as is.
 - An `event` part in a `user` message is how the harness delivers an event outside the
