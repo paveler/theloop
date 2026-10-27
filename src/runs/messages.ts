@@ -392,7 +392,10 @@ export async function toModelMessages(
   const last = out.at(-1)
   if (options.cacheBreakpoints && last && last !== anchorOut && Array.isArray(last.content)) {
     const part = last.content.at(-1)
-    if (part) withCacheControl(part)
+    // approval parts carry no providerOptions; the engine never produces them (§6.4)
+    if (part && part.type !== 'tool-approval-request' && part.type !== 'tool-approval-response') {
+      withCacheControl(part)
+    }
   }
 
   return out

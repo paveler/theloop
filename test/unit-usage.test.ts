@@ -1,3 +1,4 @@
+import type { LanguageModelUsage } from 'ai'
 import { describe, expect, it } from 'vitest'
 import type { Pricing } from '../src/contracts.js'
 import { checkBudgets, costOf, normalizeUsage, UsageTracker } from '../src/runs/usage.js'
@@ -20,12 +21,32 @@ const zeroTokens = {
   reasoning_tokens: 0,
 }
 
-describe('usage normalization per provider (SPEC §8.1)', () => {
-  it('anthropic: input already excludes the cache, cache write comes from providerMetadata', () => {
+/** LanguageModelUsage as the AI SDK v6 reports it for every adapter. */
+function sdkUsage(fields: {
+  input: number
+  noCache?: number
+  cacheRead?: number
+  cacheWrite?: number
+  output: number
+  reasoning?: number
+}): LanguageModelUsage {
+  return {
+    inputTokens: fields.input,
+    inputTokenDetails: {
+      noCacheTokens: fields.noCache,
+      cacheReadTokens: fields.cacheRead,
+      cacheWriteTokens: fields.cacheWrite,
+    },
+    outputTokens: fields.output,
+    outputTokenDetails: { textTokens: undefined, reasoningTokens: fields.reasoning },
+    totalTokens: fields.input + fields.output,
+  }
+}
+
+describe('usage normalization (SPEC §8.1)', () => {
+  it('input_tokens is the uncached part; cache read and write are separate', () => {
     const tokens = normalizeUsage(
-      'anthropic',
-      { inputTokens: 320, outputTokens: 96, totalTokens: 416, cachedInputTokens: 1500 },
-      { anthropic: { cacheCreationInputTokens: 800 } },
+      sdkUsage({ input: 2620, noCache: 320, cacheRead: 1500, cacheWrite: 800, output: 96 }),
     )
     expect(tokens).toEqual({
       input_tokens: 320,
@@ -36,26 +57,20 @@ describe('usage normalization per provider (SPEC §8.1)', () => {
     })
   })
 
-  it('openai-compatible: cached_tokens are part of prompt_tokens, so they are subtracted', () => {
-    const tokens = normalizeUsage('openai-compatible', {
-      inputTokens: 2000,
-      outputTokens: 100,
-      totalTokens: 2100,
-      cachedInputTokens: 1500,
-    })
+  it('without the uncached split, the cache is subtracted from the total', () => {
+    const tokens = normalizeUsage(sdkUsage({ input: 2000, cacheRead: 1500, output: 100 }))
     expect(tokens.input_tokens).toBe(500)
     expect(tokens.cache_read_tokens).toBe(1500)
   })
 
   it('reasoning_tokens are informational and not subtracted from output', () => {
-    const tokens = normalizeUsage('anthropic', {
-      inputTokens: 10,
-      outputTokens: 200,
-      totalTokens: 210,
-      reasoningTokens: 150,
-    })
+    const tokens = normalizeUsage(sdkUsage({ input: 10, output: 200, reasoning: 150 }))
     expect(tokens.output_tokens).toBe(200)
     expect(tokens.reasoning_tokens).toBe(150)
+  })
+
+  it('no usage is zero', () => {
+    expect(normalizeUsage(undefined)).toEqual(zeroTokens)
   })
 })
 

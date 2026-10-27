@@ -1,13 +1,13 @@
 /**
  * The provider queue and the AIMD ceiling (SPEC §11.6), 429 retries (SPEC §11.3).
  *
- * The module is tested directly on fake timers; the loop on MockLanguageModelV2 with
+ * The module is tested directly on fake timers; the loop on MockLanguageModelV3 with
  * small env values and real timers (Hono and AI SDK streams do not get along with
  * fake timers).
  */
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { APICallError } from 'ai'
-import type { LanguageModelV2StreamPart } from '@ai-sdk/provider'
+import type { LanguageModelV3StreamPart } from '@ai-sdk/provider'
 import { createEngine, type Engine } from '../src/app.js'
 import type { Llm, RunResult } from '../src/contracts.js'
 import type { EgressClient } from '../src/egress/client.js'
@@ -385,7 +385,7 @@ async function health(engine: Engine): Promise<any> {
   return (await engine.app.request('/health')).json()
 }
 
-function rateLimited(headers: Record<string, string> = {}): LanguageModelV2StreamPart {
+function rateLimited(headers: Record<string, string> = {}): LanguageModelV3StreamPart {
   return {
     type: 'error',
     error: new APICallError({

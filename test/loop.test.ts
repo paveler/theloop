@@ -1,9 +1,9 @@
 /**
- * The loop on MockLanguageModelV2 (SPEC §13.2): no network, no keys — tools run on a local
- * http server, the provider is mocked at the LanguageModelV2 level.
+ * The loop on MockLanguageModelV3 (SPEC §13.2): no network, no keys — tools run on a local
+ * http server, the provider is mocked at the LanguageModelV3 level.
  */
 import { afterEach, describe, expect, it } from 'vitest'
-import type { LanguageModelV2StreamPart } from '@ai-sdk/provider'
+import type { LanguageModelV3StreamPart } from '@ai-sdk/provider'
 import { createEngine, type Engine } from '../src/app.js'
 import type { RunResult } from '../src/contracts.js'
 import { sha256 } from '../src/ids.js'
@@ -539,7 +539,7 @@ describe('loop: provider interruptions (SPEC §11.3)', () => {
         ...textChunks('started answering'),
         toolCall('c1', 'getStatus', {}),
         { type: 'error', error: new Error('connection reset') },
-      ] as LanguageModelV2StreamPart[])
+      ] as LanguageModelV3StreamPart[])
     })
     const engine = track(createEngine(testConfig(), { modelFactory: mockFactory(model) }))
 

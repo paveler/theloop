@@ -11,6 +11,7 @@ import { contextWindowFor, providerEntry } from '../src/providers/allowlist.js'
 import { buildModel } from '../src/providers/factory.js'
 import { toModelMessages } from '../src/runs/messages.js'
 import { streamStep } from '../src/runs/provider.js'
+import { normalizeUsage } from '../src/runs/usage.js'
 import { testConfig } from './helpers.js'
 
 const noImages = async () => {
@@ -156,7 +157,8 @@ describe('minimax: signed thinking round-trips through the history (SPEC §5.2)'
       expect.objectContaining({ callId: 'call_1', tool: 'getWeather', args: { city: 'London' } }),
     ])
     expect(outcome.finishReason).toBe('tool-calls')
-    expect(outcome.usage?.cachedInputTokens).toBe(80)
+    // billing reads the uncached input, whatever the adapter puts in the total (§8.1)
+    expect(normalizeUsage(outcome.usage)).toMatchObject({ input_tokens: 120, cache_read_tokens: 80 })
   })
 
   it('the next step sends the MiniMax thinking block back unchanged', async () => {
