@@ -463,9 +463,9 @@ describe('skills: the contract stays additive (SPEC §4.2)', () => {
       'skills[0].tools: unknown tool "getReturnStatus"',
     ],
     [
-      'a deferred tool outside every skill',
-      (url: string) => runRequest({ tools: [tool(url, 'getOrder'), tool(url, 'exportReport', true)] as never }),
-      'tools[1] "exportReport" is deferred but listed in no skill',
+      'search_tools as an HTTP tool name with deferred tools',
+      (url: string) => runRequest({ tools: [tool(url, 'search_tools'), tool(url, 'exportReport', true)] as never }),
+      'tools[0].name "search_tools" is reserved when skills or deferred tools are used',
     ],
     [
       'a duplicated skill name',
@@ -490,5 +490,120 @@ describe('skills: the contract stays additive (SPEC §4.2)', () => {
     const engine = track(createEngine(testConfig(), { modelFactory: mockFactory(mockModel([])) }))
     const res = await post(engine, runRequest({ skills: [{ name: 'Bad Name', description: 'x', body: 'x' }] as never }))
     expect(res.status).toBe(400)
+  })
+})
+
+describe('search_tools (SPEC §6.8)', () => {
+  function searchRequest(url: string, overrides: Record<string, unknown> = {}) {
+    return runRequest({
+      tools: [
+        tool(url, 'getOrder'),
+        { ...tool(url, 'exportReport', true), description: 'Export a sales report as CSV' },
+        { ...tool(url, 'cancelOrder', true), description: 'Cancel an order before shipping' },
+        { ...tool(url, 'archiveOrder', true), description: 'Archive an old order' },
+      ] as never,
+      skills: [{ name: 'order-cancel', description: 'Cancellations.', body: '# Cancel', tools: ['cancelOrder'] }] as never,
+      ...overrides,
+    })
+  }
+
+  it('activates matches outside skills from the next step and points to the skill for the rest', async () => {
+    const tools = await toolServer()
+    const model = mockModel([
+      streamFrom([START, toolCall('c1', 'search_tools', { query: 'order' }), finish('tool-calls')]),
+      streamFrom([START, toolCall('c2', 'archiveOrder', { id: '1' }), finish('tool-calls')]),
+      streamFrom([START, ...textChunks('done'), finish('stop')]),
+    ])
+    const engine = track(createEngine(testConfig(), { modelFactory: mockFactory(model) }))
+
+    const result = await runWait(engine, searchRequest(tools.url))
+
+    expect(toolNames(model, 0)).toEqual(['getOrder', 'load_skill', 'search_tools'])
+    expect(toolNames(model, 1)).toEqual(['archiveOrder', 'getOrder', 'load_skill', 'search_tools'])
+    expect(result.messages[1]).toMatchObject({
+      builtin: true,
+      result: { tools: ['archiveOrder'], in_skills: { cancelOrder: 'order-cancel' } },
+    })
+    expect(toolOutputs(model, 1)[0]).toEqual({
+      type: 'text',
+      value:
+        '[engine] Tools available from the next step: archiveOrder.\n' +
+        'Part of skills, load the skill first: cancelOrder (order-cancel).',
+    })
+    expect(tools.requests.map((r) => r.path)).toEqual(['/archiveOrder'])
+
+    const events = await journal(engine, result.run_id)
+    const search = events.find((e) => e.event === 'tool_search')!
+    expect(search).toMatchObject({ limit: 5, tools: ['archiveOrder'], in_skills: { cancelOrder: 'order-cancel' } })
+    expect(search.content).toEqual({ query: 'order' })
+    expect(JSON.stringify({ ...search, content: undefined })).not.toContain('"order"')
+    expect(events.find((e) => e.event === 'run_start')).toMatchObject({ tool_search: true })
+  })
+
+  it('no match is a text result, not an empty one; limit is respected', async () => {
+    const tools = await toolServer()
+    const model = mockModel([
+      streamFrom([START, toolCall('c1', 'search_tools', { query: 'weather forecast' }), finish('tool-calls')]),
+      streamFrom([START, toolCall('c2', 'search_tools', { query: 'order', limit: 1 }), finish('tool-calls')]),
+      streamFrom([START, ...textChunks('done'), finish('stop')]),
+    ])
+    const engine = track(createEngine(testConfig(), { modelFactory: mockFactory(model) }))
+
+    const result = await runWait(engine, searchRequest(tools.url))
+
+    expect(toolOutputs(model, 1)[0]).toEqual({
+      type: 'text',
+      value: '[engine] No tools match "weather forecast". Try other words for what the tool should do.',
+    })
+    const limited = result.messages.find((m) => m.role === 'tool' && m.call_id === 'c2') as Record<string, any>
+    expect(Object.keys(limited.result.in_skills).length + limited.result.tools.length).toBe(1)
+  })
+
+  it('a hidden tool outside skills points to search_tools', async () => {
+    const tools = await toolServer()
+    const model = mockModel([
+      streamFrom([START, toolCall('c1', 'exportReport', { id: '1' }), finish('tool-calls')]),
+      streamFrom([START, ...textChunks('done'), finish('stop')]),
+    ])
+    const engine = track(createEngine(testConfig(), { modelFactory: mockFactory(model) }))
+
+    const result = await runWait(engine, searchRequest(tools.url))
+
+    expect(result.messages[1]).toMatchObject({
+      is_error: true,
+      error: 'tool_not_loaded: exportReport is not loaded. Find it with search_tools first.',
+    })
+  })
+
+  it('a found tool is restored from history; tool_reference renders references for it', async () => {
+    const tools = await toolServer()
+    const model = mockModel([streamFrom([START, ...textChunks('ok'), finish('stop')])])
+    const engine = track(createEngine(testConfig(), { modelFactory: mockFactory(model, { toolReferences: true }) }))
+    const history: StoredMessage[] = [
+      { role: 'user', content: [{ type: 'text', text: 'export the report' }] },
+      { role: 'assistant', content: [{ type: 'tool_call', call_id: 'h1', tool: 'search_tools', args: { query: 'report' } }] },
+      {
+        role: 'tool',
+        call_id: 'h1',
+        tool: 'search_tools',
+        builtin: true,
+        is_error: false,
+        result: { tools: ['exportReport', 'goneTool'], in_skills: {} },
+      },
+      { role: 'assistant', content: [{ type: 'text', text: 'Which period?' }] },
+      { role: 'user', content: [{ type: 'text', text: 'October' }] },
+    ]
+
+    const result = await runWait(engine, searchRequest(tools.url, { messages: history }))
+
+    expect(toolOutputs(model, 0)[0]).toEqual({
+      type: 'content',
+      value: [
+        { type: 'custom', providerOptions: { anthropic: { type: 'tool-reference', toolName: 'exportReport' } } },
+        { type: 'text', text: '[engine] Tools available from the next step: exportReport, goneTool.' },
+      ],
+    })
+    const restored = (await journal(engine, result.run_id)).find((e) => e.event === 'skills_restored')
+    expect(restored).toMatchObject({ skills: [], tools: ['exportReport'] })
   })
 })

@@ -14,6 +14,7 @@ import {
   type ToolMessage,
 } from '../contracts.js'
 import type { Texts } from '../i18n.js'
+import { SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX, SEARCH_QUERY_MAX_CHARS, searchTools } from '../tools/search.js'
 
 /** How activated tools reach the model (SPEC §6.8, activation mechanisms). */
 export type ActivationMechanism = 'tool_reference' | 'tools_array'
@@ -41,6 +42,21 @@ export interface LoadSkillOutcome {
   tools: string[]
   /** ok: the skill was already loaded in an earlier run (restored from history). */
   reloaded: boolean
+}
+
+/** The stored result of `search_tools` (SPEC §6.8): provider-neutral JSON. */
+export interface SearchResult {
+  /** Matches listed in no skill: activated from the next step. */
+  tools: string[]
+  /** Matches that belong to a skill: not activated, the model is pointed to the skill. */
+  in_skills: Record<string, string>
+}
+
+export interface SearchOutcome {
+  /** The query as searched (cut to 500 characters); model text. */
+  query: string
+  limit: number
+  result: SearchResult
 }
 
 export interface Restored {
@@ -83,22 +99,37 @@ export class SkillState {
         if (this.deferred.has(tool) && !this.owner.has(tool)) this.owner.set(tool, skill.name)
       }
     }
-    this.builtins =
-      request.skills.length > 0
-        ? [
-            {
-              name: BUILTIN_TOOLS.loadSkill,
-              description: texts.loadSkillDescription,
-              input_schema: {
-                type: 'object',
-                properties: { name: { type: 'string', description: texts.loadSkillNameDescription } },
-                required: ['name'],
-                additionalProperties: false,
-              },
-              deferred: false,
-            },
-          ]
-        : []
+    this.builtins = []
+    if (request.skills.length > 0) {
+      this.builtins.push({
+        name: BUILTIN_TOOLS.loadSkill,
+        description: texts.loadSkillDescription,
+        input_schema: {
+          type: 'object',
+          properties: { name: { type: 'string', description: texts.loadSkillNameDescription } },
+          required: ['name'],
+          additionalProperties: false,
+        },
+        deferred: false,
+      })
+    }
+    // a deferred tool outside every skill has no other path to the model (SPEC §6.8)
+    if ([...this.deferred].some((name) => !this.owner.has(name))) {
+      this.builtins.push({
+        name: BUILTIN_TOOLS.searchTools,
+        description: texts.searchToolsDescription,
+        input_schema: {
+          type: 'object',
+          properties: {
+            query: { type: 'string', description: texts.searchQueryDescription },
+            limit: { type: 'integer', minimum: 1, maximum: SEARCH_LIMIT_MAX, description: texts.searchLimitDescription },
+          },
+          required: ['query'],
+          additionalProperties: false,
+        },
+        deferred: false,
+      })
+    }
   }
 
   get version(): number {
@@ -114,6 +145,11 @@ export class SkillState {
 
   skillNames(): string[] {
     return [...this.skills.keys()]
+  }
+
+  /** `search_tools` is offered (SPEC §6.8). */
+  get toolSearch(): boolean {
+    return this.builtins.some((b) => b.name === BUILTIN_TOOLS.searchTools)
   }
 
   builtin(name: string): ModelTool | undefined {
@@ -163,22 +199,27 @@ export class SkillState {
     const restored: Restored = { skills: [], tools: [], invalid: [] }
     if (!this.enabled) return restored
     const args = callArgs(messages)
+    const found: string[] = []
     for (const message of messages) {
       if (message.role !== 'tool' || message.builtin !== true || message.is_error) continue
-      if (message.tool !== BUILTIN_TOOLS.loadSkill) continue
-      const name = loadedSkillName(message, args.get(message.call_id))
-      if (name === null) {
-        restored.invalid.push({ call_id: message.call_id, tool: message.tool })
+      const pair = builtinPair(message, args.get(message.call_id))
+      if (pair === null) {
+        if (isBuiltinName(message.tool)) restored.invalid.push({ call_id: message.call_id, tool: message.tool })
         continue
       }
-      if (!this.skills.has(name) || this.loaded.has(name)) continue
-      this.loaded.add(name)
-      restored.skills.push(name)
+      if (pair.kind === 'search') {
+        found.push(...pair.result.tools)
+        continue
+      }
+      if (!this.skills.has(pair.name) || this.loaded.has(pair.name)) continue
+      this.loaded.add(pair.name)
+      restored.skills.push(pair.name)
     }
     for (const name of restored.skills) {
       this.loadedBefore.add(name)
       this.activate(this.skillTools(name))
     }
+    this.activate(found)
     restored.tools = this.activatedTools()
     return restored
   }
@@ -195,6 +236,21 @@ export class SkillState {
     return { ok: true, name, text: skill.body, tools: this.skillTools(name), reloaded }
   }
 
+  /** Executes `search_tools` over every deferred tool; activation is the caller's (SPEC §6.8). */
+  search(input: unknown): SearchOutcome {
+    const raw = (input as { query?: unknown; limit?: unknown } | null) ?? {}
+    const query = String(raw.query ?? '').slice(0, SEARCH_QUERY_MAX_CHARS)
+    const limit = typeof raw.limit === 'number' ? Math.min(Math.max(1, Math.trunc(raw.limit)), SEARCH_LIMIT_MAX) : SEARCH_LIMIT_DEFAULT
+    const deferred = this.request.tools.filter((t) => this.deferred.has(t.name))
+    const result: SearchResult = { tools: [], in_skills: {} }
+    for (const name of searchTools(deferred, query, limit)) {
+      const skill = this.owner.get(name)
+      if (skill) result.in_skills[name] = skill
+      else result.tools.push(name)
+    }
+    return { query, limit, result }
+  }
+
   /**
    * What the model sees for a built-in result: the header, a blank line and the body, plus
    * the deferred tools to reference on `tool_reference`. Deterministic from the stored
@@ -203,14 +259,27 @@ export class SkillState {
    */
   render(message: ToolMessage, input: unknown): { text: string; references: string[] } | null {
     if (!this.enabled || message.builtin !== true || message.is_error) return null
-    if (message.tool !== BUILTIN_TOOLS.loadSkill) return null
-    const name = loadedSkillName(message, input)
-    if (name === null) return null
-    const tools = this.skillTools(name)
-    return {
-      text: `${this.texts.skillLoaded(name, tools)}\n\n${message.result as string}`,
-      references: this.mechanism === 'tool_reference' ? tools : [],
+    const pair = builtinPair(message, input)
+    if (pair === null) return null
+    if (pair.kind === 'search') {
+      const { tools, in_skills } = pair.result
+      const text =
+        tools.length === 0 && Object.keys(in_skills).length === 0
+          ? this.texts.searchNoMatch(pair.query)
+          : this.texts.searchResult(tools, Object.entries(in_skills))
+      return { text, references: this.references(tools) }
     }
+    const tools = this.skillTools(pair.name)
+    return {
+      text: `${this.texts.skillLoaded(pair.name, tools)}\n\n${message.result as string}`,
+      references: this.references(tools),
+    }
+  }
+
+  /** Only tools that are deferred in the current request get a reference: anything else is a 400. */
+  private references(tools: readonly string[]): string[] {
+    if (this.mechanism !== 'tool_reference') return []
+    return tools.filter((t) => this.deferred.has(t))
   }
 
   /**
@@ -223,9 +292,10 @@ export class SkillState {
     const args = callArgs(block)
     return block.some((message) => {
       if (message.role !== 'tool' || message.builtin !== true || message.is_error) return false
-      if (message.tool !== BUILTIN_TOOLS.loadSkill) return false
-      const name = loadedSkillName(message, args.get(message.call_id))
-      return name !== null && this.skills.has(name)
+      const pair = builtinPair(message, args.get(message.call_id))
+      if (pair === null) return false
+      if (pair.kind === 'search') return pair.result.tools.some((t) => this.deferred.has(t))
+      return this.skills.has(pair.name)
     })
   }
 
@@ -273,9 +343,37 @@ export function callArgs(messages: readonly StoredMessage[]): Map<string, unknow
   return out
 }
 
-/** The skill name of a well-formed `load_skill` result, else null (SPEC §6.8 shape check). */
-function loadedSkillName(message: ToolMessage, input: unknown): string | null {
-  if (typeof message.result !== 'string') return null
-  const name = (input as { name?: unknown } | null | undefined)?.name
-  return typeof name === 'string' ? name : null
+type BuiltinPair =
+  | { kind: 'skill'; name: string }
+  | { kind: 'search'; query: string; result: SearchResult }
+
+function isBuiltinName(tool: string): boolean {
+  return tool === BUILTIN_TOOLS.loadSkill || tool === BUILTIN_TOOLS.searchTools
+}
+
+/**
+ * A well-formed built-in pair, else null (SPEC §6.8 shape check): for `load_skill`,
+ * `args.name` and `result` are strings; for `search_tools`, `result` is
+ * `{ tools: string[], in_skills: Record<string, string> }`.
+ */
+function builtinPair(message: ToolMessage, input: unknown): BuiltinPair | null {
+  const args = (input as Record<string, unknown> | null | undefined) ?? {}
+  if (message.tool === BUILTIN_TOOLS.loadSkill) {
+    if (typeof message.result !== 'string' || typeof args.name !== 'string') return null
+    return { kind: 'skill', name: args.name }
+  }
+  if (message.tool === BUILTIN_TOOLS.searchTools) {
+    const result = message.result as Partial<SearchResult> | null | undefined
+    if (!result || typeof result !== 'object' || !isStringArray(result.tools)) return null
+    const inSkills = result.in_skills
+    if (!inSkills || typeof inSkills !== 'object' || Array.isArray(inSkills)) return null
+    if (!Object.values(inSkills).every((v) => typeof v === 'string')) return null
+    const query = typeof args.query === 'string' ? args.query.slice(0, SEARCH_QUERY_MAX_CHARS) : ''
+    return { kind: 'search', query, result: { tools: result.tools, in_skills: inSkills } }
+  }
+  return null
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((v) => typeof v === 'string')
 }

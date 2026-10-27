@@ -102,7 +102,7 @@ approval; no effects outside the agent. Today such tools must either pretend to 
 pay the full `deferred` round trip. — **S**
 
 **2.2 Skills on demand.** Moved to [RFC 0001](docs/rfcs/0001-skills-and-deferred-tools.md):
-`skills[]`, `defer_loading` and `load_skill` in v1.3.0 (SPEC §6.8), `search_tools` next.
+`skills[]`, `defer_loading`, `load_skill` and `search_tools` (SPEC §6.8).
 
 **2.3 Compaction as a call.** `POST /compact`: the engine summarizes a history prefix by a
 prompt from the request and returns `{ summary_message, replaces_through_seq }`. The harness

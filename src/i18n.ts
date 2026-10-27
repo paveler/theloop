@@ -44,6 +44,11 @@ export interface Texts {
   unknownSkill(name: string, available: readonly string[]): string
   toolNotLoadedSkill(tool: string, skill: string): string
   toolNotLoaded(tool: string): string
+  searchToolsDescription: string
+  searchQueryDescription: string
+  searchLimitDescription: string
+  searchResult(tools: readonly string[], inSkills: ReadonlyArray<readonly [string, string]>): string
+  searchNoMatch(query: string): string
 
   /* format gate (§5.4); field names arrive already quoted */
   checkHeader(fence: string): string
@@ -118,6 +123,22 @@ const ru: Texts = {
   toolNotLoadedSkill: (tool, skill) =>
     `tool_not_loaded: ${tool} входит в скилл "${skill}". Сначала вызови load_skill("${skill}").`,
   toolNotLoaded: (tool) => `tool_not_loaded: ${tool} не загружен. Сначала найди его через search_tools.`,
+  searchToolsDescription:
+    'Найти тулы, которые ещё не загружены, по тому, что они делают. Найденные тулы становятся ' +
+    'доступны со следующего шага.',
+  searchQueryDescription: 'Что должен делать тул, в нескольких словах.',
+  searchLimitDescription: 'Сколько тулов вернуть (от 1 до 20, по умолчанию 5).',
+  searchResult: (tools, inSkills) =>
+    [
+      tools.length > 0 ? `Тулы, доступные со следующего шага: ${tools.join(', ')}.` : null,
+      inSkills.length > 0
+        ? `Входят в скиллы, сначала загрузи скилл: ${inSkills.map(([t, s]) => `${t} (${s})`).join(', ')}.`
+        : null,
+    ]
+      .filter((line) => line !== null)
+      .map((line, i) => (i === 0 ? `[engine] ${line}` : line))
+      .join('\n'),
+  searchNoMatch: (query) => `[engine] Ни один тул не подходит под "${query}". Попробуй описать, что должен делать тул, другими словами.`,
 
   checkHeader: (fence) => `[Проверка формата] Блок ${fence} не прошёл проверку:`,
   checkFooter: (fence) => `Пришли только исправленный блок \`\`\`${fence}\`\`\`, без текста до и после.`,
@@ -187,6 +208,22 @@ const en: Texts = {
   toolNotLoadedSkill: (tool, skill) =>
     `tool_not_loaded: ${tool} belongs to skill "${skill}". Call load_skill("${skill}") first.`,
   toolNotLoaded: (tool) => `tool_not_loaded: ${tool} is not loaded. Find it with search_tools first.`,
+  searchToolsDescription:
+    'Find tools that are not loaded yet, by what they do. Matching tools become available from ' +
+    'the next step.',
+  searchQueryDescription: 'What the tool should do, in a few words.',
+  searchLimitDescription: 'How many tools to return (1 to 20, default 5).',
+  searchResult: (tools, inSkills) =>
+    [
+      tools.length > 0 ? `Tools available from the next step: ${tools.join(', ')}.` : null,
+      inSkills.length > 0
+        ? `Part of skills, load the skill first: ${inSkills.map(([t, s]) => `${t} (${s})`).join(', ')}.`
+        : null,
+    ]
+      .filter((line) => line !== null)
+      .map((line, i) => (i === 0 ? `[engine] ${line}` : line))
+      .join('\n'),
+  searchNoMatch: (query) => `[engine] No tools match "${query}". Try other words for what the tool should do.`,
 
   checkHeader: (fence) => `[Format check] The ${fence} block failed validation:`,
   checkFooter: (fence) => `Send only the corrected \`\`\`${fence}\`\`\` block, with no text before or after.`,
