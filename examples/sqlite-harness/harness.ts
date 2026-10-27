@@ -113,6 +113,9 @@ export function createHarness(options: HarnessOptions) {
           session.active_run_id = body.run_id
           store.saveSession(session)
         })
+        // the callback beat this response: the result is recorded, the session can move on now
+        const early = store.run(body.run_id)?.result
+        if (early) applyResult(early as RunResult)
         return { runId: body.run_id, streamUrl: body.stream_url }
       }
       const code = body.error?.code
@@ -184,13 +187,22 @@ export function createHarness(options: HarnessOptions) {
     const run = store.run(result.run_id)
     const sessionId = run?.session_id ?? result.meta.session_id
     if (!sessionId) return
+    let settled: Operation[] = []
     store.transaction(() => {
       const session = store.session(sessionId, '')
       const current = result.history_revision === session.history_revision
       for (const message of result.messages) {
         store.putMessage(`${result.run_id}:${message.seq}`, sessionId, message, !current)
       }
-      store.setRunResult(result.run_id, result.status, result)
+      store.setRunResult(result.run_id, sessionId, result.status, result)
+      // a deferred call closed by cancel: its approval must not execute any more (SPEC §6.5, H21)
+      for (const c of result.tool_calls) {
+        const op = c.status === 'cancelled' && c.operation_id ? store.operation(c.operation_id) : null
+        if (op?.status !== 'pending') continue
+        op.status = 'rejected'
+        op.result = { error: 'cancelled' }
+        store.putOperation(op)
+      }
       // only the first application moves the session on
       if (!current || session.active_run_id !== result.run_id) return
       session.active_run_id = null
@@ -198,11 +210,17 @@ export function createHarness(options: HarnessOptions) {
       if (result.status === 'awaiting_tool') {
         session.state = 'awaiting_tool'
         session.pending_call_ids = result.tool_calls.filter((c) => c.status === 'deferred').map((c) => c.call_id)
+        // an operation can be closed already: rejected at registration, or executed before a
+        // replay found it by origin (SPEC §6.4) — no decision will come for it
+        settled = result.tool_calls
+          .map((c) => (c.status === 'deferred' && c.operation_id ? store.operation(c.operation_id) : null))
+          .filter((op): op is Operation => op != null && op.status !== 'pending')
       } else {
         session.state = 'idle'
       }
       store.saveSession(session)
     })
+    for (const op of settled) void continueAfter(op).catch((err) => console.error('continue:', err))
   }
 
   /* --------------------------------------------------------------- turns */
@@ -271,10 +289,15 @@ export function createHarness(options: HarnessOptions) {
       const known = store.operationByRef(`opref_${key}`)
       if (known) return { status: 'deferred', operation_id: known.id }
 
-      const same = store
-        .pendingOperations(sessionId, 'refundOrder')
-        .find((op) => op.fields.orderId === fields.orderId && op.fields.amount === fields.amount)
+      // the subject of a refund is the order; a new amount updates the pending operation and
+      // bumps its version, so a card for the old amount can no longer be confirmed
+      const same = store.pendingOperations(sessionId, 'refundOrder').find((op) => op.fields.orderId === fields.orderId)
       if (same) {
+        if (same.fields.amount !== fields.amount) {
+          same.fields = fields
+          same.version += 1
+          store.putOperation(same)
+        }
         store.putOpref(`opref_${key}`, same.id)
         return { status: 'deferred', operation_id: same.id }
       }

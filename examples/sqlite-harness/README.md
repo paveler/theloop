@@ -62,10 +62,11 @@ How it covers the harness obligations of [SPEC Appendix A](../../SPEC.md#appendi
 | H10 `409 result_pending` / `session_busy` → fetch, record, ack, retry | `startRun` |
 | H11 interrupt = synchronous `cancel` → record → new run | `send` |
 | H12 a message during `awaiting_tool` supersedes the call; the late result comes as an `event` part | `send`, `continueAfter` |
-| H13 continue only when every deferred call has a result | `continueAfter` |
-| H14 write endpoint: origin lookup → pending comparison → create; always `deferred` | `registerRefund` |
+| H13 continue only when every deferred call has a result; a call whose operation is already closed continues at once | `continueAfter`, `applyResult` |
+| H14 write endpoint: origin lookup → pending comparison (a new amount bumps the version) → create; always `deferred` | `registerRefund` |
 | H15 mutation only after approval, version checked, operation id as the downstream idempotency key | `decide`, `store.refund` |
 | H16 tool data scoped by `meta.user_id`, never by ids from `args` alone | `callTool` |
+| H21 a deferred call closed by `cancel` cancels its operation | `applyResult` |
 
 Not covered, on purpose: multi-tenancy, encrypted key storage, usage accounting and
 reconciliation (H19), a web UI. Each is a table and a page in a real product.

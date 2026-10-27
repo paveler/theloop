@@ -27,6 +27,8 @@ export interface RunRow {
   status: string
   deadline_at: number
   acked: boolean
+  /** The recorded result, once one arrived. */
+  result: unknown
 }
 
 export type OperationStatus = 'pending' | 'done' | 'rejected'
@@ -160,11 +162,16 @@ export function openStore(path = ':memory:') {
         status: String(row.status),
         deadline_at: Number(row.deadline_at),
         acked: Number(row.acked) === 1,
+        result: row.result == null ? null : JSON.parse(String(row.result)),
       }
     },
 
-    setRunResult(id: string, status: string, result: unknown): void {
-      db.prepare('UPDATE runs SET status = ?, result = ? WHERE id = ?').run(status, JSON.stringify(result), id)
+    /** An upsert: a callback may arrive before the POST /runs response created the row. */
+    setRunResult(id: string, sessionId: string, status: string, result: unknown): void {
+      db.prepare(
+        `INSERT INTO runs (id, session_id, status, deadline_at, result) VALUES (?, ?, ?, 0, ?)
+         ON CONFLICT(id) DO UPDATE SET status = excluded.status, result = excluded.result`,
+      ).run(id, sessionId, status, JSON.stringify(result))
     },
 
     setRunStatus(id: string, status: string, deadlineAt?: number): void {
