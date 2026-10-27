@@ -710,7 +710,6 @@ class RunExecution {
         provider_request_id: outcome.providerRequestId,
       })
     }
-    const providerKind = plan.resolved.supportsCacheControl ? 'anthropic' : 'openai-compatible'
 
     if (kind === 'failed') {
       this.usage.record({
@@ -733,7 +732,7 @@ class RunExecution {
       return
     }
 
-    const reported = normalizeUsage(providerKind, outcome.usage, outcome.providerMetadata)
+    const reported = normalizeUsage(outcome.usage)
     const hasReported = outcome.usage?.inputTokens != null || outcome.usage?.outputTokens != null
 
     if (kind === 'ok' && hasReported && plan.resolved.capabilities.usage_in_stream) {

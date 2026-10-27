@@ -1,7 +1,7 @@
 # theloop — Specification
 
 > **Status:** v1.0 · `contract_version: "1"` · the contract is frozen and implemented.
-> Reference implementation (this repository): Node 22 + TypeScript, Hono, Vercel AI SDK 5.
+> Reference implementation (this repository): Node 22 + TypeScript, Hono, Vercel AI SDK 6.
 > License: Apache 2.0.
 >
 > This document is normative for the HTTP contract, the message format and the loop
@@ -957,9 +957,9 @@ engine cuts this without a new status:
    the model may change arguments or call another tool.
 3. **The second repeat in a run** → all following steps go with `tool_choice: none`: the
    model must answer in text with what it has, and the run ends `completed`. For
-   Anthropic the AI SDK removes `tools` from the request on `none`; for GigaChat and GLM
-   the engine sends no tools on such steps (§9.1) — both accept tool pairs in the
-   history without tool definitions. If a provider ignores `none` and still returns tool
+   Anthropic the request keeps `tools` and carries `tool_choice: { "type": "none" }`;
+   for GigaChat and GLM the engine sends no tools on such steps (§9.1) — both accept
+   tool pairs in the history without tool definitions. If a provider ignores `none` and still returns tool
    calls, they are handled as usual, bounded by `max_steps`.
 4. **The second empty result of the same tool in a run** — empty by §6.2, with any
    arguments, consecutive or not — also switches the following steps to

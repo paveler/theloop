@@ -59,8 +59,8 @@ const GLM_EFFORT = /^glm-5\.([2-9]|\d{2,})/i
  * they only have adaptive thinking, with depth in `output_config.effort`. Later versions of the
  * same lines are matched in advance: a needless drop costs a warn, a miss costs a failed run.
  * Opus / Sonnet 4.6, Haiku 4.5 and older accept both sampling and a budget. @ai-sdk/anthropic
- * 2.0.x drops sampling itself only for opus-4-7 / 4-8 and fable-5, and sends thinking as given,
- * so we do not rely on it.
+ * drops sampling itself only for the models in its own table, which lags behind the lines, and
+ * sends thinking as given, so we do not rely on it.
  */
 const NEW_CLAUDE =
   /^claude-(fable|mythos)-|^claude-opus-(4-[7-9]|[5-9]|\d{2,})|^claude-(sonnet|haiku)-([5-9]|\d{2,})/i

@@ -2,11 +2,11 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { AddressInfo } from 'node:net'
 import type {
-  LanguageModelV2,
-  LanguageModelV2FinishReason,
-  LanguageModelV2StreamPart,
+  LanguageModelV3,
+  LanguageModelV3FinishReason,
+  LanguageModelV3StreamPart,
 } from '@ai-sdk/provider'
-import { MockLanguageModelV2 } from 'ai/test'
+import { MockLanguageModelV3 } from 'ai/test'
 import { simulateReadableStream } from 'ai'
 import { createConfig, type Config } from '../src/config.js'
 import type { RunRequest } from '../src/contracts.js'
@@ -29,13 +29,13 @@ export function testConfig(overrides: Record<string, string> = {}): Config {
   })
 }
 
-export function streamFrom(parts: LanguageModelV2StreamPart[]) {
+export function streamFrom(parts: LanguageModelV3StreamPart[]) {
   return { stream: simulateReadableStream({ chunks: parts, chunkDelayInMs: 0 }) }
 }
 
-export const START: LanguageModelV2StreamPart = { type: 'stream-start', warnings: [] }
+export const START: LanguageModelV3StreamPart = { type: 'stream-start', warnings: [] }
 
-export function textChunks(text: string, id = 't1'): LanguageModelV2StreamPart[] {
+export function textChunks(text: string, id = 't1'): LanguageModelV3StreamPart[] {
   return [
     { type: 'text-start', id },
     { type: 'text-delta', id, delta: text },
@@ -43,18 +43,24 @@ export function textChunks(text: string, id = 't1'): LanguageModelV2StreamPart[]
   ]
 }
 
+/** inputTokens is the total prompt, cache read included, as the v3 provider spec reports it. */
 export function finish(
-  finishReason: LanguageModelV2FinishReason,
+  finishReason: LanguageModelV3FinishReason['unified'],
   usage: { inputTokens?: number; outputTokens?: number; cachedInputTokens?: number } = {},
-): LanguageModelV2StreamPart {
+): LanguageModelV3StreamPart {
+  const total = usage.inputTokens ?? 100
+  const cacheRead = usage.cachedInputTokens
   return {
     type: 'finish',
-    finishReason,
+    finishReason: { unified: finishReason, raw: finishReason },
     usage: {
-      inputTokens: usage.inputTokens ?? 100,
-      outputTokens: usage.outputTokens ?? 10,
-      totalTokens: (usage.inputTokens ?? 100) + (usage.outputTokens ?? 10),
-      ...(usage.cachedInputTokens != null ? { cachedInputTokens: usage.cachedInputTokens } : {}),
+      inputTokens: {
+        total,
+        noCache: cacheRead != null ? total - cacheRead : total,
+        cacheRead,
+        cacheWrite: undefined,
+      },
+      outputTokens: { total: usage.outputTokens ?? 10, text: undefined, reasoning: undefined },
     },
   }
 }
@@ -63,23 +69,23 @@ export function toolCall(
   toolCallId: string,
   toolName: string,
   input: unknown,
-): LanguageModelV2StreamPart {
+): LanguageModelV3StreamPart {
   return { type: 'tool-call', toolCallId, toolName, input: JSON.stringify(input) }
 }
 
-type DoStream = LanguageModelV2['doStream']
+type DoStream = LanguageModelV3['doStream']
 type StreamResult = Awaited<ReturnType<DoStream>>
 
 /**
- * NB: the doStream array of MockLanguageModelV2 is indexed from 1 (an off-by-one bug in
+ * NB: the doStream array of the mock model is indexed from 1 (an off-by-one bug since
  * ai@5: doStreamCalls.push runs BEFORE doStream[length] is read), so the stream queue is
  * unrolled into a function with its own counter.
  */
-export function mockModel(doStream: DoStream | StreamResult[]): MockLanguageModelV2 {
+export function mockModel(doStream: DoStream | StreamResult[]): MockLanguageModelV3 {
   if (Array.isArray(doStream)) {
     const queue = doStream
     let index = 0
-    return new MockLanguageModelV2({
+    return new MockLanguageModelV3({
       provider: 'mock',
       modelId: 'mock-model',
       doStream: async () => {
@@ -89,11 +95,11 @@ export function mockModel(doStream: DoStream | StreamResult[]): MockLanguageMode
       },
     })
   }
-  return new MockLanguageModelV2({ provider: 'mock', modelId: 'mock-model', doStream })
+  return new MockLanguageModelV3({ provider: 'mock', modelId: 'mock-model', doStream })
 }
 
 export function mockFactory(
-  model: MockLanguageModelV2,
+  model: MockLanguageModelV3,
   overrides: Partial<ResolvedModel> = {},
 ): ModelFactory {
   return () => ({
@@ -180,11 +186,11 @@ export function bearer(token = ENGINE_TOKEN): Record<string, string> {
 
 /** A stream that emits its beginning and hangs until aborted — for cancel / timeout tests. */
 export function hangingStream(
-  parts: LanguageModelV2StreamPart[],
+  parts: LanguageModelV3StreamPart[],
   signal?: AbortSignal,
-): { stream: ReadableStream<LanguageModelV2StreamPart> } {
+): { stream: ReadableStream<LanguageModelV3StreamPart> } {
   return {
-    stream: new ReadableStream<LanguageModelV2StreamPart>({
+    stream: new ReadableStream<LanguageModelV3StreamPart>({
       start(controller) {
         for (const part of parts) controller.enqueue(part)
         const onAbort = () => {

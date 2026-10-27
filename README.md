@@ -42,7 +42,7 @@ and executes.
 
 > [!NOTE]
 > **Status: v1.0** — the contract is frozen ([SPEC.md](SPEC.md)) and implemented: Node 22,
-> TypeScript, Hono, Vercel AI SDK 5. Tests run without network or keys.
+> TypeScript, Hono, Vercel AI SDK 6. Tests run without network or keys.
 > "1.0" is a promise about the contract (semver: no breaking changes within 1.x), not a claim
 > of operational maturity — the implementation is young; expect fixes, not contract changes.
 

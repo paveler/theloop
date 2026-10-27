@@ -5,7 +5,7 @@
  * 0 tokens), unknown (network / timeout / 5xx / dropped stream — the provider may have billed).
  * input_tokens is always the uncached input; cache_read / cache_write are separate.
  */
-import type { LanguageModelUsage, ProviderMetadata } from 'ai'
+import type { LanguageModelUsage } from 'ai'
 import type { Pricing, Usage, UsageCall, UsageCost, UsageTotal } from '../contracts.js'
 
 export interface NormalizedTokens {
@@ -25,32 +25,23 @@ const ZERO: NormalizedTokens = {
 }
 
 /**
- * Anthropic reports input_tokens already without the cache, and returns cache write in
- * providerMetadata. For openai-compatible providers prompt_tokens INCLUDES cached_tokens —
- * subtract it (SPEC §8.1).
+ * The AI SDK (v6) reports usage in one shape for every adapter: inputTokens is the TOTAL
+ * prompt, and inputTokenDetails splits it into uncached, cache read and cache write. The
+ * engine bills input_tokens as the uncached part (SPEC §8.1).
  */
-export function normalizeUsage(
-  providerKind: 'anthropic' | 'openai-compatible',
-  usage: LanguageModelUsage | undefined,
-  providerMetadata?: ProviderMetadata,
-): NormalizedTokens {
+export function normalizeUsage(usage: LanguageModelUsage | undefined): NormalizedTokens {
   if (!usage) return { ...ZERO }
-  const cacheRead = usage.cachedInputTokens ?? 0
-  const rawInput = usage.inputTokens ?? 0
-  const input = providerKind === 'anthropic' ? rawInput : Math.max(0, rawInput - cacheRead)
-
-  let cacheWrite = 0
-  const anthropicMeta = providerMetadata?.anthropic as { cacheCreationInputTokens?: number } | undefined
-  if (typeof anthropicMeta?.cacheCreationInputTokens === 'number') {
-    cacheWrite = anthropicMeta.cacheCreationInputTokens
-  }
+  const details = usage.inputTokenDetails
+  const cacheRead = details?.cacheReadTokens ?? 0
+  const cacheWrite = details?.cacheWriteTokens ?? 0
+  const input = details?.noCacheTokens ?? Math.max(0, (usage.inputTokens ?? 0) - cacheRead - cacheWrite)
 
   return {
     input_tokens: input,
     output_tokens: usage.outputTokens ?? 0,
     cache_read_tokens: cacheRead,
     cache_write_tokens: cacheWrite,
-    reasoning_tokens: usage.reasoningTokens ?? 0,
+    reasoning_tokens: usage.outputTokenDetails?.reasoningTokens ?? 0,
   }
 }
 

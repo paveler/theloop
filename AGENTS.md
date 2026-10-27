@@ -10,7 +10,7 @@ theloop is an agent loop as a stateless HTTP service. One `POST /runs` is one ru
 request carries provider, model, key, prompt, the full history, tools (URL + schema) and
 limits. The engine runs "model → tools → model", streams text over SSE, delivers the result
 and usage by callback, and forgets the run. Backend only, no UI. Node 22, TypeScript (ESM),
-Hono, Vercel AI SDK 5, vitest.
+Hono, Vercel AI SDK 6, vitest.
 
 Documents, in order of authority:
 
