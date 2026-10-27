@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Accepted 2026-10-27. PR A (v1.3.0: `skills[]`, `defer_loading`, `load_skill`) implemented; PR B (`search_tools`) next. Review history: draft 2026-10-27; revised the same day after review: activating pairs pinned against trimming (5.7), name reservation gated on the feature (4.4), `tool_not_loaded` excluded from repeat detection (5.5), model text in journal `content` (9), v1.3.0 check for deferred tools outside skills (4.4); second pass: `builtin: true` marker on engine-written tool messages and `tool_calls[]` entries, the only thing that distinguishes a built-in pair from a legacy HTTP tool of the same name (4.5, 5.7) |
+| Status | Accepted 2026-10-27. Implemented: PR A (v1.3.0: `skills[]`, `defer_loading`, `load_skill`) and PR B (v1.4.0: `search_tools`). Review history: draft 2026-10-27; revised the same day after review: activating pairs pinned against trimming (5.7), name reservation gated on the feature (4.4), `tool_not_loaded` excluded from repeat detection (5.5), model text in journal `content` (9), v1.3.0 check for deferred tools outside skills (4.4); second pass: `builtin: true` marker on engine-written tool messages and `tool_calls[]` entries, the only thing that distinguishes a built-in pair from a legacy HTTP tool of the same name (4.5, 5.7) |
 | Scope | Additive to `contract_version: "1"`; a request without `skills[]` and `defer_loading` behaves exactly as today |
 | Target | v1.3.0: `skills[]`, `tools[].defer_loading`, built-in `load_skill`. v1.4.0: built-in `search_tools` |
 | Prerequisite | AI SDK v6 line: `ai` 6.x, `@ai-sdk/anthropic` 3.x, `@ai-sdk/openai-compatible` 2.x (see section 14) |

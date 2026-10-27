@@ -312,7 +312,7 @@ maximum size of any incoming request body is `MAX_REQUEST_BYTES` (env, default 1
 | `llm.pricing` | no | If present, the engine returns `usage.cost` and can enforce `limits.max_cost` (§8.3). |
 | `system` | no | Dates are never put here by the engine (§9.4). |
 | `messages` | yes | The full history; at least one `user` message. |
-| `tools[]` | no | `effect: "read" \| "write"` is **mandatory** (§6.4). `defer_loading: true` hides the tool from the model until a skill activates it (§6.8). |
+| `tools[]` | no | `effect: "read" \| "write"` is **mandatory** (§6.4). `defer_loading: true` hides the tool from the model until a skill or `search_tools` activates it (§6.8). |
 | `skills[]` | no | Up to 64 instruction bundles `{ name, description, body, tools? }` the model loads on demand (§6.8). `name`: `^[a-z0-9][a-z0-9_-]{0,63}$`, unique; `description`: 1 to 1024 characters; `body`: 1 byte to 32 KiB UTF-8; `tools`: names from `tools[]`. |
 | `limits` | no | Defaults and server ceilings — §10. |
 | `stream` | no | What SSE reveals beyond text (§6.6). Default — nothing. |
@@ -343,8 +343,7 @@ created.
 Refusals: `400 bad_request` (including `output_checks`: invalid schema, schema over
 64 KB, more than 4 checks, repeated `fence` — §5.4; and, only when the request uses
 skills or deferred tools: a `tools[]` entry named `load_skill` or `search_tools`, a
-duplicated skill name, a skill listing a tool absent from `tools[]`, a deferred tool
-listed in no skill — §6.8) `| unresolved_tool_call |
+duplicated skill name, a skill listing a tool absent from `tools[]` — §6.8) `| unresolved_tool_call |
 history_ends_with_assistant` (§5) `| write_context_missing | provider_not_allowed |
 provider_key_missing | egress_denied | unsupported_media_type | image_too_large`,
 `401 unauthorized`, `409 session_busy` (+ `active_run_id`, the run is still going)
@@ -501,8 +500,9 @@ AssistantPart = TextPart
   so provider caches and signed thinking blocks stay valid. Without it, the last user
   message gets the current time, which lives for one turn only.
 - `builtin: true` on a `tool` message — the engine wrote it for one of its own tools
-  (`load_skill`, §6.8). It is the only thing that makes such a pair a built-in one; the
-  harness stores it with the rest of the message (H20).
+  (`load_skill`, `search_tools`, §6.8). It is the only thing that makes such a pair a built-in one; the
+  harness stores it with the rest of the message (H20). `false` or `null` are accepted and
+  mean the same as absent, as does `null` for `tools[].defer_loading`.
 - `partial: true` — the answer was cut (cancel / timeout / shutdown / limit). It goes
   into the next run as is.
 - An `event` part in a `user` message is how the harness delivers an event outside the
@@ -1019,8 +1019,24 @@ other once visible; deferral is a context optimisation, not an authorization bou
 call to one that is not visible yet is not executed: `tool_not_loaded: <tool> belongs to
 skill "<skill>". Call load_skill("<skill>") first.` It does not count toward
 `max_tool_calls` and is not a repeat candidate (§6.7), so the same call on the next step,
-once the skill is loaded, executes. Until `search_tools` ships, every deferred tool must be
-listed in a skill.
+once the skill is loaded, executes. For a deferred tool in no skill the error points to
+`search_tools` instead.
+
+**Built-in tool `search_tools`** `{ "query": string, "limit"?: 1 to 20 }`, offered when at
+least one deferred tool is listed in no skill. The engine ranks **every deferred tool**
+with BM25 (`k1 = 1.2`, `b = 0.75`) over the tool's name (split on `_`, `-` and camelCase),
+its description, and the property names and descriptions of `input_schema`. Tokens are
+lower-cased runs of Unicode letters and digits of two or more characters; no stemming, no
+stop words. The query is cut to 500 characters. Only positive scores are returned, best
+first, ties by name, at most `limit` (default 5). The stored `result` is JSON:
+`{ "tools": [...], "in_skills": { "<tool>": "<skill>" } }` — `tools` are matches in no
+skill and are activated from the next step; `in_skills` are not activated, the model is
+pointed to the skill so the tool arrives with its instructions. The model sees
+`[engine] Tools available from the next step: <a>, <b>.` and
+`Part of skills, load the skill first: <tool> (<skill>).`; with no match,
+`[engine] No tools match "<query>". …` — a text result, not an empty one (§6.2). The same
+query again in a run is a §6.7 repeat. The query is model text: in the journal it goes to
+`content` only.
 
 **Activation mechanisms**, one per run, chosen from the model (§9.2) and written to
 `run_start` as `activation`:
@@ -1038,13 +1054,15 @@ listed in a skill.
 
 **Statelessness.** Before step 1 the engine derives what is loaded from `messages`: every
 `load_skill` pair whose `tool` message has `builtin: true` and `is_error: false`, whose
-skill is still in `skills[]`, makes that skill's deferred tools visible (`skills_restored`).
+skill is still in `skills[]`, makes that skill's deferred tools visible, and so does every
+such `search_tools` result for the tools in its `result.tools` that are still deferred in
+`tools[]` (`skills_restored`).
 Unmarked pairs — an HTTP tool that was called `load_skill` before the harness adopted
 skills — stay ordinary history. A marked message with the wrong shape (`args.name` and
 `result` must be strings) is ordinary history with a `builtin_history_invalid` warning.
 Historical results render deterministically from the stored message and the current
 request: byte for byte as in the run that produced them while tools, skills and locale do
-not change. The body in the history is the body as loaded then; the history is never
+not change. Only tools that are deferred in the current request get a `tool_reference`. The body in the history is the body as loaded then; the history is never
 rewritten (§9.3). Trimming (§5.1) never drops a turn that carries an activation in
 effect, so the model's tools always match the engine's visible set.
 
@@ -1844,6 +1862,7 @@ a log pipeline. There is no database (§2): a restart or deploy means an empty j
 | `builtin_history_invalid` | warn | a `builtin: true` message of the wrong shape, treated as ordinary history: `call_id`, `tool` | — |
 | `skill_loaded` | info | `load_skill` ok: `name`, `step`, `tools` (activated), `reloaded` | — |
 | `skill_unknown` | warn | `load_skill` with an unknown name | `name` (model text) |
+| `tool_search` | info | `search_tools` executed: `step`, `limit`, `tools`, `in_skills` | `query` (model text) |
 | `duplicate_write_intent` | warn | two calls of one write tool in a step (§6.3) | `args` |
 | `tools_disabled` | warn | `tool_choice: none` from now on (§6.7): `reason`, repeat and empty counters | — |
 | `output_check` | debug / info / warn | a format gate decision (§5.4): `fence`, `attempt` (0 — the original answer), `outcome` — `absent \| passed \| invalid` for 0, `repaired \| invalid \| missing` for repairs, `failed` + `reason` — gave up; `errors` — paths. `step_start`, `provider_attempt`, `provider_failure`, `limit_hit` of a repair step carry `repair: <fence>`, `repair_attempt` | `issues` (error lines), `block` (original block), `draft` (repair answer) |
@@ -1913,6 +1932,9 @@ equivalent of the following suites.
    `deferLoading`, `cache_control` on the last non-deferred, a `tool_result` of references only with the text after it, tools on
    `none` steps; trimming keeps the activating turn; without the feature an HTTP tool named
    `load_skill` is ordinary, with it the name is a `400`; the other `400`s of §4.2.
+   `search_tools`: BM25 (camelCase split, argument names, positive scores only, ties by
+   name, `limit`, the 500-character cut); matches outside skills activate from the next
+   step, `in_skills` do not; the no-match text; found tools restored from history.
 5. **Format gate** (§5.4): block search (last block, inline fence, unclosed,
    `<|superquote|>`); schema parity with the client on a corpus of real model outputs;
    model-facing errors (unknown keys, `oneOf` branches, ≤ 8 lines); `passed` without extra
@@ -2056,7 +2078,7 @@ come from skipping one of these.
 | H17 | Keep tool results compact; the engine truncates at `tool_result_max_bytes`. | §6.2 |
 | H18 | Hand `stream_url` / `cancel_url` to end-user clients as is; never expose `ENGINE_TOKEN`. | §4.1 |
 | H19 | Reconcile `Σ usage.total` with provider billing periodically. | §8.4 |
-| H20 | Store the `tool` messages of `load_skill` verbatim, `result` and `builtin` included: the engine restores loaded skills from them on the next run, and only marked messages count. | §5, §6.8 |
+| H20 | Store the `tool` messages of `load_skill` and `search_tools` verbatim, `result` and `builtin` included: the engine restores loaded skills from them on the next run, and only marked messages count. | §5, §6.8 |
 
 A reference harness, a conformance test kit for harnesses and examples for common platforms
 are on the roadmap.
@@ -2084,7 +2106,10 @@ providers, the network and tools is passed through as received.
 | `load_skill` description (§6.8) | `Load a skill listed in the system prompt: returns its instructions and makes its tools available from the next step.`; argument `name`: `Skill name, exactly as listed.` |
 | Skill loaded (§6.8) | `[engine] Skill "<name>" loaded. Tools available from the next step: <a>, <b>.` or `[engine] Skill "<name>" loaded.` |
 | Unknown skill (§6.8) | `unknown_skill: <name>. Available skills: <a>, <b>.` |
-| Tool not loaded (§6.8) | `tool_not_loaded: <tool> belongs to skill "<skill>". Call load_skill("<skill>") first.` |
+| Tool not loaded (§6.8) | `tool_not_loaded: <tool> belongs to skill "<skill>". Call load_skill("<skill>") first.` or `tool_not_loaded: <tool> is not loaded. Find it with search_tools first.` |
+| `search_tools` description (§6.8) | `Find tools that are not loaded yet, by what they do. Matching tools become available from the next step.`; `query`: `What the tool should do, in a few words.`; `limit`: `How many tools to return (1 to 20, default 5).` |
+| Search result (§6.8) | `[engine] Tools available from the next step: <a>, <b>.` and / or `Part of skills, load the skill first: <tool> (<skill>), …` |
+| Search without a match (§6.8) | `[engine] No tools match "<query>". Try other words for what the tool should do.` |
 | Format check header (§5.4) | `[Format check] The <fence> block failed validation:` |
 | Format check footer (§5.4) | ``Send only the corrected ```<fence>``` block, with no text before or after.`` |
 | Invalid JSON in a block (§5.4) | `JSON did not parse: <reason>` |

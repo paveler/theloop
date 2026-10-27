@@ -114,22 +114,14 @@ function assertSkills(request: RunRequest): void {
     }
   })
 
+  // a deferred tool outside every skill is reachable through search_tools
   const toolNames = new Set(request.tools.map((t) => t.name))
   const seen = new Set<string>()
-  const inSkills = new Set<string>()
   request.skills.forEach((skill, index) => {
     if (seen.has(skill.name)) throw new EngineError('bad_request', `skills[${index}].name "${skill.name}" is duplicated`)
     seen.add(skill.name)
     for (const name of skill.tools) {
       if (!toolNames.has(name)) throw new EngineError('bad_request', `skills[${index}].tools: unknown tool "${name}"`)
-      inSkills.add(name)
-    }
-  })
-
-  // until search_tools ships, nothing could activate such a tool (RFC 0001, 4.4)
-  request.tools.forEach((tool, index) => {
-    if (tool.defer_loading && !inSkills.has(tool.name)) {
-      throw new EngineError('bad_request', `tools[${index}] "${tool.name}" is deferred but listed in no skill`)
     }
   })
 }

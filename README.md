@@ -83,7 +83,8 @@ intents, limits and everything else — [SPEC.md](SPEC.md).
 - **Providers.** Anthropic, OpenAI, DeepSeek, GLM (z.ai), GigaChat, MiniMax and any
   OpenAI-compatible endpoint, with per-key queues and AIMD rate limiting.
 - **Skills and deferred tools.** `skills[]` in the `SKILL.md` shape: the model sees an index,
-  loads a skill's instructions and tools mid-run with `load_skill`, and the prompt cache
+  loads a skill's instructions and tools mid-run with `load_skill`, finds deferred tools
+  with `search_tools` (BM25), and the prompt cache
   survives (`tool_reference` on Anthropic). Still stateless: what is loaded comes from the
   history.
 - **Debuggable.** An in-memory event journal per run and session (`GET /logs`), with content,
@@ -204,6 +205,7 @@ src/
   runs/validate.ts      request validation
   runs/images.ts        image validation and download through egress
   tools/http.ts         tool calls: ok / error / accepted / deferred, effect control, retries
+  tools/search.ts       BM25 over deferred tools for search_tools (§6.8)
   tools/args.ts         conservative argument validation against input_schema
   egress/               the single outbound HTTP client: allowlist, private IPs, no redirects
   stream/sse.ts         SSE with replay, snapshot, gap, backpressure

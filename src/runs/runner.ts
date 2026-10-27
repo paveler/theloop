@@ -10,6 +10,7 @@ import { jsonSchema, tool, type ToolSet } from 'ai'
 import type { ModelMessage } from '@ai-sdk/provider-utils'
 import type { Config } from '../config.js'
 import {
+  BUILTIN_TOOLS,
   CONTRACT_VERSION,
   publicError,
   type AssistantMessage,
@@ -251,7 +252,7 @@ class RunExecution {
         callback: request.callback ? safeUrl(request.callback.url) : null,
         tools: request.tools.map((t) => `${t.name}:${t.effect}${t.defer_loading === true ? ':deferred' : ''}`),
         ...(this.skills.enabled
-          ? { skills: this.skills.skillNames(), activation: this.skills.mechanism, tool_search: false }
+          ? { skills: this.skills.skillNames(), activation: this.skills.mechanism, tool_search: this.skills.toolSearch }
           : {}),
         limits: plan.limits,
         context_window: plan.resolved.contextWindow,
@@ -271,7 +272,7 @@ class RunExecution {
     for (const item of this.restored.invalid) {
       log.warn('builtin_history_invalid', { run_id: record.runId, call_id: item.call_id, tool: item.tool })
     }
-    if (this.restored.skills.length > 0) {
+    if (this.restored.skills.length > 0 || this.restored.tools.length > 0) {
       log.info('skills_restored', { run_id: record.runId, skills: this.restored.skills, tools: this.restored.tools })
     }
 
@@ -1120,6 +1121,28 @@ class RunExecution {
    */
   private runBuiltin(call: StepToolCall): CallResult {
     const started = Date.now()
+    if (call.tool === BUILTIN_TOOLS.searchTools) {
+      const found = this.skills.search(call.args)
+      // the query is model text: content only (§12.2); names from the request are metadata
+      log.info(
+        'tool_search',
+        {
+          run_id: this.record.runId,
+          step: this.steps,
+          limit: found.limit,
+          tools: found.result.tools,
+          in_skills: found.result.in_skills,
+        },
+        { query: found.query },
+      )
+      return {
+        call,
+        outcome: { kind: 'ok', result: found.result, truncated: false },
+        durationMs: Date.now() - started,
+        builtin: true,
+        activate: found.result.tools,
+      }
+    }
     const loaded = this.skills.loadSkill(call.args)
     const durationMs = Date.now() - started
     if (!loaded.ok) {
