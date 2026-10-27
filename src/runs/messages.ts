@@ -323,8 +323,16 @@ export async function toModelMessages(
   const out: ModelMessage[] = []
   let anchorOut: ModelMessage | null = null
   const callArgs = new Map<string, unknown>()
+  // texts of built-in results that carry tool references: they follow the tool results in the
+  // same user turn, since the API refuses a tool_result mixing tool_reference with text (§6.8)
+  const trailing: string[] = []
+  const flushTrailing = () => {
+    if (trailing.length === 0) return
+    out.push({ role: 'user', content: trailing.splice(0).map((text) => ({ type: 'text', text })) } as UserModelMessage)
+  }
 
   for (const message of messages) {
+    if (message.role !== 'tool') flushTrailing()
     if (message.role === 'user') {
       const content: Exclude<UserModelMessage['content'], string> = []
       for (const part of message.content) {
@@ -382,13 +390,15 @@ export async function toModelMessages(
 
     // tool: consecutive results are merged into one tool message —
     // providers (Anthropic) expect them as one block
+    const builtin = message.is_error ? null : builtinOutput(message, callArgs.get(message.call_id), options)
+    if (builtin?.trailingText) trailing.push(builtin.trailingText)
     const resultPart: ToolResultPart = {
       type: 'tool-result',
       toolCallId: message.call_id,
       toolName: message.tool,
       output: message.is_error
         ? { type: 'error-text', value: message.error ?? 'tool error' }
-        : (builtinOutput(message, callArgs.get(message.call_id), options) ?? toolOutput(message.result, options.texts)),
+        : (builtin?.output ?? toolOutput(message.result, options.texts)),
     }
     const last = out[out.length - 1]
     if (last && last.role === 'tool') {
@@ -397,6 +407,7 @@ export async function toModelMessages(
       out.push({ role: 'tool', content: [resultPart] } as ToolModelMessage)
     }
   }
+  flushTrailing()
 
   // prompt tail: a tool step within the run and the next turn read everything sent
   // here from the cache. If the tail is the anchor with the current time, the point is already before it
@@ -453,26 +464,27 @@ export function isEmptyToolResult(result: unknown): boolean {
 }
 
 /**
- * A built-in result (SPEC §6.8): with references — one `tool_reference` per deferred tool,
- * then the text, so the API expands the definitions inside the conversation; otherwise text.
+ * A built-in result (SPEC §6.8). With references — a tool_result of `tool_reference` blocks
+ * only, one per deferred tool, so the API expands the definitions inside the conversation;
+ * the text goes after the tool results of the turn. Without references — the text itself.
  */
 function builtinOutput(
   message: ToolMessage,
   args: unknown,
   options: ConvertOptions,
-): ToolResultPart['output'] | null {
+): { output: ToolResultPart['output']; trailingText?: string } | null {
   const rendered = options.renderBuiltin?.(message, args)
   if (!rendered) return null
-  if (rendered.references.length === 0) return { type: 'text', value: rendered.text }
+  if (rendered.references.length === 0) return { output: { type: 'text', value: rendered.text } }
   return {
-    type: 'content',
-    value: [
-      ...rendered.references.map((toolName) => ({
+    output: {
+      type: 'content',
+      value: rendered.references.map((toolName) => ({
         type: 'custom' as const,
         providerOptions: { anthropic: { type: 'tool-reference', toolName } },
       })),
-      { type: 'text' as const, text: rendered.text },
-    ],
+    },
+    trailingText: rendered.text,
   }
 }
 

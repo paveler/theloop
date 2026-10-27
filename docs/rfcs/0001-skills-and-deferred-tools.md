@@ -255,18 +255,21 @@ and later, Haiku 4.5 and later, every Fable and Mythos; the model table of the t
   changes only when the request's tools change: the prefix is stable.
 - `cache_control` goes on the **last non-deferred** tool; a deferred tool with `cache_control`
   is a `400`. There is always one: `load_skill` or `search_tools` is non-deferred.
-- A `load_skill` or `search_tools` result is sent as a `tool_result` whose `content` is an array:
-  one `tool_reference` block per tool to activate, then one `text` block with the text of
-  sections 5.3 and 5.4. The API expands the references into full definitions at that point of
+- A `load_skill` or `search_tools` result is sent as a `tool_result` whose `content` is one
+  `tool_reference` block per tool to activate, and nothing else; the text of sections 5.3
+  and 5.4 follows as a `text` block in the same user turn, after the tool results. The live
+  API refuses a `tool_result` that mixes the two ("Tool definitions/code execution functions
+  cannot be mixed with other content"), although the schema lists both (section 14). The API expands the references into full definitions at that point of
   the conversation and keeps doing so on every later request, so the tools stay available for
   the rest of the session without re-loading, and the cached prefix is untouched.
 
   ```json
-  { "type": "tool_result", "tool_use_id": "toolu_01...",
-    "content": [
-      { "type": "tool_reference", "tool_name": "createReturn" },
-      { "type": "tool_reference", "tool_name": "getReturnStatus" },
-      { "type": "text", "text": "[engine] Skill \"order-returns\" loaded. ...\n\n# Returns\n..." } ] }
+  { "role": "user", "content": [
+    { "type": "tool_result", "tool_use_id": "toolu_01...",
+      "content": [
+        { "type": "tool_reference", "tool_name": "createReturn" },
+        { "type": "tool_reference", "tool_name": "getReturnStatus" } ] },
+    { "type": "text", "text": "[engine] Skill \"order-returns\" loaded. ...\n\n# Returns\n..." } ] }
   ```
 
   Only tools that are in the current `tools[]` **and deferred** get a reference: a reference to
@@ -429,7 +432,7 @@ index text in `en` and `ru`, sorted by name, appended after `system`; the valida
 4.4; BM25: camelCase split, argument names searched, positive scores only, `limit`, ties by name,
 the 500-character cut; restoration from history (a loaded skill, a skill gone from `skills[]`, a
 found tool gone or no longer deferred, error results ignored); rendering of a historical
-`load_skill` result on `tool_reference`: references for present deferred tools only, then text,
+`load_skill` result on `tool_reference`: references for present deferred tools only, the text after the tool results,
 byte-identical to the live rendering; `estimateToolSchemaTokens` over visible tools only.
 
 **Loop on the mock model** (`test/skills.test.ts`): `load_skill` on step 1 gives the header and
@@ -441,7 +444,7 @@ step, does not activate `in_skills`, returns the no-match text, respects `limit`
 `tools_array` the SDK call of step 2 carries the activated tools and step 1 does not; on
 `tool_reference` every step carries all tools with `deferLoading` on the deferred ones,
 `cacheControl` on the last non-deferred, the tool result of step 2 has `tool-reference` parts
-then text, and a `none` step still carries the tools; `tool_choice: none` after repeats disables
+only and the text follows it, and a `none` step still carries the tools; `tool_choice: none` after repeats disables
 the built-ins too; a load on the last allowed step is not executed (§10.1); SSE events for
 built-ins; `load_skill` and the skill's tool in one batch, then the same tool call on the next
 step executes (no `repeated_call`); a history that overflows the window keeps the block with the
@@ -538,8 +541,9 @@ after both, whichever is ready.
 ## 14. To verify during implementation
 
 1. A `tool_result` whose `content` mixes `tool_reference` and `text` blocks: the Messages API
-   schema lists both among the allowed block types of `tool_result.content`; the smoke case
-   confirms it on the live API.
+   schema lists both, but the live API answers `400` ("cannot be mixed with other content").
+   Resolved in 5.6: references only in the `tool_result`, the text right after it in the same
+   user turn. The smoke case passes with that shape, and the second turn reads the cache.
 2. `@ai-sdk/anthropic` 3.x: a `custom` tool-result content part with
    `providerOptions.anthropic.type === "tool-reference"` is emitted as `tool_reference`, and
    `toolChoice: "none"` keeps the tools array. Both read from the 3.0.135 build; re-check on the

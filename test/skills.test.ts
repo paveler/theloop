@@ -352,13 +352,20 @@ describe('skills: tool_reference mechanism (SPEC §6.8)', () => {
         { deferLoading: true },
       ])
     }
+    // the API refuses a tool_result mixing tool_reference with text: references only, the
+    // text follows in the same user turn
     const output = toolOutputs(model, 1)[0]
     expect(output.type).toBe('content')
     expect(output.value).toEqual([
       { type: 'custom', providerOptions: { anthropic: { type: 'tool-reference', toolName: 'createReturn' } } },
       { type: 'custom', providerOptions: { anthropic: { type: 'tool-reference', toolName: 'getReturnStatus' } } },
-      { type: 'text', text: `${HEADER}\n\n${BODY}` },
     ])
+    const prompt = model.doStreamCalls[1]!.prompt
+    const toolIndex = prompt.findIndex((m) => m.role === 'tool')
+    expect(prompt[toolIndex + 1]).toMatchObject({
+      role: 'user',
+      content: [{ type: 'text', text: `${HEADER}\n\n${BODY}` }],
+    })
     const start = (await journal(engine, result.run_id)).find((e) => e.event === 'run_start')
     expect(start).toMatchObject({ activation: 'tool_reference', skills: ['order-returns', 'shipping'], tool_search: false })
     expect(start!.tools).toContain('createReturn:read:deferred')

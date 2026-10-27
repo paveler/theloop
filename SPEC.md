@@ -1028,8 +1028,9 @@ listed in a skill.
 - `tool_reference` — Anthropic models with tool search. Every step carries every tool:
   non-deferred by name (built-ins among them), then deferred by name with
   `defer_loading: true`; `cache_control` goes on the last non-deferred one. A built-in
-  result is a `tool_result` whose content is one `tool_reference` block per tool to
-  activate, then the text. The API expands the definitions inside the conversation, so the
+  result that activates tools is a `tool_result` of `tool_reference` blocks only, one per
+  tool; its text follows as a `text` block in the same user turn, after the tool results
+  (the API refuses a `tool_result` that mixes `tool_reference` with text). The API expands the definitions inside the conversation, so the
   cached prefix never changes. `tool_choice: none` steps keep the tools.
 - `tools_array` — every other provider. A step carries the visible tools by name; an
   activation adds tools to the next step's array (one prefix cache miss). The text is the
@@ -1909,7 +1910,7 @@ equivalent of the following suites.
    `max_tool_calls` is untouched; `tool_not_loaded`, not a repeat; unknown skill; the same
    skill twice is `repeated_call`; restoration from history and a reload; an unmarked or
    malformed pair activates nothing; on `tool_reference` every step carries every tool with
-   `deferLoading`, `cache_control` on the last non-deferred, references then text, tools on
+   `deferLoading`, `cache_control` on the last non-deferred, a `tool_result` of references only with the text after it, tools on
    `none` steps; trimming keeps the activating turn; without the feature an HTTP tool named
    `load_skill` is ordinary, with it the name is a `400`; the other `400`s of §4.2.
 5. **Format gate** (§5.4): block search (last block, inline fence, unclosed,
