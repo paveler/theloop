@@ -4,6 +4,54 @@ All notable changes to theloop. The contract is versioned separately (`contract_
 [SPEC.md](SPEC.md)); every change below is additive to it. Releases follow semver: no breaking
 changes within 1.x.
 
+## v1.2.0 — 2026-10-28
+
+[RFC 0002](docs/rfcs/0002-final-answer-on-limits-and-disk-journal.md) and
+[RFC 0003](docs/rfcs/0003-presentation-invariants.md). Additive to contract `"1"`, with one
+default behavior change (`max_steps` / `max_tool_calls`, opt-out below); everything from
+RFC 0003 is opt-in.
+
+### Changed
+
+- **A run never ends on `max_steps` / `max_tool_calls` without an answer** (SPEC §10.1).
+  The last allowed step goes with `tool_choice: none` and an ephemeral engine note (answer
+  with what you have); a refused `max_tool_calls` batch, or a budget used up exactly, makes
+  the next step text-only. The model answers → `completed / end_turn` with the new
+  `limit_reached`. No answer (empty, a tool call anyway, a provider failure, a budget) →
+  `stopped_limit` with a fixed localized fallback as the last assistant message and
+  `answer_source: "fallback"`. `limits.final_answer: false` restores the old behavior
+  exactly. Harnesses that showed `stopped_limit` as an error should render its answer
+  (new obligation H22).
+- A model that calls a tool despite `tool_choice: none` is refused by the AI SDK; on the
+  final step that attempt is no longer retried.
+
+### Added
+
+- **Journal on disk** (SPEC §12.4, §4.9). `LOG_DIR` turns on daily JSONL files that survive
+  restarts; `LOG_RETENTION_DAYS` (7), `LOG_DIR_MAX_BYTES` (2 GB) and
+  `LOG_DISK_CONTENT_MAX_CHARS` (200 000) bound them. `GET /logs` reads memory first and
+  falls back to disk; the response gains `source: memory | disk | mixed`, the query gains
+  `days` and `inline_prompts`. Entries on disk carry `boot_id`.
+- **Prompts by hash.** `run_start` stores `system_sha256`; the text is kept once in memory
+  and once per day file (`prompt_blob`), and `GET /logs` inlines it back by default.
+- **One presentation per run** (SPEC §6.9). `tools[].presents`, `output_checks[].presents`
+  and `limits.max_presentations`: presenting calls are admitted in order up to the budget;
+  once it is spent, presenting tools are hidden and refused (`tool_calls[].status:
+  presentation_limit`) and presenting fences are cut (`output_checks[].status:
+  suppressed`). `result.presentations` lists what reached the user.
+- **Blocks belong to the final answer** (SPEC §5.4). `output_checks[].interim: "drop"`
+  removes blocks of the fence from the text of tool steps, from the stored message and the
+  next prompt; SSE `output_check` `dropped`.
+- **Configurable repeat tolerance** (SPEC §6.7). `limits.max_repeated_calls` (default 1,
+  ceiling 3); `0` disables tools on the first repeat.
+- **Grounded values** (SPEC §5.4). `output_checks[].grounded: [{ path, tools }]` requires
+  values at a JSON Pointer (with `*`) to come from `ok` results of the listed tools; an
+  invented value goes through the normal repair (`outcome: ungrounded` in the journal).
+- Journal events `presentation`, `presentation_limit`, `interim_block_dropped`.
+- Journal events `final_answer`, `journal_retention`, `journal_pruned`,
+  `journal_disk_ephemeral`; `step_start.final_answer_step` with `content.engine_note`;
+  `run_done.limit_reached` / `answer_source`.
+
 ## v1.1.2 — 2026-10-27
 
 No breaking contract changes. SPEC §6.5 now spells out the cancelled deferred call, and

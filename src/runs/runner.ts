@@ -15,9 +15,11 @@ import {
   publicError,
   type AssistantMessage,
   type AssistantPart,
+  type FinalAnswerLimit,
   type Limits,
   type OutputCheckFailReason,
   type OutputCheckResult,
+  type Presentation,
   type RunContext,
   type RunRequest,
   type RunResult,
@@ -60,6 +62,8 @@ import type { RunRecord, RunRegistry } from './registry.js'
 import {
   appendBlock,
   checkText,
+  collectScalars,
+  findBlocks,
   ISSUE_MISSING,
   issueLines,
   issuePaths,
@@ -76,9 +80,6 @@ import { checkBudgets, normalizeUsage, UsageTracker } from './usage.js'
 
 /** Network / 5xx: ×2 (SPEC §11.3). 429 has its own ladder: Retry-After or full jitter, up to PROVIDER_RATE_LIMIT_RETRIES. */
 const PROVIDER_RETRY_DELAYS_MS = [1000, 3000]
-
-/** How many repeats of the same call are forgiven before tools are disabled (SPEC §6.7). */
-const MAX_REPEATED_CALLS = 1
 
 /** This many empty results from one tool in a run, and tools are disabled (SPEC §6.7). */
 const MAX_EMPTY_RESULTS = 2
@@ -132,7 +133,8 @@ class RunExecution {
   private readonly toolsByName = new Map<string, ToolDef>()
   /** The step's tool set; rebuilt when an activation changes it (SPEC §6.8). */
   private toolSet: ToolSet = {}
-  private toolSetVersion = -1
+  /** Skills version + presenting tools hidden: the tool set is rebuilt when either changes. */
+  private toolSetKey = ''
   private readonly resolveImage: (url: string) => Promise<{ data: Uint8Array; mediaType: string }>
   /** `system` with the skill index (SPEC §6.8). */
   private readonly systemText: string | null
@@ -165,6 +167,18 @@ class RunExecution {
   private repairing: { fence: string; attempt: number } | null = null
   /** Which budget blocked the repair step. */
   private repairBudgetLimit: 'max_total_tokens' | 'max_cost' | null = null
+  /** The next step is the text-only final step of this limit (SPEC §10.1). */
+  private finalAnswer: FinalAnswerLimit | null = null
+  /** The run answered on its final step: result.limit_reached. */
+  private limitReached: FinalAnswerLimit | null = null
+  /** The answer is the engine's fallback text (SPEC §10.1). */
+  private fallbackAnswer = false
+  /** Which budget blocked the final step: the run ends with it, and the fallback answer. */
+  private finalBudgetLimit: 'max_total_tokens' | 'max_cost' | null = null
+  /** The final step's provider failure was a tool call under tool_choice none. */
+  private finalIgnoredNone = false
+  /** What reached the user, counted only with limits.max_presentations (SPEC §6.9). */
+  private readonly presentations: Presentation[] = []
   private timeoutTimer: ReturnType<typeof setTimeout> | null = null
   /** When limits.timeout_ms fires — waiting for a slot and the 429 retry pause must fit before it. */
   private deadline = Number.POSITIVE_INFINITY
@@ -236,10 +250,55 @@ class RunExecution {
    * prompt, and reordering them from turn to turn wipes the whole cache.
    */
   private refreshTools(): void {
-    if (this.toolSetVersion === this.skills.version) return
-    this.toolSetVersion = this.skills.version
-    this.toolSet = buildToolSet(this.skills.providerTools(this.plan.request.tools), this.cacheEnabled)
-    this.toolTokens = estimateToolSchemaTokens(this.skills.visibleTools(this.plan.request.tools))
+    const key = `${this.skills.version}:${this.presentationsSpent()}`
+    if (this.toolSetKey === key) return
+    this.toolSetKey = key
+    const tools = this.requestTools()
+    this.toolSet = buildToolSet(this.skills.providerTools(tools), this.cacheEnabled)
+    this.toolTokens = estimateToolSchemaTokens(this.skills.visibleTools(tools))
+  }
+
+  /** The presentation budget is spent: presenting tools are hidden and refused (SPEC §6.9). */
+  private presentationsSpent(): boolean {
+    const max = this.plan.limits.max_presentations
+    return max != null && this.presentations.length >= max
+  }
+
+  /**
+   * The request's tools minus hidden presenting ones. With tool_reference a deferred tool stays
+   * in the list (the history may reference it); its calls are refused all the same.
+   */
+  private requestTools(): ToolDef[] {
+    const { tools } = this.plan.request
+    if (!this.presentationsSpent()) return tools
+    const keepDeferred = this.skills.mechanism === 'tool_reference'
+    return tools.filter((t) => t.presents !== true || (keepDeferred && t.defer_loading === true))
+  }
+
+  private presents(tool: string): boolean {
+    return this.toolsByName.get(tool)?.presents === true
+  }
+
+  /** Scalars of `ok` results of the tools, in the request history and this run (SPEC §5.4). */
+  private readonly groundingSource = (tools: readonly string[]): ReadonlySet<string> => {
+    const names = new Set(tools)
+    const values = new Set<string>()
+    for (const message of [...this.plan.request.messages, ...this.newMessages]) {
+      if (message.role !== 'tool' || message.is_error || !names.has(message.tool)) continue
+      collectScalars(message.result, values)
+    }
+    return values
+  }
+
+  private recordPresentation(item: Presentation): void {
+    this.presentations.push(item)
+    log.info('presentation', {
+      run_id: this.record.runId,
+      step: this.steps,
+      ...item,
+      used: this.presentations.length,
+      max: this.plan.limits.max_presentations,
+    })
   }
 
   async execute(): Promise<void> {
@@ -342,15 +401,29 @@ class RunExecution {
       this.steps = step
       this.record.steps = step
 
-      const prompt = await this.buildPrompt(step)
-      const outcome = await this.callProvider(prompt, step)
-      if (outcome === 'budget_exceeded') return
-      if (outcome === 'aborted') return
-      if (outcome === 'failed') return
+      // §10.1: the last allowed step goes without tools, so a run on max_steps still ends with an answer
+      if (limits.final_answer && !this.finalAnswer && limits.max_steps > 1 && step >= limits.max_steps) {
+        this.finalAnswer = 'max_steps'
+      }
+      const final = this.finalAnswer
+
+      const prompt = await this.buildPrompt(step, [], final ? this.texts.finalAnswerNote(final) : undefined)
+      const outcome = await this.callProvider(prompt, step, final ? 'final' : 'main')
+      if (typeof outcome === 'string') {
+        // a final step that hit a budget or a provider failure did not finish the run itself
+        if (final && !this.finished) {
+          this.finishWithFallback(
+            final,
+            outcome === 'budget_exceeded' ? 'budget' : this.finalIgnoredNone ? 'tool_calls_ignored_none' : 'provider_error',
+          )
+        }
+        return
+      }
 
       const partialByLength = outcome.finishReason === 'length'
       const message = this.pushAssistant(outcome.parts, partialByLength)
       this.emitStepEvent(step, outcome)
+      if (outcome.toolCalls.length > 0 && message) this.dropInterimBlocks(step, message)
 
       if (outcome.toolCalls.length === 0) {
         if (partialByLength) {
@@ -358,10 +431,18 @@ class RunExecution {
           this.finish('stopped_limit', 'max_tokens')
           return
         }
+        if (final && outcome.text.trim().length === 0) {
+          this.finishWithFallback(final, 'empty_text')
+          return
+        }
         // the format gate goes exactly here: otherwise the run would end with the final text (SPEC §5.4)
         if (this.plan.outputChecks.length > 0 && (await this.applyOutputChecks(step, message)) === 'cancelled') {
           this.finishAborted()
           return
+        }
+        if (final) {
+          this.limitReached = final
+          log.info('final_answer', { run_id: this.record.runId, step, limit: final, outcome: 'model' })
         }
         this.finish('completed', 'end_turn')
         return
@@ -375,6 +456,18 @@ class RunExecution {
         this.finish('stopped_limit', 'max_tokens')
         return
       }
+      // the provider ignored tool_choice none on the final step: the calls are never executed
+      if (final) {
+        this.logLimit(final, { step, pending_tool_calls: outcome.toolCalls.length, final_answer: true })
+        this.sealUnresolvedToolCalls(`not_executed: ${final}`, 'not_executed')
+        if (outcome.text.trim().length === 0) {
+          this.finishWithFallback(final, 'tool_calls_ignored_none')
+          return
+        }
+        log.info('final_answer', { run_id: this.record.runId, step, limit: final, outcome: 'model' })
+        this.finish('stopped_limit', final)
+        return
+      }
       if (step >= limits.max_steps) {
         this.logLimit('max_steps', { step, max_steps: limits.max_steps, pending_tool_calls: outcome.toolCalls.length })
         this.sealUnresolvedToolCalls('not_executed: max_steps', 'not_executed')
@@ -384,7 +477,11 @@ class RunExecution {
       // built-ins, tool_not_loaded rejections (§6.8) and repeats (§6.7) never reach an endpoint: they do not count
       const remaining = limits.max_tool_calls - this.toolCallsUsed
       const requested = outcome.toolCalls.filter(
-        (c) => !this.skills.builtin(c.tool) && !this.skills.isHidden(c.tool) && !this.seenCalls.has(callKey(c)),
+        (c) =>
+          !this.skills.builtin(c.tool) &&
+          !this.skills.isHidden(c.tool) &&
+          !this.seenCalls.has(callKey(c)) &&
+          !(this.presents(c.tool) && this.presentationsSpent()),
       ).length
       if (requested > remaining) {
         this.logLimit('max_tool_calls', {
@@ -392,8 +489,14 @@ class RunExecution {
           used: this.toolCallsUsed,
           requested,
           max_tool_calls: limits.max_tool_calls,
+          ...(limits.final_answer ? { final_answer: true } : {}),
         })
         this.sealUnresolvedToolCalls('not_executed: max_tool_calls', 'not_executed')
+        // all-or-nothing stays; the next step answers without tools (§10.1 rule 2)
+        if (limits.final_answer) {
+          this.finalAnswer = 'max_tool_calls'
+          continue
+        }
         this.finish('stopped_limit', 'max_tool_calls')
         return
       }
@@ -408,18 +511,27 @@ class RunExecution {
         this.finish('awaiting_tool', 'deferred')
         return
       }
+      // the budget is used up exactly: the following steps are text-only
+      if (limits.final_answer && this.toolCallsUsed > 0 && this.toolCallsUsed >= limits.max_tool_calls) {
+        this.finalAnswer ??= 'max_tool_calls'
+      }
     }
   }
 
   /* ----------------------------------------------------- provider call */
 
-  /** @param extra a tail that is not in the run's messages: repair synthetics and drafts (SPEC §5.4). */
+  /**
+   * @param extra a tail that is not in the run's messages: repair synthetics and drafts (SPEC §5.4).
+   * @param engineNote the final step's note (§10.1): the prompt of this step only, never the history.
+   */
   private async buildPrompt(
     step: number,
     extra: readonly StoredMessage[] = [],
+    engineNote?: string,
   ): Promise<Prompt> {
     const { plan } = this
-    const history = [...plan.request.messages, ...this.newMessages, ...extra]
+    const note: StoredMessage[] = engineNote ? [{ role: 'user', content: [{ type: 'text', text: engineNote }] }] : []
+    const history = [...plan.request.messages, ...this.newMessages, ...extra, ...note]
     this.refreshTools()
 
     const trim = trimHistory({
@@ -467,9 +579,13 @@ class RunExecution {
       estimated_tokens: trim.estimatedTokens,
       tools_disabled: this.toolsDisabled || undefined,
       tool_calls_used: this.toolCallsUsed,
-      ...(this.skills.enabled ? { tools_visible: this.skills.visibleTools(plan.request.tools).map((t) => t.name) } : {}),
+      ...(this.skills.enabled || this.presentationsSpent()
+        ? { tools_visible: this.skills.visibleTools(this.requestTools()).map((t) => t.name) }
+        : {}),
+      ...(plan.limits.max_presentations != null ? { presentations_used: this.presentations.length } : {}),
+      ...(engineNote ? { final_answer_step: true } : {}),
       ...this.repairFields(),
-    })
+    }, engineNote ? { engine_note: engineNote } : undefined)
     // the engine's own edit of a signed prefix: stale thinking blocks are dropped, not a 400 (SPEC §9.3)
     const dropStaleThinking =
       plan.resolved.thinkingPrefixBinding === true &&
@@ -481,16 +597,20 @@ class RunExecution {
    * Provider call attempts, retried ONLY before the first content event
    * (SPEC §11.3): after that a transparent retry is impossible — the browser has already seen text.
    *
-   * @param repair a block repair step (SPEC §5.4): tool_choice none, deltas go after
+   * @param mode `repair` — a block repair step (SPEC §5.4): tool_choice none, deltas go after
    * the separator, tool_call is not sent to SSE; a limit, a broken stream or a provider failure
    * do NOT end the run — the gate decides the outcome, the model's answer already exists.
+   * `final` — the text-only final step on a limit (§10.1): tool_choice none, tool_call is not
+   * sent to SSE; a budget or a provider failure after retries does not end the run — the
+   * caller ends it with the fallback answer.
    */
   private async callProvider(
     prompt: Prompt,
     step: number,
-    repair = false,
+    mode: 'main' | 'repair' | 'final' = 'main',
   ): Promise<StepOutcome | 'budget_exceeded' | 'aborted' | 'failed'> {
     const { plan, record } = this
+    const repair = mode === 'repair'
     const params = plan.request.llm.params
     let separated = false
     let rateLimitRetries = 0
@@ -526,6 +646,10 @@ class RunExecution {
           this.repairBudgetLimit = budget.exceeded === 'max_cost' ? 'max_cost' : 'max_total_tokens'
           return 'budget_exceeded'
         }
+        if (mode === 'final') {
+          this.finalBudgetLimit = budget.exceeded === 'max_cost' ? 'max_cost' : 'max_total_tokens'
+          return 'budget_exceeded'
+        }
         this.finish('stopped_limit', budget.exceeded!)
         return 'budget_exceeded'
       }
@@ -552,8 +676,8 @@ class RunExecution {
       let slotOutcome: SlotOutcome = 'neutral'
       let retryAfterMs: number | undefined
       let outcome: StepOutcome
-      // a text-only step: the model is repeating itself (§6.7) or repairing a block (§5.4)
-      const noTools = this.toolsDisabled || repair
+      // a text-only step: the model is repeating itself (§6.7), repairing a block (§5.4) or answering on a limit (§10.1)
+      const noTools = this.toolsDisabled || mode !== 'main'
       try {
         outcome = await streamStep({
           texts: this.texts,
@@ -585,9 +709,9 @@ class RunExecution {
             if (plan.request.stream.expose_reasoning) record.sse.emit('reasoning', { text })
           },
           onToolCall: (call) => {
-            // repair runs with tool_choice none; an ignored call will never execute —
+            // repair and final steps run with tool_choice none; an ignored call will never execute —
             // in SSE it would hang as pending forever
-            if (repair) return
+            if (mode !== 'main') return
             record.sse.emit('tool_call', {
               call_id: call.callId,
               tool: call.tool,
@@ -630,6 +754,11 @@ class RunExecution {
             : otherRetries < PROVIDER_RETRY_DELAYS_MS.length
               ? { delayMs: PROVIDER_RETRY_DELAYS_MS[otherRetries]!, skipped: undefined }
               : { delayMs: null, skipped: 'retries_exhausted' as const }
+      // the final step does not wait out retries for a model that keeps calling tools: the fallback answers now
+      if (mode === 'final' && outcome.failure.toolChoiceViolation) {
+        this.finalIgnoredNone = true
+        retry.delayMs = null
+      }
       const willRetry = retry.delayMs !== null
       log.warn(
         'provider_failure',
@@ -680,7 +809,7 @@ class RunExecution {
         continue
       }
 
-      if (repair) return 'failed'
+      if (mode !== 'main') return 'failed'
       this.finish('failed', outcome.failure.code, {
         code: outcome.failure.code,
         message: outcome.failure.message,
@@ -931,8 +1060,15 @@ class RunExecution {
     const rejected = new Map<string, string>()
     // a deferred tool the model has never seen the schema of (§6.8); not a repeat candidate
     const notLoaded = new Set<string>()
+    // a presenting tool hidden after the budget was spent (§6.9); the provider may mark the call
+    // invalid as unknown, the refusal says why
+    const overPresentation = new Set<string>()
     for (const call of calls) {
       if (repeated.has(call.callId)) continue
+      if (this.presents(call.tool) && this.presentationsSpent()) {
+        overPresentation.add(call.callId)
+        continue
+      }
       if (this.skills.isHidden(call.tool)) {
         notLoaded.add(call.callId)
         rejected.set(call.callId, this.skills.notLoadedError(call.tool))
@@ -960,6 +1096,20 @@ class RunExecution {
       writeCounts.set(call.tool, (writeCounts.get(call.tool) ?? 0) + 1)
     }
     const duplicated = new Set([...writeCounts.entries()].filter(([, n]) => n > 1).map(([name]) => name))
+
+    // presenting calls are admitted in the model's order up to the remaining budget, before any
+    // endpoint is called (SPEC §6.9): a later call is refused even if an earlier one fails
+    const maxPresentations = plan.limits.max_presentations
+    if (maxPresentations != null) {
+      let room = maxPresentations - this.presentations.length
+      for (const call of calls) {
+        if (repeated.has(call.callId) || rejected.has(call.callId) || overPresentation.has(call.callId)) continue
+        if (!this.presents(call.tool)) continue
+        if (duplicated.has(call.tool)) continue
+        if (room > 0) room--
+        else overPresentation.add(call.callId)
+      }
+    }
 
     const tasks = calls.map((call) => async (): Promise<CallResult> => {
       if (repeated.has(call.callId)) {
@@ -992,6 +1142,19 @@ class RunExecution {
         }
       }
       if (this.skills.builtin(call.tool)) return this.runBuiltin(call)
+      if (overPresentation.has(call.callId)) {
+        log.warn(
+          'presentation_limit',
+          { run_id: this.record.runId, step: this.steps, kind: 'tool', name: call.tool, call_id: call.callId },
+          { args: call.args },
+        )
+        return {
+          call,
+          outcome: { kind: 'error', error: this.texts.presentationLimit(call.tool), status: 'error' },
+          status: 'presentation_limit',
+          durationMs: 0,
+        }
+      }
       if (duplicated.has(call.tool)) {
         log.warn(
           'duplicate_write_intent',
@@ -1028,6 +1191,13 @@ class RunExecution {
     }
     // activations take effect from the next step (§6.8)
     for (const result of results) if (result.activate) this.skills.activate(result.activate)
+    if (maxPresentations != null) {
+      for (const result of results) {
+        if (result.outcome.kind === 'ok' && !result.builtin && this.presents(result.call.tool)) {
+          this.recordPresentation({ kind: 'tool', name: result.call.tool, call_id: result.call.callId })
+        }
+      }
+    }
     this.repeatedCalls += repeated.size
     for (const result of results) {
       if (result.builtin || result.outcome.kind !== 'ok' || !isEmptyToolResult(result.outcome.result)) continue
@@ -1038,13 +1208,14 @@ class RunExecution {
     // from here on, only a text answer based on what is already there
     if (!this.toolsDisabled) {
       const emptyTool = [...this.emptyResults].find(([, n]) => n >= MAX_EMPTY_RESULTS)?.[0]
-      if (this.repeatedCalls > MAX_REPEATED_CALLS || emptyTool) {
+      if (this.repeatedCalls > plan.limits.max_repeated_calls || emptyTool) {
         this.toolsDisabled = true
         log.warn('tools_disabled', {
           run_id: this.record.runId,
           step: this.steps,
           reason: emptyTool ? 'empty_results' : 'repeated_calls',
           repeated_calls: this.repeatedCalls,
+          max_repeated_calls: plan.limits.max_repeated_calls,
           empty_results: Object.fromEntries(this.emptyResults),
           ...(emptyTool ? { tool: emptyTool } : {}),
         })
@@ -1280,26 +1451,41 @@ class RunExecution {
     const repaired = new Map<string, string>()
     const stripped = new Set<string>()
 
+    const counted = this.plan.limits.max_presentations != null
     for (const check of this.plan.outputChecks) {
-      const verdict = checkText(original, check, this.texts)
+      const verdict = checkText(original, check, this.texts, this.groundingSource)
 
       if (verdict.kind === 'absent') {
         this.outputCheckResults.push({ fence: check.fence, status: 'absent', attempts: 0 })
         this.logOutputCheck('debug', step, check.fence, 0, 'absent')
         continue
       }
+      // the user already sees this run's presentation: the block is cut, not repaired (SPEC §6.9)
+      if (counted && check.presents && this.presentationsSpent()) {
+        stripped.add(check.fence)
+        this.outputCheckResults.push({ fence: check.fence, status: 'suppressed', attempts: 0, reason: 'presentation_limit' })
+        this.record.sse.emit('output_check', { fence: check.fence, attempt: 0, status: 'suppressed' })
+        log.warn(
+          'presentation_limit',
+          { run_id: this.record.runId, step, kind: 'fence', name: check.fence },
+          { block: verdict.block.raw },
+        )
+        continue
+      }
       if (verdict.kind === 'valid') {
         this.outputCheckResults.push({ fence: check.fence, status: 'passed', attempts: 0 })
         this.record.sse.emit('output_check', { fence: check.fence, attempt: 0, status: 'passed' })
         this.logOutputCheck('info', step, check.fence, 0, 'passed')
+        if (counted && check.presents) this.recordPresentation({ kind: 'fence', name: check.fence })
         continue
       }
 
-      this.logOutputCheck('warn', step, check.fence, 0, 'invalid', verdict.issues, { block: verdict.block.raw })
+      this.logOutputCheck('warn', step, check.fence, 0, invalidOutcome(verdict.issues), verdict.issues, { block: verdict.block.raw })
       const outcome = await this.repairBlock(step, check, verdict.issues)
       stripped.add(check.fence)
 
       if (outcome.ok) {
+        if (counted && check.presents) this.recordPresentation({ kind: 'fence', name: check.fence })
         repaired.set(check.fence, outcome.raw)
         this.outputCheckResults.push({
           fence: check.fence,
@@ -1371,7 +1557,7 @@ class RunExecution {
       this.repairing = { fence: check.fence, attempt }
       let outcome: Awaited<ReturnType<RunExecution['callProvider']>>
       try {
-        outcome = await this.callProvider(await this.buildPrompt(step, trail), step, true)
+        outcome = await this.callProvider(await this.buildPrompt(step, trail), step, 'repair')
       } finally {
         this.repairing = null
       }
@@ -1386,7 +1572,7 @@ class RunExecution {
         return { ok: false, attempts: attempt, reason, issues: lastIssues }
       }
 
-      const verdict = checkText(outcome.text, check, this.texts)
+      const verdict = checkText(outcome.text, check, this.texts, this.groundingSource)
       if (verdict.kind === 'valid') {
         this.logOutputCheck('info', step, check.fence, attempt, 'repaired', [], { draft: outcome.text })
         return { ok: true, attempts: attempt, raw: verdict.raw }
@@ -1396,7 +1582,7 @@ class RunExecution {
         verdict.kind === 'absent'
           ? [{ path: ISSUE_MISSING, message: this.texts.blockMissing(check.fence) }]
           : verdict.issues
-      this.logOutputCheck('warn', step, check.fence, attempt, verdict.kind === 'absent' ? 'missing' : 'invalid', lastIssues, {
+      this.logOutputCheck('warn', step, check.fence, attempt, verdict.kind === 'absent' ? 'missing' : invalidOutcome(lastIssues), lastIssues, {
         draft: outcome.text,
       })
       // an empty answer does not go into the history: Anthropic rejects an assistant message with no content
@@ -1404,6 +1590,25 @@ class RunExecution {
         trail.push({ role: 'assistant', content: [{ type: 'text', text: outcome.text }] })
       }
     }
+  }
+
+  /**
+   * A block of a `drop` fence in the text of a tool step answers a question the step has not
+   * finished asking (SPEC §5.4): it is removed from the stored message, so the model never
+   * sees it again. The original stays in the journal.
+   */
+  private dropInterimBlocks(step: number, message: AssistantMessage): void {
+    const original = textOf(message)
+    let text = original
+    for (const check of this.plan.outputChecks) {
+      if (!check.dropInterim) continue
+      const blocks = findBlocks(text, check.fence).length
+      if (blocks === 0) continue
+      text = stripBlocks(text, check.fence)
+      this.record.sse.emit('output_check', { fence: check.fence, attempt: 0, status: 'dropped', step })
+      log.warn('interim_block_dropped', { run_id: this.record.runId, step, fence: check.fence, blocks }, { text: original })
+    }
+    if (text !== original) this.replaceFinalText(message, text)
   }
 
   private abortedRepairReason(): OutputCheckFailReason {
@@ -1440,7 +1645,7 @@ class RunExecution {
     step: number,
     fence: string,
     attempt: number,
-    outcome: 'absent' | 'passed' | 'invalid' | 'missing' | 'repaired',
+    outcome: 'absent' | 'passed' | 'invalid' | 'ungrounded' | 'missing' | 'repaired',
     issues: readonly Issue[] = [],
     content: Record<string, unknown> = {},
   ): void {
@@ -1591,6 +1796,23 @@ class RunExecution {
     log.warn('limit_hit', { run_id: this.record.runId, limit, ...fields })
   }
 
+  /**
+   * The final step produced no answer (§10.1): the run still ends with one — the fixed
+   * text in the run locale, streamed like model text and stored as the last assistant message.
+   */
+  private finishWithFallback(
+    limit: FinalAnswerLimit,
+    reason: 'empty_text' | 'tool_calls_ignored_none' | 'provider_error' | 'budget',
+  ): void {
+    const text = this.texts.finalAnswerFallback
+    this.record.sse.emit('delta', { text })
+    this.pushAssistant([{ type: 'text', text }], false)
+    this.fallbackAnswer = true
+    log.warn('final_answer', { run_id: this.record.runId, step: this.steps, limit, outcome: 'fallback', reason })
+    // a budget that blocked the final step is the honest finish_reason (§10.2)
+    this.finish('stopped_limit', reason === 'budget' ? (this.finalBudgetLimit ?? limit) : limit)
+  }
+
   private finishAborted(): void {
     if (this.finished) return
     const reason = this.record.abortReason
@@ -1644,6 +1866,9 @@ class RunExecution {
       context,
       // the field is present only if the gate was requested; [] — the run never reached the final text
       ...(plan.outputChecks.length > 0 ? { output_checks: this.outputCheckResults } : {}),
+      ...(this.limitReached && status === 'completed' ? { limit_reached: this.limitReached } : {}),
+      ...(this.fallbackAnswer ? { answer_source: 'fallback' as const } : {}),
+      ...(plan.limits.max_presentations != null ? { presentations: this.presentations } : {}),
       error: error ?? null,
     }
 
@@ -1676,6 +1901,8 @@ class RunExecution {
         context_trimmed: this.contextTrimmed || undefined,
         context_tokens: context.used_tokens,
         context_window: context.window_tokens,
+        limit_reached: result.limit_reached,
+        answer_source: result.answer_source,
         ...(error ? { error_code: error.code, error_message: error.message } : {}),
       },
       { answer: finalText(this.newMessages) || undefined, provider_body: error?.provider_body },
@@ -1716,6 +1943,11 @@ class RunExecution {
     this.released = true
     this.record.releasePromise = this.plan.resolved.release?.(this.record.runId) ?? null
   }
+}
+
+/** `ungrounded` when every issue is a grounding one: the shape was fine (SPEC §5.4). */
+function invalidOutcome(issues: readonly Issue[]): 'invalid' | 'ungrounded' {
+  return issues.length > 0 && issues.every((i) => i.code === 'ungrounded') ? 'ungrounded' : 'invalid'
 }
 
 function textOf(message: AssistantMessage): string {

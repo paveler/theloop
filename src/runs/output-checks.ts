@@ -27,16 +27,32 @@ export const ISSUE_UNCLOSED = 'block_unclosed'
 export const ISSUE_MISSING = 'block_missing'
 const SPECIAL_PATHS = new Set([ISSUE_JSON, ISSUE_UNCLOSED, ISSUE_MISSING])
 
+export interface GroundedRule {
+  /** Pointer segments, unescaped; `*` — every index or key. */
+  segments: string[]
+  tools: string[]
+}
+
 export interface CompiledOutputCheck {
   fence: string
   maxRepairs: number
   validate: ValidateFunction
+  /** Counts toward limits.max_presentations (SPEC §6.9). */
+  presents: boolean
+  /** Blocks in the text of a tool step are dropped (SPEC §5.4). */
+  dropInterim: boolean
+  grounded: GroundedRule[]
 }
+
+/** The scalars, as strings, found in `ok` results of the given tools so far (SPEC §5.4). */
+export type GroundingSource = (tools: readonly string[]) => ReadonlySet<string>
 
 export interface Issue {
   /** JSON Pointer in the block (`/actions/0`, `/` — the root) or json / block_unclosed / block_missing. */
   path: string
   message: string
+  /** `ungrounded` — a value not found in the listed tools' results. */
+  code?: 'ungrounded'
 }
 
 export interface FencedBlock {
@@ -87,8 +103,19 @@ export function compileOutputChecks(inputs: readonly OutputCheckInput[] | null |
         OUTPUT_CHECK_LIMITS.max_repairs_cap,
       ),
       validate: compileSchema(input.fence, serialized),
+      presents: input.presents === true,
+      dropInterim: input.interim === 'drop',
+      grounded: (input.grounded ?? []).map((rule) => ({ segments: pointerSegments(rule.path), tools: rule.tools })),
     }
   })
+}
+
+function pointerSegments(path: string): string[] {
+  if (path === '/') return []
+  return path
+    .slice(1)
+    .split('/')
+    .map((s) => s.replace(/~1/g, '/').replace(/~0/g, '~'))
 }
 
 function compileSchema(fence: string, serialized: string): ValidateFunction {
@@ -201,8 +228,9 @@ export function normalizeRaw(raw: string): string {
  */
 export function checkText(
   text: string,
-  check: Pick<CompiledOutputCheck, 'validate'> & { fence: string },
+  check: Pick<CompiledOutputCheck, 'validate'> & { fence: string; grounded?: GroundedRule[] },
   t: Texts = texts(),
+  grounding?: GroundingSource,
 ): BlockVerdict {
   const block = findBlocks(text, check.fence).at(-1)
   if (!block) return { kind: 'absent' }
@@ -225,8 +253,56 @@ export function checkText(
     return { kind: 'invalid', block, issues: [{ path: ISSUE_JSON, message }] }
   }
 
-  if (check.validate(data)) return { kind: 'valid', block, raw }
-  return { kind: 'invalid', block, issues: schemaIssues(check.validate.errors ?? [], check.validate.schema, t) }
+  if (!check.validate(data)) {
+    return { kind: 'invalid', block, issues: schemaIssues(check.validate.errors ?? [], check.validate.schema, t) }
+  }
+  // provenance after the shape: a value the listed tools never returned is invented (SPEC §5.4)
+  const ungrounded = check.grounded && grounding ? groundingIssues(data, check.grounded, grounding, t) : []
+  if (ungrounded.length > 0) return { kind: 'invalid', block, issues: ungrounded }
+  return { kind: 'valid', block, raw }
+}
+
+function groundingIssues(data: unknown, rules: readonly GroundedRule[], source: GroundingSource, t: Texts): Issue[] {
+  const issues: Issue[] = []
+  for (const rule of rules) {
+    const known = source(rule.tools)
+    for (const { path, value } of pointerMatches(data, rule.segments)) {
+      // structure is not grounded: the pointer has to name scalars
+      if (value === null || typeof value === 'object') continue
+      const text = String(value)
+      if (!known.has(text)) issues.push({ path, message: t.ungrounded(text, rule.tools), code: 'ungrounded' })
+    }
+  }
+  return issues
+}
+
+/** Every value at the pointer, `*` expanded over array indexes and object keys. */
+function pointerMatches(data: unknown, segments: readonly string[]): Array<{ path: string; value: unknown }> {
+  let level: Array<{ path: string; value: unknown }> = [{ path: '', value: data }]
+  for (const segment of segments) {
+    const next: Array<{ path: string; value: unknown }> = []
+    for (const { path, value } of level) {
+      if (typeof value !== 'object' || value === null) continue
+      const keys = segment === '*' ? Object.keys(value) : [segment]
+      for (const key of keys) {
+        if (!Object.prototype.hasOwnProperty.call(value, key)) continue
+        const escaped = key.replace(/~/g, '~0').replace(/\//g, '~1')
+        next.push({ path: `${path}/${escaped}`, value: (value as Record<string, unknown>)[key] })
+      }
+    }
+    level = next
+  }
+  return level.map((m) => ({ ...m, path: m.path || '/' }))
+}
+
+/** Every scalar in a tool result, as a string: a value counts wherever it sits in the result. */
+export function collectScalars(value: unknown, into: Set<string>): void {
+  if (value === null || value === undefined) return
+  if (typeof value !== 'object') {
+    into.add(String(value))
+    return
+  }
+  for (const item of Object.values(value)) collectScalars(item, into)
 }
 
 /* ---------------------------------------------------- errors for the model */

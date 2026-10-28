@@ -3,8 +3,12 @@
  * GET /logs and GET /runs/{id}/logs. Everything that goes through log.* from log.ts is recorded,
  * at any level: the LOG_LEVEL filter applies to stdout only.
  *
- * No database: a restart / deploy means an empty journal. Ceilings on entry count and bytes;
+ * No database: a restart / deploy means an empty memory journal; LOG_DIR adds the disk
+ * journal (log-disk.ts) that GET /logs falls back to. Ceilings on entry count and bytes;
  * on overflow old entries are evicted in a batch down to 90% of the ceiling.
+ *
+ * A prompt is stored once by hash (SPEC §12.4): run_start carries `content.system_sha256`,
+ * the text lives in a blob shared by every entry that references it.
  */
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error'
@@ -25,6 +29,12 @@ export interface LogEntry {
   session_id?: string
   content?: Record<string, unknown>
   [field: string]: unknown
+}
+
+/** A prompt stored once by hash; `text` is already clipped and scrubbed. */
+export interface PromptBlob {
+  sha256: string
+  text: string
 }
 
 export interface LogQuery {
@@ -55,6 +65,7 @@ export interface LogBufferStats {
 interface Slot {
   entry: LogEntry
   bytes: number
+  blob?: string
 }
 
 export class LogBuffer {
@@ -63,20 +74,25 @@ export class LogBuffer {
   private seq = 0
   private dropped = 0
   private readonly sessionByRun = new Map<string, string>()
+  /** sha256 → text and how many stored entries reference it; bytes count toward the ceiling. */
+  private readonly blobs = new Map<string, { text: string; refs: number; bytes: number }>()
 
   constructor(
     private readonly maxEntries: number,
     private readonly maxBytes: number,
   ) {}
 
+  /**
+   * Assigns seq and the run's session_id and stores the entry; a turned-off buffer still
+   * returns it, for the disk journal.
+   */
   push(
     level: LogLevel,
     event: string,
     fields: Record<string, unknown>,
     content: Record<string, unknown> | undefined,
-  ): void {
-    if (this.maxEntries <= 0 || this.maxBytes <= 0) return
-
+    blob?: PromptBlob,
+  ): LogEntry {
     const entry: LogEntry = {
       seq: ++this.seq,
       at: new Date().toISOString(),
@@ -97,29 +113,48 @@ export class LogBuffer {
       }
     }
 
+    if (this.maxEntries <= 0 || this.maxBytes <= 0) return entry
+
     const bytes = Buffer.byteLength(safeStringify(entry), 'utf8')
-    this.slots.push({ entry, bytes })
+    const slot: Slot = { entry, bytes }
+    if (blob) {
+      slot.blob = blob.sha256
+      const existing = this.blobs.get(blob.sha256)
+      if (existing) existing.refs++
+      else {
+        const blobBytes = Buffer.byteLength(blob.text, 'utf8')
+        this.blobs.set(blob.sha256, { text: blob.text, refs: 1, bytes: blobBytes })
+        this.bytes += blobBytes
+      }
+    }
+    this.slots.push(slot)
     this.bytes += bytes
     if (this.slots.length > this.maxEntries || this.bytes > this.maxBytes) this.evict()
+    return entry
+  }
+
+  /** The prompt text by hash, while an entry in memory references it. */
+  blob(sha256: string): string | undefined {
+    return this.blobs.get(sha256)?.text
   }
 
   query(q: LogQuery): LogQueryResult {
-    const minRank = q.minLevel ? LEVEL_RANK[q.minLevel] : 0
-    const events = q.events && q.events.length > 0 ? new Set(q.events) : null
+    const matches = entryFilter(q)
     const matched: LogEntry[] = []
     for (const { entry } of this.slots) {
       if (q.since != null && entry.seq <= q.since) continue
-      if (q.runId && entry.run_id !== q.runId) continue
-      if (q.sessionId && entry.session_id !== q.sessionId) continue
-      if (events && !events.has(entry.event)) continue
-      if (LEVEL_RANK[entry.level] < minRank) continue
-      matched.push(entry)
+      if (matches(entry)) matched.push(entry)
     }
     if (matched.length <= q.limit) return { entries: matched, truncated: false }
     return {
       entries: q.since != null ? matched.slice(0, q.limit) : matched.slice(-q.limit),
       truncated: true,
     }
+  }
+
+  /** seq of the oldest entry in memory; everything after it up to last_seq is here. */
+  oldestSeq(): number | null {
+    return this.slots[0]?.entry.seq ?? null
   }
 
   stats(): LogBufferStats {
@@ -150,13 +185,32 @@ export class LogBuffer {
       drop < this.slots.length &&
       (this.slots.length - drop > targetEntries || this.bytes - freed > targetBytes)
     ) {
-      freed += this.slots[drop]!.bytes
+      const slot = this.slots[drop]!
+      freed += slot.bytes
+      if (slot.blob) {
+        const blob = this.blobs.get(slot.blob)
+        if (blob && --blob.refs === 0) {
+          this.blobs.delete(slot.blob)
+          freed += blob.bytes
+        }
+      }
       drop++
     }
     this.slots.splice(0, drop)
     this.bytes -= freed
     this.dropped += drop
   }
+}
+
+/** run / session / event / level filters of a query; `since` is the caller's, it is per boot. */
+export function entryFilter(q: LogQuery): (entry: LogEntry) => boolean {
+  const minRank = q.minLevel ? LEVEL_RANK[q.minLevel] : 0
+  const events = q.events && q.events.length > 0 ? new Set(q.events) : null
+  return (entry) =>
+    (!q.runId || entry.run_id === q.runId) &&
+    (!q.sessionId || entry.session_id === q.sessionId) &&
+    (!events || events.has(entry.event)) &&
+    (LEVEL_RANK[entry.level] ?? 0) >= minRank
 }
 
 /**
@@ -170,7 +224,7 @@ export function formatLogText(entries: readonly LogEntry[], hide: readonly strin
   const hidden = new Set(hide)
   const lines: string[] = []
   for (const entry of entries) {
-    const { seq: _seq, at, level, event, content, ...fields } = entry
+    const { seq: _seq, at, level, event, content, boot_id: _boot, ...fields } = entry
     const delta = `+${Date.parse(at) - first}ms`
     const head = `${at.slice(11, 23)}Z ${delta.padStart(9)} ${level.toUpperCase().padEnd(5)} ${event}`
     const pairs = Object.entries(fields)
@@ -194,7 +248,7 @@ function inlineValue(value: unknown): string {
   return String(value)
 }
 
-function safeStringify(value: unknown): string {
+export function safeStringify(value: unknown): string {
   try {
     return JSON.stringify(value) ?? 'undefined'
   } catch {

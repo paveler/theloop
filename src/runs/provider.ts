@@ -6,7 +6,14 @@
  * Returns an outcome, not an exception: on a dropped stream we need the partial answer
  * and a "saw content" flag — after the first content event a transparent retry is impossible.
  */
-import { APICallError, streamText, type LanguageModel, type ProviderMetadata, type ToolSet } from 'ai'
+import {
+  APICallError,
+  streamText,
+  ToolChoiceViolationError,
+  type LanguageModel,
+  type ProviderMetadata,
+  type ToolSet,
+} from 'ai'
 import type { ModelMessage } from '@ai-sdk/provider-utils'
 import type { LanguageModelUsage } from 'ai'
 import type { AssistantPart } from '../contracts.js'
@@ -27,6 +34,8 @@ export interface ProviderFailure {
   retriable: boolean
   /** Retry-After from the provider response, ms (SPEC §11.3) — 429 only. */
   retryAfterMs?: number
+  /** The model called a tool under tool_choice none; the SDK refuses such a response (§10.1). */
+  toolChoiceViolation?: true
 }
 
 export interface StepToolCall {
@@ -317,6 +326,10 @@ function findGigachatOAuthError(err: unknown): GigachatOAuthError | null {
 }
 
 export function classifyProviderError(err: unknown, t: Texts = texts()): ProviderFailure {
+  // the response was generated, so the attempt is unknown; a retry may come back as text
+  if (ToolChoiceViolationError.isInstance(err)) {
+    return { kind: 'unknown', code: 'provider_unavailable', message: err.message, retriable: true, toolChoiceViolation: true }
+  }
   if (APICallError.isInstance(err)) {
     const status = err.statusCode ?? 0
     const body = err.responseBody ? redactSecrets(err.responseBody).slice(0, 2048) : undefined

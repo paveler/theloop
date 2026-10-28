@@ -17,8 +17,8 @@ import { EgressClient } from './egress/client.js'
 import { EngineError } from './errors.js'
 import { newRunId, hashBody, timingSafeEqualStr } from './ids.js'
 import { configureAlerts, sendAlert } from './alerts.js'
-import { initLogger, log, logBuffer, logContentEnabled, logger, safeUrl } from './log.js'
-import { formatLogText, LOG_LEVELS, type LogLevel, type LogQuery } from './log-buffer.js'
+import { diskJournal, flushJournal, initLogger, log, logBuffer, logContentEnabled, logger, safeUrl } from './log.js'
+import { formatLogText, LOG_LEVELS, type LogEntry, type LogLevel, type LogQuery } from './log-buffer.js'
 import { buildModel, type ModelFactory } from './providers/factory.js'
 import { pinnedProviderHosts } from './providers/allowlist.js'
 import { ProviderThrottle } from './providers/throttle.js'
@@ -355,23 +355,23 @@ export function createEngine(
 
   /* ------------------------------------------------------------------ logs */
 
-  // in-memory event journal (SPEC §4.9, §12.4): content only with ENGINE_TOKEN,
+  // event journal, memory then disk (SPEC §4.9, §12.4): content only with ENGINE_TOKEN,
   // the same access level as GET /runs/{id} with messages
-  app.get('/logs', (c) => {
+  app.get('/logs', async (c) => {
     requireEngineToken(c.req.header('authorization'), config)
-    const { query, format } = parseLogQuery(c.req.query())
-    return logsResponse(c, query, format)
+    const { query, format, read } = parseLogQuery(c.req.query())
+    return logsResponse(c, query, format, read)
   })
 
-  app.get('/runs/:id/logs', (c) => {
+  app.get('/runs/:id/logs', async (c) => {
     requireEngineToken(c.req.header('authorization'), config)
     const id = c.req.param('id')
-    const { query, format } = parseLogQuery(c.req.query())
+    const { query, format, read } = parseLogQuery(c.req.query())
     query.runId = id
-    if (query.since == null && !registry.get(id) && logBuffer().query({ runId: id, limit: 1 }).entries.length === 0) {
+    if (query.since == null && !registry.get(id) && !(await runInJournal(id, read.days))) {
       throw new EngineError('run_not_found', 'run not found in the registry or the journal: restarted, evicted, or never existed')
     }
-    return logsResponse(c, query, format)
+    return logsResponse(c, query, format, read)
   })
 
   /* -------------------------------------------------------------- shutdown */
@@ -418,6 +418,7 @@ export function createEngine(
       sleep(2000),
     ])
     registry.stopSweeper()
+    flushJournal()
   }
 
   return { app, deps, shuttingDown: () => shuttingDown, shutdown, version }
@@ -446,7 +447,13 @@ function logRunRejected(err: EngineError, raw: unknown): void {
   })
 }
 
-function parseLogQuery(q: Record<string, string>): { query: LogQuery; format: 'json' | 'text' } {
+/** How a journal read resolves: prompt texts inlined or hashes only, and how many day files to scan. */
+interface LogRead {
+  inlinePrompts: boolean
+  days: number | undefined
+}
+
+function parseLogQuery(q: Record<string, string>): { query: LogQuery; format: 'json' | 'text'; read: LogRead } {
   const level = q.level || undefined
   if (level && !(LOG_LEVELS as readonly string[]).includes(level)) {
     throw new EngineError('bad_request', `level: one of ${LOG_LEVELS.join(', ')}`)
@@ -459,6 +466,10 @@ function parseLogQuery(q: Record<string, string>): { query: LogQuery; format: 'j
   if (!Number.isInteger(limit) || limit < 1) throw new EngineError('bad_request', 'limit: integer ≥ 1')
   const format = q.format || 'json'
   if (format !== 'json' && format !== 'text') throw new EngineError('bad_request', 'format: json or text')
+  const inline = q.inline_prompts || 'true'
+  if (inline !== 'true' && inline !== 'false') throw new EngineError('bad_request', 'inline_prompts: true or false')
+  const days = q.days ? Number(q.days) : undefined
+  if (days != null && (!Number.isInteger(days) || days < 1)) throw new EngineError('bad_request', 'days: integer ≥ 1')
 
   return {
     query: {
@@ -470,12 +481,71 @@ function parseLogQuery(q: Record<string, string>): { query: LogQuery; format: 'j
       limit: Math.min(limit, LOGS_MAX_LIMIT),
     },
     format,
+    read: { inlinePrompts: inline === 'true', days },
   }
 }
 
-function logsResponse(c: Context, query: LogQuery, format: 'json' | 'text'): Response {
+async function runInJournal(runId: string, days: number | undefined): Promise<boolean> {
+  if (logBuffer().query({ runId, limit: 1 }).entries.length > 0) return true
+  const disk = diskJournal()
+  if (!disk) return false
+  const found = await disk.query({ runId, limit: 1, need: 1, memoryFromSeq: logBuffer().oldestSeq(), days })
+  return found.entries.length > 0
+}
+
+/**
+ * Memory first; the disk journal (§12.4) when memory may not hold the whole range: fewer
+ * matches than `limit` and no run_start of the requested run, or a tail whose start was evicted.
+ */
+async function readJournal(
+  query: LogQuery,
+  read: LogRead,
+): Promise<{ entries: LogEntry[]; truncated: boolean; source: 'memory' | 'disk' | 'mixed' }> {
   const buffer = logBuffer()
-  const { entries, truncated } = buffer.query(query)
+  const memory = buffer.query(query)
+  const disk = diskJournal()
+  const oldest = buffer.oldestSeq()
+  const covered =
+    !disk ||
+    (query.since != null
+      ? oldest != null && oldest <= query.since + 1
+      : memory.truncated ||
+        (query.runId != null && buffer.query({ runId: query.runId, events: ['run_start'], limit: 1 }).entries.length > 0))
+  if (covered) return { ...memory, source: 'memory' }
+
+  const need = query.since != null ? query.limit : query.limit - memory.entries.length
+  const older = await disk.query({ ...query, need, memoryFromSeq: oldest, days: read.days })
+  if (older.entries.length === 0) return { ...memory, source: 'memory' }
+  const entries = [...older.entries, ...memory.entries]
+  return {
+    entries: query.since != null ? entries.slice(0, query.limit) : entries,
+    truncated: older.truncated || memory.truncated || entries.length > query.limit,
+    source: memory.entries.length > 0 ? 'mixed' : 'disk',
+  }
+}
+
+/** `content.system_sha256` → `content.system` from memory, else from the entry's day file; copies, never the stored entry. */
+async function inlinePrompts(entries: LogEntry[]): Promise<LogEntry[]> {
+  const cache = new Map<string, string | undefined>()
+  const out: LogEntry[] = []
+  for (const entry of entries) {
+    const sha = entry.content?.system_sha256
+    if (typeof sha !== 'string') {
+      out.push(entry)
+      continue
+    }
+    if (!cache.has(sha)) cache.set(sha, logBuffer().blob(sha) ?? (await diskJournal()?.blob(sha, entry.at)))
+    const text = cache.get(sha)
+    out.push(text === undefined ? entry : { ...entry, content: { system: text, ...entry.content } })
+  }
+  return out
+}
+
+async function logsResponse(c: Context, query: LogQuery, format: 'json' | 'text', read: LogRead): Promise<Response> {
+  const buffer = logBuffer()
+  const journal = await readJournal(query, read)
+  const { truncated, source } = journal
+  const entries = read.inlinePrompts ? await inlinePrompts(journal.entries) : journal.entries
   const stats = buffer.stats()
   // with since and truncation — page on from the last returned entry; otherwise everything
   // matched up to last_seq has been returned, and the tail continues from it
@@ -502,7 +572,8 @@ function logsResponse(c: Context, query: LogQuery, format: 'json' | 'text'): Res
       entries,
       truncated,
       next_since: nextSince,
-      buffer: { ...stats, content: logContentEnabled() },
+      source,
+      buffer: { ...stats, content: logContentEnabled(), disk: diskJournal() !== null },
     }),
   )
 }

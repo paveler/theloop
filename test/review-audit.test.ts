@@ -26,7 +26,8 @@ it('a repeated call does not consume the remaining HTTP tool budget', async () =
     streamFrom([START, ...textChunks('Answer'), finish('stop')]),
   ])
   const engine = track(createEngine(testConfig(), { modelFactory: mockFactory(model) }))
-  const result = await read(post(engine, runRequest({ tools: [def(server.url)], limits: { max_tool_calls: 1 } } as never)))
+  // final_answer: false — otherwise the used-up budget makes step 2 text-only (§10.1) and the repeat never happens
+  const result = await read(post(engine, runRequest({ tools: [def(server.url)], limits: { max_tool_calls: 1, final_answer: false } } as never)))
   expect(result.status).toBe('completed')
 })
 

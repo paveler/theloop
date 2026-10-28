@@ -1,15 +1,19 @@
 /**
- * Logs (SPEC §12.2, §12.4): pino to stdout + an in-memory journal for GET /logs.
+ * Logs (SPEC §12.2, §12.4): pino to stdout + an in-memory journal for GET /logs, and with
+ * LOG_DIR the same journal on disk.
  *
  * An event = metadata + optional content (prompt, model texts, tool args /
  * results). Metadata goes to stdout and the journal, with run_id on every line that has one.
  * content goes only to the journal (LOG_BUFFER_CONTENT, on by default), to stdout only
- * with LOG_PROMPTS=1 (local). Every content field is clipped to LOG_CONTENT_MAX_CHARS.
- * Keys and header values are never written anywhere.
+ * with LOG_PROMPTS=1 (local). Every content field is clipped to LOG_CONTENT_MAX_CHARS in
+ * memory and stdout, to LOG_DISK_CONTENT_MAX_CHARS on disk. `content.system` is journaled
+ * once by hash as `system_sha256`. Keys and header values are never written anywhere.
  */
+import { createHash } from 'node:crypto'
 import pino from 'pino'
 import type { Config } from './config.js'
-import { LogBuffer, type LogLevel } from './log-buffer.js'
+import { LogBuffer, type LogLevel, type PromptBlob } from './log-buffer.js'
+import { DiskJournal, type PruneReport } from './log-disk.js'
 
 export type Logger = pino.Logger
 export type LogFields = Record<string, unknown>
@@ -22,6 +26,10 @@ type LogSettings = Pick<
   | 'logBufferMaxBytes'
   | 'logBufferContent'
   | 'logContentMaxChars'
+  | 'logDir'
+  | 'logRetentionDays'
+  | 'logDirMaxBytes'
+  | 'logDiskContentMaxChars'
 >
 
 let root: Logger = pino({ level: process.env.LOG_LEVEL ?? 'info' })
@@ -29,6 +37,9 @@ let buffer = new LogBuffer(20_000, 33_554_432)
 let contentToBuffer = true
 let contentToStdout = false
 let contentMaxChars = 4000
+let disk: DiskJournal | null = null
+let diskContentMaxChars = 200_000
+let exitHook = false
 
 export function initLogger(settings: LogSettings): Logger {
   root = pino({ level: settings.logLevel })
@@ -36,7 +47,45 @@ export function initLogger(settings: LogSettings): Logger {
   contentToBuffer = settings.logBufferContent
   contentToStdout = settings.logPrompts
   contentMaxChars = settings.logContentMaxChars
+  diskContentMaxChars = settings.logDiskContentMaxChars
+  disk?.close()
+  disk = null
+  if (settings.logDir) {
+    disk = new DiskJournal(
+      { dir: settings.logDir, retentionDays: settings.logRetentionDays, maxBytes: settings.logDirMaxBytes },
+      logPrune,
+    )
+    disk.onWriteError((err) => root.warn({ err: String(err) }, 'journal_write_failed'))
+    // appendFileSync: the last second of entries reaches the disk even on process.exit
+    if (!exitHook) {
+      exitHook = true
+      process.on('exit', () => disk?.flush())
+    }
+    if (disk.onRootFilesystem()) log.warn('journal_disk_ephemeral', { dir: settings.logDir })
+    logPrune(disk.prune())
+  }
   return root
+}
+
+function logPrune(report: PruneReport): void {
+  if (report.expired.length > 0) log.info('journal_retention', { deleted: report.expired })
+  if (report.pruned.length > 0) {
+    log.warn('journal_pruned', {
+      deleted: report.pruned,
+      bytes_before: report.bytesBefore,
+      bytes_after: report.bytesAfter,
+    })
+  }
+}
+
+/** The disk journal, when LOG_DIR is set. */
+export function diskJournal(): DiskJournal | null {
+  return disk
+}
+
+/** Writes the buffered tail of the disk journal (shutdown). */
+export function flushJournal(): void {
+  disk?.flush()
 }
 
 /** Bare pino, for the access log only: it does not go to the journal, otherwise GET /logs would spam itself. */
@@ -53,10 +102,30 @@ export function logContentEnabled(): boolean {
 }
 
 function emit(level: LogLevel, event: string, fields: LogFields = {}, content?: LogFields): void {
-  const clipped =
-    content && (contentToBuffer || contentToStdout) ? clipContent(content, contentMaxChars) : undefined
-  root[level](contentToStdout && clipped ? { ...fields, content: clipped } : fields, event)
-  buffer.push(level, event, fields, contentToBuffer ? clipped : undefined)
+  if (content && contentToStdout) root[level]({ ...fields, content: clipContent(content, contentMaxChars) }, event)
+  else root[level](fields, event)
+
+  if (!content || !contentToBuffer) {
+    const entry = buffer.push(level, event, fields, undefined)
+    disk?.append(entry, undefined, undefined)
+    return
+  }
+  // the prompt is the bulk of run_start and the same run after run: stored once by hash (§12.4)
+  let rest = content
+  let prompt: string | null = null
+  let sha256: string | null = null
+  if (typeof content.system === 'string') {
+    prompt = redactSecrets(content.system)
+    sha256 = createHash('sha256').update(prompt).digest('hex')
+    const { system: _system, ...others } = content
+    rest = others
+  }
+  // the hash is not content: never clipped
+  const journaled = (max: number): LogFields => ({ ...(sha256 ? { system_sha256: sha256 } : {}), ...clipContent(rest, max) })
+  const blob = (max: number): PromptBlob | undefined =>
+    prompt !== null && sha256 !== null ? { sha256, text: clipString(prompt, max) } : undefined
+  const entry = buffer.push(level, event, fields, journaled(contentMaxChars), blob(contentMaxChars))
+  disk?.append(entry, journaled(diskContentMaxChars), blob(diskContentMaxChars))
 }
 
 /**
