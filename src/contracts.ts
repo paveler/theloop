@@ -140,6 +140,8 @@ export const LimitsSchema = z
     max_cost: z.number().positive().optional(),
     timeout_ms: z.number().int().positive().optional(),
     tool_result_max_bytes: z.number().int().positive().optional(),
+    /** false — the pre-1.2 behavior: max_steps / max_tool_calls end the run without an answer (SPEC §10.1). */
+    final_answer: z.boolean().optional(),
   })
   .default({})
 
@@ -153,7 +155,12 @@ export interface Limits {
   max_cost?: number
   timeout_ms: number
   tool_result_max_bytes: number
+  /** A text-only last step on max_steps / max_tool_calls (SPEC §10.1). */
+  final_answer: boolean
 }
+
+/** The limits that end in a text-only final step instead of a run without an answer (SPEC §10.1). */
+export type FinalAnswerLimit = 'max_steps' | 'max_tool_calls'
 
 /* -------------------------------------------------------------------- llm */
 
@@ -498,5 +505,9 @@ export interface RunResult {
   context: RunContext
   /** Only if the request had output_checks; [] — the run never reached a final text (SPEC §5.4). */
   output_checks?: OutputCheckResult[]
+  /** A completed run whose answer came from the text-only final step (SPEC §10.1). */
+  limit_reached?: FinalAnswerLimit
+  /** fallback — the answer is the engine's fixed text (SPEC §10.1); absent — the model's. */
+  answer_source?: 'model' | 'fallback'
   error: RunErrorBody | null
 }

@@ -207,7 +207,7 @@ describe('journal: loops and limits', () => {
     const engine = track(createEngine(testConfig(), { modelFactory: mockFactory(model) }))
     const result = await runWait(
       engine,
-      runRequest({ tools: [readTool(tools.url)] as never, limits: { max_steps: 2 } as never }),
+      runRequest({ tools: [readTool(tools.url)] as never, limits: { max_steps: 2, final_answer: false } as never }),
     )
     expect(result.finish_reason).toBe('max_steps')
 

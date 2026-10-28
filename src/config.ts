@@ -48,6 +48,13 @@ export interface Config {
   /** Event content in the journal; on by default. */
   logBufferContent: boolean
   logContentMaxChars: number
+  /** The journal on disk (SPEC §12.4); unset — memory only. */
+  logDir: string | undefined
+  /** Day files older than this are deleted; 0 — today only. */
+  logRetentionDays: number
+  logDirMaxBytes: number
+  /** Per-field content cap on disk: a safety net, not a trim. */
+  logDiskContentMaxChars: number
 
   /** Queue and AIMD concurrency ceiling per provider key (SPEC §11.6). */
   providerThrottle: ThrottleSettings
@@ -221,6 +228,10 @@ export function createConfig(env: Env = process.env): Config {
     logBufferMaxBytes: num(env, 'LOG_BUFFER_MAX_BYTES', 33_554_432),
     logBufferContent: bool(env, 'LOG_BUFFER_CONTENT', true),
     logContentMaxChars: num(env, 'LOG_CONTENT_MAX_CHARS', 4000),
+    logDir: env.LOG_DIR?.trim() || undefined,
+    logRetentionDays: int(env, 'LOG_RETENTION_DAYS', 7, 0),
+    logDirMaxBytes: num(env, 'LOG_DIR_MAX_BYTES', 2_147_483_648),
+    logDiskContentMaxChars: num(env, 'LOG_DISK_CONTENT_MAX_CHARS', 200_000),
 
     providerThrottle: {
       enabled: bool(env, 'PROVIDER_THROTTLE', true),

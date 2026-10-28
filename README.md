@@ -89,8 +89,11 @@ intents, limits and everything else — [SPEC.md](SPEC.md).
   until a skill or `search_tools` (BM25) brings them in, and the prompt cache survives
   (`tool_reference` on Anthropic). Still stateless: what is loaded comes from the history.
   See [Skills and deferred tools](#skills-and-deferred-tools).
-- **Debuggable.** An in-memory event journal per run and session (`GET /logs`), with content,
-  without shipping prompts to your log pipeline.
+- **Debuggable.** An event journal per run and session (`GET /logs`), with content,
+  without shipping prompts to your log pipeline: in memory, and with `LOG_DIR` in day files
+  on disk that survive a deploy and keep a week.
+- **Always answers on a limit.** The last allowed step goes without tools, so a run that
+  hits `max_steps` or `max_tool_calls` still ends with an answer, not an empty error.
 
 ## Skills and deferred tools
 
@@ -219,6 +222,7 @@ src/
   errors.ts             error codes and their HTTP statuses (§12.1)
   i18n.ts               engine-injected text, en / ru (Appendix B)
   log.ts, log-buffer.ts structured events; the in-memory journal for GET /logs (§12.4)
+  log-disk.ts           the journal on disk: day files, retention, reads past memory (§12.4)
   alerts.ts             error webhook (§12.3)
   runs/registry.ts      in-memory runs: status, SSE buffer, tokens, session lock, idempotency
   runs/runner.ts        the loop, step by step: one streamText per step → finish-step →

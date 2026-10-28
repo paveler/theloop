@@ -592,6 +592,7 @@ describe('loop: provider interruptions (SPEC §11.3)', () => {
 })
 
 describe('loop: limits at the step boundary (SPEC §10.1)', () => {
+  // final_answer: false — the pre-1.2 behavior; the default text-only final step is in final-answer.test.ts
   it('max_steps: the tools of the last allowed step do not run', async () => {
     const tools = trackServer(await startServer((_body, _req, res) => json(res, 200, { status: 'ok', result: {} })))
     const model = mockModel(async () =>
@@ -601,7 +602,7 @@ describe('loop: limits at the step boundary (SPEC §10.1)', () => {
 
     const result = await runWait(
       engine,
-      runRequest({ tools: [readTool(tools.url)] as never, limits: { max_steps: 2 } as never }),
+      runRequest({ tools: [readTool(tools.url)] as never, limits: { max_steps: 2, final_answer: false } as never }),
     )
 
     expect(result.status).toBe('stopped_limit')
@@ -628,7 +629,7 @@ describe('loop: limits at the step boundary (SPEC §10.1)', () => {
 
     const result = await runWait(
       engine,
-      runRequest({ tools: [readTool(tools.url)] as never, limits: { max_tool_calls: 2 } as never }),
+      runRequest({ tools: [readTool(tools.url)] as never, limits: { max_tool_calls: 2, final_answer: false } as never }),
     )
 
     expect(result.status).toBe('stopped_limit')

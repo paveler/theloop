@@ -155,6 +155,7 @@ export function resolveLimits(request: RunRequest, providerMaxTokens: number): L
       input.tool_result_max_bytes ?? LIMIT_DEFAULTS.tool_result_max_bytes,
       LIMIT_CAPS.tool_result_max_bytes,
     ),
+    final_answer: input.final_answer !== false,
   }
   // max_cost works only with pricing (SPEC §8.3)
   if (input.max_cost != null) {
