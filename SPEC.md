@@ -312,14 +312,14 @@ maximum size of any incoming request body is `MAX_REQUEST_BYTES` (env, default 1
 | `llm.pricing` | no | If present, the engine returns `usage.cost` and can enforce `limits.max_cost` (§8.3). |
 | `system` | no | Dates are never put here by the engine (§9.4). |
 | `messages` | yes | The full history; at least one `user` message. |
-| `tools[]` | no | `effect: "read" \| "write"` is **mandatory** (§6.4). `defer_loading: true` hides the tool from the model until a skill or `search_tools` activates it (§6.8). |
+| `tools[]` | no | `effect: "read" \| "write"` is **mandatory** (§6.4). `defer_loading: true` hides the tool from the model until a skill or `search_tools` activates it (§6.8). `presents: true` — the harness renders a successful result to the user; counts toward `limits.max_presentations` (§6.9). |
 | `skills[]` | no | Up to 64 instruction bundles `{ name, description, body, tools? }` the model loads on demand (§6.8). `name`: `^[a-z0-9][a-z0-9_-]{0,63}$`, unique; `description`: 1 to 1024 characters; `body`: 1 byte to 32 KiB UTF-8; `tools`: names from `tools[]`. |
 | `limits` | no | Defaults and server ceilings — §10. |
 | `stream` | no | What SSE reveals beyond text (§6.6). Default — nothing. |
 | `callback` | no if `wait: true` | Where to deliver the result: `{ url, headers? }`. The callback body is `{ "payload": <result> }` (§7). |
 | `wait` | no | `true` → synchronous `200` with the result body (§7); a configured callback is still sent. For tests and curl. |
 | `meta` | no; **`meta.session_id` is required if there are write tools** | Passed through to tools and the callback. **Reserved** keys read by the engine: `session_id` (lock, part of the `operation_id` hash), `timezone` (§9.4), `locale` (Appendix B). |
-| `output_checks` | no | Up to 4 checks of structured blocks in the final answer: `{ fence, schema, max_repairs? }` — §5.4. The schema is compiled on receipt: invalid → `400 bad_request` (`output_check_schema_invalid: …`). |
+| `output_checks` | no | Up to 4 checks of structured blocks in the final answer: `{ fence, schema, max_repairs?, presents?, interim?, grounded? }` — §5.4. The schema is compiled on receipt: invalid → `400 bad_request` (`output_check_schema_invalid: …`). |
 
 Response `202`:
 
@@ -649,13 +649,16 @@ about specific block types: the fence and the schema come in the request.
 | `fence` | Fence label, `^[a-z0-9-]{1,40}$`. Unique within the list. |
 | `schema` | JSON Schema 2020-12, serialized size ≤ 64 KB. Compiled on receipt: ajv `Ajv2020`, `allErrors`, `discriminator`, `strict: false`. Does not compile (including an unresolvable `$ref`, a foreign `$schema`, `$async`) → `400 bad_request`, `output_check_schema_invalid: <fence>: <reason>`; over 64 KB → `output_check_schema_too_large`. `format` is not validated. |
 | `max_repairs` | Repair steps: default 1, ceiling 3 — higher values are clamped like §10 limits. `0` — check only: a broken block is cut without repair. |
+| `presents` | `true` — the harness renders a block of this fence to the user: a `passed` / `repaired` block counts toward `limits.max_presentations`, and is cut once the budget is spent (§6.9). Default `false`. |
+| `interim` | `keep` (default) or `drop` — blocks of this fence in the text of a tool step (below). |
+| `grounded` | Up to 8 `{ path, tools }`: values at `path` must come from `ok` results of `tools` (below). |
 
 At most 4 checks. **Without `output_checks` the engine behaves exactly as if the feature
 did not exist**, and the result has no `output_checks` field.
 
 **When.** Only at the moment the run would otherwise finish `completed / end_turn`: a
 step without tool calls and not cut by `max_tokens`. Intermediate steps with tool calls
-are not checked. A run that never reaches that moment (`stopped_limit`,
+are not checked; with `interim: "drop"` their blocks are removed instead. A run that never reaches that moment (`stopped_limit`,
 `awaiting_tool`, `failed`, `cancelled`) returns `output_checks: []`.
 
 **How the block is found:**
@@ -733,6 +736,8 @@ the opening of the new one). A `tool_call` in a repair step (the provider ignore
 | `repairing` | number of the repair starting | before a repair step; `errors` — error paths being fixed |
 | `repaired` | number of the successful repair | the repaired block is valid |
 | `failed` | repairs made | gave up; `errors` — error paths of the last attempt |
+| `suppressed` | 0 | a presenting block after the presentation budget is spent: cut, not repaired (§6.9) |
+| `dropped` | 0 | `interim: "drop"` removed blocks from a tool step; carries `step` |
 
 `absent` is not streamed. `errors` are paths only (`/actions/0/kind`, `/` for the root)
 or `json` / `block_unclosed` / `block_missing`. After a failed repair the SSE text also
@@ -744,12 +749,39 @@ request order:
 
 | Field | Meaning |
 |---|---|
-| `status` | `absent \| passed \| repaired \| failed` |
+| `status` | `absent \| passed \| repaired \| failed \| suppressed` — `suppressed`: cut by the presentation budget (§6.9), the text stays |
 | `attempts` | repair steps made (0 for `absent` / `passed` and when repair never started) |
 | `errors` | for `repaired` and `failed` — errors of the **original** block as `path: message` strings (≤ 8): what the model broke, for analytics |
-| `reason` | for `failed`: `repairs_exhausted \| max_total_tokens \| max_cost \| run_timeout \| provider_failure \| cancelled` |
+| `reason` | for `failed`: `repairs_exhausted \| max_total_tokens \| max_cost \| run_timeout \| provider_failure \| cancelled`; for `suppressed`: `presentation_limit` |
 
 **Journal** (§12.4) — an `output_check` event for every gate decision.
+
+**Interim blocks** (`interim: "drop"`). A block of the fence written in a step that ends
+with tool calls answers a question the step has not finished asking — the tool results may
+change it — and, kept in the history, it is an example the model copies on every following
+step. When such a step finishes, every block of the fence in its text, closed or not, is
+removed (block detection as above); the surrounding text stays, and if nothing but
+whitespace remains the stored assistant message carries only its tool calls. The cleaned
+text is what goes into `messages` and what the provider sees on the next step; the original
+is in the journal (`interim_block_dropped`). Nothing is repaired: the final answer is where
+the block belongs, and where the gate checks it. The text was already streamed: right
+after the step's `step` event SSE gets `output_check { fence, attempt: 0, status:
+"dropped", step }`; a client that renders from the final message does nothing.
+
+**Grounded values** (`grounded`). The schema can say "two digits"; it cannot say "a value
+some lookup returned". `grounded: [{ path, tools }]` — `path` is a JSON Pointer into the
+block, `*` matching every array index or object key at that level; `tools` — tool names. A
+scalar at `path` is grounded if it equals a scalar found anywhere in an `ok` result of one
+of those tools, in the request history or in this run so far (results truncated by
+`tool_result_max_bytes` are searched as truncated). Values compare as strings after
+`String()`, exactly. Objects and arrays at `path` are skipped — point at the scalars; a
+path that matches nothing passes (presence is the schema's job). Checked after the schema
+passes; an ungrounded value is a validation error and goes through the repair above with
+the line, in the run locale, `- /codes/0: "91" is not among the values returned by
+lookup_area`. Repair steps have no tools, so the model must use a returned value or drop
+the item. The journal reports such a verdict as `outcome: ungrounded`. It is a provenance
+check, not a semantic one; ids the engine never saw in a tool result belong in the
+schema as an `enum`.
 
 **Accepted risk.** A `pattern` in the schema is a regular expression executed on model
 output. The harness is trusted (`ENGINE_TOKEN`) and the answer is bounded by
@@ -994,7 +1026,9 @@ engine cuts this without a new status:
    returns the same — use the existing result or answer the user* —
    `tool_calls[].status = error`. The first repeat is a warning: tools stay available,
    the model may change arguments or call another tool.
-3. **The second repeat in a run** → all following steps go with `tool_choice: none`: the
+3. **The second repeat in a run** (`limits.max_repeated_calls`, default 1 forgiven repeat:
+   `0` — the first repeat already disables tools, `n` — repeat `n + 1` does, clamped to 3)
+   → all following steps go with `tool_choice: none`: the
    model must answer in text with what it has, and the run ends `completed`. For
    Anthropic the request keeps `tools` and carries `tool_choice: { "type": "none" }`;
    for GigaChat and GLM the engine sends no tools on such steps (§9.1) — both accept
@@ -1008,6 +1042,9 @@ engine cuts this without a new status:
 
 Calls with **different** arguments are not repeats: iterating over queries is
 legitimate work, bounded by rule 4 and `max_steps`.
+
+A call refused by the presentation budget (§6.9) is recorded like an executed one:
+repeating it is a repeat.
 
 ### 6.8 Skills and deferred tools
 
@@ -1084,6 +1121,44 @@ request: byte for byte as in the run that produced them while tools, skills and 
 not change. Only tools that are deferred in the current request get a `tool_reference`. The body in the history is the body as loaded then; the history is never
 rewritten (§9.3). Trimming (§5.1) never drops a turn that carries an activation in
 effect, so the model's tools always match the engine's visible set.
+
+### 6.9 Presentations
+
+The harness often renders parts of a run: a tool result as a card deck under the answer, a
+fenced block as a card with a button (§5.4). Two of them in one run compete for the same
+screen and answer different questions, and a weak model produces exactly that. The harness
+marks what is rendered — `tools[].presents`, `output_checks[].presents` — and caps it with
+`limits.max_presentations` (integer ≥ 1, no engine default, not clamped). Without the limit
+`presents` changes nothing.
+
+A **presentation** is counted when a presenting tool call finishes `ok` (§6.2, an
+`accepted` call that resolved `ok` included; errors, rejections, repeats and refusals show
+nothing), or when the final answer has a `passed` / `repaired` block of a presenting fence.
+`deferred` write tools are not counted: their approval cards are the harness's, and the run
+ends `awaiting_tool` anyway.
+
+**Within a step**, presenting calls are admitted in the model's tool-call order up to the
+remaining budget, before any endpoint is called; the rest are refused, even if an admitted
+one then fails. **Once the budget is spent**, from the next step:
+
+1. presenting tools are left out of the tool list sent to the provider (as §6.7 does for
+   providers without `tool_choice: none`); other tools stay. A deferred presenting tool
+   activated later (§6.8) stays out too; with `tool_reference` it stays listed, since the
+   history may reference it, and is refused all the same;
+2. a call to one is refused without calling the endpoint: `{ is_error: true, error:
+   "presentation_limit: …" }` in the run locale (Appendix B) — *the user already sees a
+   result of this run, answer in text about it* — and `tool_calls[].status =
+   presentation_limit`. It does not count toward `max_tool_calls`;
+3. a presenting fence in the final answer is cut without repair:
+   `output_checks[].status = suppressed`, `reason: presentation_limit`, the rest of the text
+   stays.
+
+Tools win over fences by construction: a fence counts only in the final answer, after every
+tool step. If a card must win, the harness does not send the competing presenting tool on
+that run — `tools[]` is per request, and a tool the model cannot see is a rule it cannot
+break. `max_tool_calls` (§10.1) is checked first: a batch over it is not executed, nothing
+is counted. The result carries `presentations: [{ kind: "tool" | "fence", name, call_id? }]`
+in order, only when `max_presentations` is set.
 
 ## 7. Result and callback
 
@@ -1170,7 +1245,9 @@ endpoints are **not** covered by the signature — they have their own `tools[].
   `ENGINE_TOKEN` (callback, `GET`, `cancel`): a provider body may quote the prompt, so SSE
   `done` and run-token `cancel` return `error` without it (§4.4, §6.6).
 - `tool_calls[].status`: `ok | error | timeout | deferred | cancelled | not_executed |
-  duplicate_write_intent | http_error | protocol_error`.
+  presentation_limit | duplicate_write_intent | http_error | protocol_error`.
+- `presentations` — what reached the user, in order (§6.9); only with
+  `limits.max_presentations`.
 - `tool_calls[].builtin: true` — a call of an engine tool (§6.8): `effect: "read"`,
   in-process `duration_ms`. Absent on HTTP tool calls.
 - `history_revision` — an echo of the request (§4.2), for ordering late results (§3).
@@ -1546,6 +1623,8 @@ Time zone — `meta.timezone` (IANA), else env `DEFAULT_TIMEZONE`, else `UTC`.
 | `max_steps` (logical loop steps; transport attempts are separate, in usage and §10.2 budgets) | 8 | 32 | the last step is text-only (§10.1): `completed` + `limit_reached`, or `stopped_limit / max_steps` with the fallback answer |
 | `max_tokens` (output per call) | 4096 | per provider (Anthropic 32k, MiniMax and GLM 64k — with thinking, GigaChat 8k) | `stopped_limit / max_tokens`, text kept |
 | `max_tool_calls` (per run) | 16 | 64 | the batch is not executed, the next step is text-only (§10.1) |
+| `max_repeated_calls` | 1 | 3 | repeats forgiven before `tool_choice: none` (§6.7); `0` — the first repeat disables tools |
+| `max_presentations` | — (no limit) | — | presenting tools hidden and refused, presenting fences cut (§6.9) |
 | `final_answer` (bool) | `true` | — | `false` — the pre-1.2 behavior: `max_steps` / `max_tool_calls` end the run at once, without an answer |
 | `max_total_tokens` (the **full** prompt input including cache read / write, + output; all attempts) | 200 000 | 1 000 000 | `stopped_limit / max_total_tokens` — an estimated budget, checked before every attempt (§10.2) |
 | `max_cost` (needs `pricing`) | — | — | `stopped_limit / max_cost` — an estimated budget, checked before every attempt (§10.2) |
@@ -1934,7 +2013,7 @@ without `LOG_DIR` a restart or deploy means an empty journal.
 | `locale_unsupported` | warn | `meta.locale` is not a supported locale (Appendix B): `requested`, `locale` — the one the run uses | — |
 | `llm_param_unsupported` | warn | an `llm.params` entry is not supported by the provider or model and was not sent (§9.3): `param`, `provider`, `model` | — |
 | `run_start` | info | start: model, tools as `name:effect`, limits, window, cache, history by role, `meta`, callback | `system_sha256` (`system` when read back, §4.9), `history_tail` (the last 6 messages as a string) |
-| `step_start` | debug | before a step: messages in the prompt, token estimate, `tools_disabled`, `tool_calls_used`, `final_answer_step: true` on the text-only final step (§10.1) | `engine_note` on the final step |
+| `step_start` | debug | before a step: messages in the prompt, token estimate, `tools_disabled`, `tool_calls_used`, `final_answer_step: true` on the text-only final step (§10.1), `presentations_used` with `max_presentations`, `tools_visible` without hidden presenting tools | `engine_note` on the final step |
 | `context_trimmed` | warn | context trimmed (§5.1): messages before / after, estimate, window | — |
 | `thinking_blocks_dropped` | info | the provider dropped stale thinking blocks after an engine-made prefix edit (§9.3): `step`, `dropped`, `reasons` | — |
 | `provider_attempt` | info | every provider attempt (§8): status, `finish_reason`, tokens, `provider_request_id` | — |
@@ -1957,8 +2036,11 @@ without `LOG_DIR` a restart or deploy means an empty journal.
 | `skill_unknown` | warn | `load_skill` with an unknown name | `name` (model text) |
 | `tool_search` | info | `search_tools` executed: `step`, `limit`, `tools`, `in_skills` | `query` (model text) |
 | `duplicate_write_intent` | warn | two calls of one write tool in a step (§6.3) | `args` |
-| `tools_disabled` | warn | `tool_choice: none` from now on (§6.7): `reason`, repeat and empty counters | — |
-| `output_check` | debug / info / warn | a format gate decision (§5.4): `fence`, `attempt` (0 — the original answer), `outcome` — `absent \| passed \| invalid` for 0, `repaired \| invalid \| missing` for repairs, `failed` + `reason` — gave up; `errors` — paths. `step_start`, `provider_attempt`, `provider_failure`, `limit_hit` of a repair step carry `repair: <fence>`, `repair_attempt` | `issues` (error lines), `block` (original block), `draft` (repair answer) |
+| `tools_disabled` | warn | `tool_choice: none` from now on (§6.7): `reason`, repeat and empty counters, `max_repeated_calls` | — |
+| `presentation` | info | a presentation counted (§6.9): `kind`, `name`, `call_id`, `used`, `max` | — |
+| `presentation_limit` | warn | a presenting call refused or a fence cut (§6.9): `kind`, `name`, `call_id`, `step` | `args` / `block` |
+| `interim_block_dropped` | warn | `interim: "drop"` removed blocks from a tool step (§5.4): `fence`, `step`, `blocks` | `text` (the original step text) |
+| `output_check` | debug / info / warn | a format gate decision (§5.4): `fence`, `attempt` (0 — the original answer), `outcome` — `absent \| passed \| invalid \| ungrounded` for 0, `repaired \| invalid \| ungrounded \| missing` for repairs, `failed` + `reason` — gave up; `errors` — paths. `step_start`, `provider_attempt`, `provider_failure`, `limit_hit` of a repair step carry `repair: <fence>`, `repair_attempt` | `issues` (error lines), `block` (original block), `draft` (repair answer) |
 | `tool_protocol_error` | error / warn | a write tool answered anything but `deferred`, or `deferred` without `operation_id` | `body` |
 | `tool_calls_sealed` | info | unresolved tool calls got a synthetic error (§6.5, §10.1) | — |
 | `run_timeout` | warn | `limits.timeout_ms` fired | — |
@@ -2049,6 +2131,13 @@ equivalent of the following suites.
    env and by `timeout_ms`, cancel while queued, 429 retry by `Retry-After` and with
    jitter, retry limit, a pause that does not fit `timeout_ms`, a retry queues again, a 429
    after content is not retried, `/health`; the limiter key never contains the key.
+5a. **Presentations** (§5.4, §6.7, §6.9): admission order within a step, hiding and
+   refusal once spent (a repeat of a refused call counts), errors do not spend, a fence
+   cut as `suppressed`, a skill-activated presenting tool stays hidden, no limit — no
+   effect; `interim: "drop"` (stored message, next prompt, SSE, unclosed block, only a
+   block), `keep`; `max_repeated_calls` `0` and clamping; `grounded` — history and run
+   results, numbers as strings, `*` over arrays and keys, repair with `ungrounded`,
+   `failed`, a path matching nothing.
 6a. **Journal** (§4.9, §12.4): filters, content off, scrubbing; prompts by hash (one
    `prompt_blob` per day file, `system` read back, `inline_prompts=false`); the disk
    journal — day files, `0600`, flush on shutdown, reads after a restart (`source: disk`)
@@ -2211,6 +2300,8 @@ providers, the network and tools is passed through as received.
 | Empty tool result (§6.2) | `[engine] The tool succeeded and returned an empty result — there is no data. Calling it again with the same arguments will return the same.` |
 | Repeated call (§6.7) | `repeated_call: this exact call was already executed in this run; its result is above. Repeating it returns the same — use the result you have or answer the user.` |
 | Final step note (§10.1) | `[engine] Step limit reached: tools are unavailable on this step.` or `[engine] Tool call limit reached: tools are unavailable from now on.`, then `Answer the user now with what you already have: what is done, what is not, and what the user can do next. Do not promise to call tools.` |
+| Presentation limit (§6.9) | `presentation_limit: <tool> was not called — the user already sees a result of this run. Answer in text about what is shown.` |
+| Ungrounded value (§5.4) | `"<value>" is not among the values returned by <tool>, <tool>` |
 | Final step fallback answer (§10.1) | `I ran out of steps before finishing. Please send the request again, or narrow it down.` |
 | Invalid tool input (§6.1) | `invalid_tool_input: <reason>`, e.g. `arguments: missing required field "id"`, `n: expected integer, got string` |
 | Skill index header (§6.8) | `[engine] Skills. Before working on a topic a skill covers, call load_skill with its name: the instructions, and the tools the skill unlocks, arrive on the next step.` |

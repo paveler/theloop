@@ -92,6 +92,9 @@ intents, limits and everything else — [SPEC.md](SPEC.md).
 - **Debuggable.** An event journal per run and session (`GET /logs`), with content,
   without shipping prompts to your log pipeline: in memory, and with `LOG_DIR` in day files
   on disk that survive a deploy and keep a week.
+- **Presentation invariants.** Mark what the harness renders, and the engine keeps one
+  card or deck per run, keeps blocks out of tool steps, and checks that card values came
+  from tool results.
 - **Always answers on a limit.** The last allowed step goes without tools, so a run that
   hits `max_steps` or `max_tool_calls` still ends with an answer, not an empty error.
 

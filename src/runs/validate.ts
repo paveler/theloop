@@ -156,6 +156,8 @@ export function resolveLimits(request: RunRequest, providerMaxTokens: number): L
       LIMIT_CAPS.tool_result_max_bytes,
     ),
     final_answer: input.final_answer !== false,
+    max_repeated_calls: Math.min(input.max_repeated_calls ?? 1, LIMIT_CAPS.max_repeated_calls),
+    ...(input.max_presentations != null ? { max_presentations: input.max_presentations } : {}),
   }
   // max_cost works only with pricing (SPEC §8.3)
   if (input.max_cost != null) {

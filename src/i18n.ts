@@ -31,6 +31,10 @@ export interface Texts {
   /* the text-only final step on a limit (§10.1) */
   finalAnswerNote(limit: 'max_steps' | 'max_tool_calls'): string
   finalAnswerFallback: string
+
+  /* presentations (§6.9) and grounded values (§5.4) */
+  presentationLimit(tool: string): string
+  ungrounded(value: string, tools: readonly string[]): string
   invalidCall: string
   invalidCallArgs: string
   argsRoot: string
@@ -110,6 +114,10 @@ const ru: Texts = {
     'Ответь пользователю сейчас тем, что уже есть: что сделано, что нет и что пользователь может ' +
     'сделать дальше. Не обещай вызвать тулы.',
   finalAnswerFallback: 'Не успел закончить за отведённые шаги. Отправьте запрос ещё раз или уточните его.',
+  presentationLimit: (tool) =>
+    `presentation_limit: ${tool} не вызван — пользователь уже видит результат этого run. ` +
+    'Ответь текстом про то, что ему показано.',
+  ungrounded: (value, tools) => `${JSON.stringify(value)} нет среди значений, которые вернули ${tools.join(', ')}`,
   invalidCall: 'невалидный вызов',
   invalidCallArgs: 'невалидные аргументы вызова',
   argsRoot: 'аргументы',
@@ -202,6 +210,10 @@ const en: Texts = {
     'Answer the user now with what you already have: what is done, what is not, and what the ' +
     'user can do next. Do not promise to call tools.',
   finalAnswerFallback: 'I ran out of steps before finishing. Please send the request again, or narrow it down.',
+  presentationLimit: (tool) =>
+    `presentation_limit: ${tool} was not called — the user already sees a result of this run. ` +
+    'Answer in text about what is shown.',
+  ungrounded: (value, tools) => `${JSON.stringify(value)} is not among the values returned by ${tools.join(', ')}`,
   invalidCall: 'invalid call',
   invalidCallArgs: 'invalid call arguments',
   argsRoot: 'arguments',

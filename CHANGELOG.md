@@ -6,8 +6,10 @@ changes within 1.x.
 
 ## v1.2.0 — 2026-10-28
 
-[RFC 0002](docs/rfcs/0002-final-answer-on-limits-and-disk-journal.md). Additive to contract
-`"1"`, with one default behavior change (`max_steps` / `max_tool_calls`, opt-out below).
+[RFC 0002](docs/rfcs/0002-final-answer-on-limits-and-disk-journal.md) and
+[RFC 0003](docs/rfcs/0003-presentation-invariants.md). Additive to contract `"1"`, with one
+default behavior change (`max_steps` / `max_tool_calls`, opt-out below); everything from
+RFC 0003 is opt-in.
 
 ### Changed
 
@@ -32,6 +34,20 @@ changes within 1.x.
   `days` and `inline_prompts`. Entries on disk carry `boot_id`.
 - **Prompts by hash.** `run_start` stores `system_sha256`; the text is kept once in memory
   and once per day file (`prompt_blob`), and `GET /logs` inlines it back by default.
+- **One presentation per run** (SPEC §6.9). `tools[].presents`, `output_checks[].presents`
+  and `limits.max_presentations`: presenting calls are admitted in order up to the budget;
+  once it is spent, presenting tools are hidden and refused (`tool_calls[].status:
+  presentation_limit`) and presenting fences are cut (`output_checks[].status:
+  suppressed`). `result.presentations` lists what reached the user.
+- **Blocks belong to the final answer** (SPEC §5.4). `output_checks[].interim: "drop"`
+  removes blocks of the fence from the text of tool steps, from the stored message and the
+  next prompt; SSE `output_check` `dropped`.
+- **Configurable repeat tolerance** (SPEC §6.7). `limits.max_repeated_calls` (default 1,
+  ceiling 3); `0` disables tools on the first repeat.
+- **Grounded values** (SPEC §5.4). `output_checks[].grounded: [{ path, tools }]` requires
+  values at a JSON Pointer (with `*`) to come from `ok` results of the listed tools; an
+  invented value goes through the normal repair (`outcome: ungrounded` in the journal).
+- Journal events `presentation`, `presentation_limit`, `interim_block_dropped`.
 - Journal events `final_answer`, `journal_retention`, `journal_pruned`,
   `journal_disk_ephemeral`; `step_start.final_answer_step` with `content.engine_note`;
   `run_done.limit_reached` / `answer_source`.

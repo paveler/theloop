@@ -123,6 +123,7 @@ export const LIMIT_DEFAULTS = {
 export const LIMIT_CAPS = {
   max_steps: 32,
   max_tool_calls: 64,
+  max_repeated_calls: 3,
   max_total_tokens: 1_000_000,
   timeout_ms: 600_000,
   tool_result_max_bytes: 262_144,
@@ -142,6 +143,10 @@ export const LimitsSchema = z
     tool_result_max_bytes: z.number().int().positive().optional(),
     /** false — the pre-1.2 behavior: max_steps / max_tool_calls end the run without an answer (SPEC §10.1). */
     final_answer: z.boolean().optional(),
+    /** Repeats tolerated before tools are disabled (SPEC §6.7); default 1, clamped to 3. */
+    max_repeated_calls: z.number().int().nonnegative().optional(),
+    /** Presentations reaching the user per run (SPEC §6.9); absent — no limit. */
+    max_presentations: z.number().int().positive().optional(),
   })
   .default({})
 
@@ -157,6 +162,8 @@ export interface Limits {
   tool_result_max_bytes: number
   /** A text-only last step on max_steps / max_tool_calls (SPEC §10.1). */
   final_answer: boolean
+  max_repeated_calls: number
+  max_presentations?: number
 }
 
 /** The limits that end in a text-only final step instead of a run without an answer (SPEC §10.1). */
@@ -237,6 +244,8 @@ export const ToolDefSchema = z.object({
   effect: ToolEffectSchema, // required (SPEC §6.4)
   /** Hidden from the model until a skill or search activates it (SPEC §6.8). */
   defer_loading: z.boolean().nullish(),
+  /** A successful result is rendered to the user: counts toward limits.max_presentations (SPEC §6.9). */
+  presents: z.boolean().nullish(),
 })
 
 export type ToolDef = z.infer<typeof ToolDefSchema>
@@ -302,12 +311,26 @@ export const OUTPUT_CHECK_LIMITS = {
   max_repairs_default: 1,
   /** Ceiling: a request can only tighten it; anything above is clamped. */
   max_repairs_cap: 3,
+  /** grounded[] entries per check. */
+  max_grounded: 8,
 } as const
+
+export const GroundedSchema = z.object({
+  /** JSON Pointer into the block; `*` matches every index or key at that level. */
+  path: z.string().regex(/^\//, 'path: a JSON Pointer starting with /'),
+  tools: z.array(z.string().min(1)).min(1),
+})
 
 export const OutputCheckSchema = z.object({
   fence: z.string().regex(/^[a-z0-9-]{1,40}$/, 'fence: ^[a-z0-9-]{1,40}$'),
   schema: z.record(z.string(), z.unknown()),
   max_repairs: z.number().int().nonnegative().optional(),
+  /** A block of this fence is rendered to the user (SPEC §6.9). */
+  presents: z.boolean().nullish(),
+  /** Blocks in the text of a tool step: kept as v1, or dropped (SPEC §5.4). */
+  interim: z.enum(['keep', 'drop']).nullish(),
+  /** Values that must come from tool results (SPEC §5.4). */
+  grounded: z.array(GroundedSchema).max(OUTPUT_CHECK_LIMITS.max_grounded).nullish(),
 })
 
 export type OutputCheckInput = z.infer<typeof OutputCheckSchema>
@@ -374,6 +397,7 @@ export type ToolCallStatus =
   | 'deferred'
   | 'cancelled'
   | 'not_executed'
+  | 'presentation_limit'
   | 'duplicate_write_intent'
   | 'http_error'
   | 'protocol_error'
@@ -449,7 +473,7 @@ export function publicError(error: RunErrorBody): Omit<RunErrorBody, 'provider_b
 }
 
 /** Outcome of the check for one fence (SPEC §5.4). */
-export type OutputCheckStatus = 'absent' | 'passed' | 'repaired' | 'failed'
+export type OutputCheckStatus = 'absent' | 'passed' | 'repaired' | 'failed' | 'suppressed'
 
 /** Why the repair failed: attempts exhausted, budget / timeout, provider, stop. */
 export type OutputCheckFailReason =
@@ -459,6 +483,7 @@ export type OutputCheckFailReason =
   | 'run_timeout'
   | 'provider_failure'
   | 'cancelled'
+  | 'presentation_limit'
 
 export interface OutputCheckResult {
   fence: string
@@ -469,6 +494,13 @@ export interface OutputCheckResult {
   errors?: string[]
   /** Only when failed. */
   reason?: OutputCheckFailReason
+}
+
+/** A presenting tool result or fence block that reached the user (SPEC §6.9). */
+export interface Presentation {
+  kind: 'tool' | 'fence'
+  name: string
+  call_id?: string
 }
 
 /** How much context is used after the run (SPEC §7). */
@@ -509,5 +541,7 @@ export interface RunResult {
   limit_reached?: FinalAnswerLimit
   /** fallback — the answer is the engine's fixed text (SPEC §10.1); absent — the model's. */
   answer_source?: 'model' | 'fallback'
+  /** What reached the user, in order; only with limits.max_presentations (SPEC §6.9). */
+  presentations?: Presentation[]
   error: RunErrorBody | null
 }
