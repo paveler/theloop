@@ -4,6 +4,19 @@ All notable changes to theloop. The contract is versioned separately (`contract_
 [SPEC.md](SPEC.md)); every change below is additive to it. Releases follow semver: no breaking
 changes within 1.x.
 
+## v1.2.1 — 2026-10-29
+
+### Fixed
+
+- **An empty answer no longer ends a run silently** (SPEC §10.1 rule 8). The v1.2.0 fallback
+  covered only the `max_steps` / `max_tool_calls` final step: a model that went text-only
+  after §6.7 disabled tools (a repeat, or two empty results) and then replied with nothing
+  ended the run `completed / end_turn` with an empty answer. Now an empty step (no text, no
+  tool calls) is dropped and re-asked once without tools, with an ephemeral engine note;
+  if that is empty too, the run ends `completed` with a localized fallback and
+  `answer_source: "fallback"`. New journal event `empty_answer`, new `step_start` field
+  `empty_answer_reask`. `limits.final_answer: false` keeps the old behavior.
+
 ## v1.2.0 — 2026-10-28
 
 [RFC 0002](docs/rfcs/0002-final-answer-on-limits-and-disk-journal.md) and

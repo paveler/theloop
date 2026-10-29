@@ -177,6 +177,8 @@ class RunExecution {
   private finalBudgetLimit: 'max_total_tokens' | 'max_cost' | null = null
   /** The final step's provider failure was a tool call under tool_choice none. */
   private finalIgnoredNone = false
+  /** The model ended a step with an empty answer: the next step re-asks it, once (SPEC §10.1 rule 8). */
+  private emptyReask = false
   /** What reached the user, counted only with limits.max_presentations (SPEC §6.9). */
   private readonly presentations: Presentation[] = []
   private timeoutTimer: ReturnType<typeof setTimeout> | null = null
@@ -406,16 +408,19 @@ class RunExecution {
         this.finalAnswer = 'max_steps'
       }
       const final = this.finalAnswer
+      // a limit's final step wins: its note already asks for an answer, and its fallback ends the run
+      const reask = !final && this.emptyReask
+      const note = final ? this.texts.finalAnswerNote(final) : reask ? this.texts.emptyAnswerNote : undefined
 
-      const prompt = await this.buildPrompt(step, [], final ? this.texts.finalAnswerNote(final) : undefined)
-      const outcome = await this.callProvider(prompt, step, final ? 'final' : 'main')
+      const prompt = await this.buildPrompt(step, [], note)
+      const outcome = await this.callProvider(prompt, step, final || reask ? 'final' : 'main')
       if (typeof outcome === 'string') {
         // a final step that hit a budget or a provider failure did not finish the run itself
-        if (final && !this.finished) {
-          this.finishWithFallback(
-            final,
-            outcome === 'budget_exceeded' ? 'budget' : this.finalIgnoredNone ? 'tool_calls_ignored_none' : 'provider_error',
-          )
+        if ((final || reask) && !this.finished) {
+          const reason =
+            outcome === 'budget_exceeded' ? 'budget' : this.finalIgnoredNone ? 'tool_calls_ignored_none' : 'provider_error'
+          if (final) this.finishWithFallback(final, reason)
+          else this.finishEmptyAnswer(reason)
         }
         return
       }
@@ -431,9 +436,31 @@ class RunExecution {
           this.finish('stopped_limit', 'max_tokens')
           return
         }
-        if (final && outcome.text.trim().length === 0) {
-          this.finishWithFallback(final, 'empty_text')
-          return
+        if (outcome.text.trim().length === 0) {
+          if (final) {
+            this.finishWithFallback(final, 'empty_text')
+            return
+          }
+          if (reask) {
+            this.finishEmptyAnswer('empty_text')
+            return
+          }
+          // §10.1 rule 8: an empty answer is never the end of a run — one text-only re-ask, then the fallback
+          if (limits.final_answer) {
+            if (step >= limits.max_steps) {
+              this.finishEmptyAnswer('empty_text')
+              return
+            }
+            // a whitespace-only or reasoning-only message must not reach the re-ask prompt:
+            // Anthropic rejects an assistant message without visible text
+            if (message && this.newMessages.at(-1) === message) {
+              this.newMessages.pop()
+              this.seq--
+            }
+            this.emptyReask = true
+            log.warn('empty_answer', { run_id: this.record.runId, step, outcome: 'reask' })
+            continue
+          }
         }
         // the format gate goes exactly here: otherwise the run would end with the final text (SPEC §5.4)
         if (this.plan.outputChecks.length > 0 && (await this.applyOutputChecks(step, message)) === 'cancelled') {
@@ -443,6 +470,8 @@ class RunExecution {
         if (final) {
           this.limitReached = final
           log.info('final_answer', { run_id: this.record.runId, step, limit: final, outcome: 'model' })
+        } else if (reask) {
+          log.info('empty_answer', { run_id: this.record.runId, step, outcome: 'model' })
         }
         this.finish('completed', 'end_turn')
         return
@@ -466,6 +495,17 @@ class RunExecution {
         }
         log.info('final_answer', { run_id: this.record.runId, step, limit: final, outcome: 'model' })
         this.finish('stopped_limit', final)
+        return
+      }
+      // the re-ask is text-only too: its ignored tool calls are never executed, the text (if any) is the answer
+      if (reask) {
+        this.sealUnresolvedToolCalls('not_executed: empty_answer', 'not_executed')
+        if (outcome.text.trim().length === 0) {
+          this.finishEmptyAnswer('tool_calls_ignored_none')
+          return
+        }
+        log.info('empty_answer', { run_id: this.record.runId, step, outcome: 'model' })
+        this.finish('completed', 'end_turn')
         return
       }
       if (step >= limits.max_steps) {
@@ -522,7 +562,7 @@ class RunExecution {
 
   /**
    * @param extra a tail that is not in the run's messages: repair synthetics and drafts (SPEC §5.4).
-   * @param engineNote the final step's note (§10.1): the prompt of this step only, never the history.
+   * @param engineNote the final step's or the empty-answer re-ask's note (§10.1): the prompt of this step only, never the history.
    */
   private async buildPrompt(
     step: number,
@@ -583,7 +623,7 @@ class RunExecution {
         ? { tools_visible: this.skills.visibleTools(this.requestTools()).map((t) => t.name) }
         : {}),
       ...(plan.limits.max_presentations != null ? { presentations_used: this.presentations.length } : {}),
-      ...(engineNote ? { final_answer_step: true } : {}),
+      ...(engineNote ? (this.finalAnswer ? { final_answer_step: true } : { empty_answer_reask: true }) : {}),
       ...this.repairFields(),
     }, engineNote ? { engine_note: engineNote } : undefined)
     // the engine's own edit of a signed prefix: stale thinking blocks are dropped, not a 400 (SPEC §9.3)
@@ -1811,6 +1851,20 @@ class RunExecution {
     log.warn('final_answer', { run_id: this.record.runId, step: this.steps, limit, outcome: 'fallback', reason })
     // a budget that blocked the final step is the honest finish_reason (§10.2)
     this.finish('stopped_limit', reason === 'budget' ? (this.finalBudgetLimit ?? limit) : limit)
+  }
+
+  /**
+   * The re-ask after an empty answer produced nothing either (§10.1 rule 8): the run ends
+   * `completed` with the engine's fixed text instead of an empty answer.
+   */
+  private finishEmptyAnswer(reason: 'empty_text' | 'tool_calls_ignored_none' | 'provider_error' | 'budget'): void {
+    const text = this.texts.emptyAnswerFallback
+    this.record.sse.emit('delta', { text })
+    this.pushAssistant([{ type: 'text', text }], false)
+    this.fallbackAnswer = true
+    log.warn('empty_answer', { run_id: this.record.runId, step: this.steps, outcome: 'fallback', reason })
+    if (reason === 'budget' && this.finalBudgetLimit) this.finish('stopped_limit', this.finalBudgetLimit)
+    else this.finish('completed', 'end_turn')
   }
 
   private finishAborted(): void {
