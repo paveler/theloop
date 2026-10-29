@@ -329,3 +329,155 @@ describe('final answer on max_tool_calls (SPEC §10.1 rule 2)', () => {
     expect(result.answer_source).toBe('fallback')
   })
 })
+
+describe('empty answer (SPEC §10.1 rule 8)', () => {
+  const emptyStep = () => streamFrom([START, finish('stop')])
+  const reaskNote = '[engine] Your previous reply was empty'
+  const fallbackText = 'I could not put an answer together. Please send the request again, or rephrase it.'
+
+  it('tools disabled by a repeat, then an empty reply → one text-only re-ask; the model answers → completed', async () => {
+    const tools = await toolServer()
+    const model = mockModel([
+      callStep('c1', { id: '1' }),
+      callStep('c2', { id: '1' }),
+      emptyStep(),
+      textStep('I could not find more; here is what I have.'),
+    ])
+    const engine = track(createEngine(testConfig(), { modelFactory: mockFactory(model) }))
+
+    const result = await runWait(
+      engine,
+      runRequest({ tools: [readTool(tools.url)] as never, limits: { max_steps: 8, max_repeated_calls: 0 } as never }),
+    )
+
+    expect(result.status).toBe('completed')
+    expect(result.finish_reason).toBe('end_turn')
+    expect(result.answer_source).toBeUndefined()
+    expect(result.limit_reached).toBeUndefined()
+    expect(model.doStreamCalls).toHaveLength(4)
+    expect(model.doStreamCalls[3]!.toolChoice).toEqual({ type: 'none' })
+    expect(lastUserText(model.doStreamCalls[3]!.prompt as never)).toContain(reaskNote)
+    expect(JSON.stringify(result.messages)).not.toContain(reaskNote)
+    expect(lastText(result)).toBe('I could not find more; here is what I have.')
+
+    const entries = await logs(engine, result.run_id, 'step_start,empty_answer')
+    expect(entries.filter((e) => e.event === 'empty_answer').map((e) => e.outcome)).toEqual(['reask', 'model'])
+    const reaskStart = entries.find((e) => e.event === 'step_start' && e.step === 4)
+    expect(reaskStart).toMatchObject({ empty_answer_reask: true })
+    expect(reaskStart).not.toHaveProperty('final_answer_step')
+  })
+
+  it('an empty reply on a plain text step is re-asked too', async () => {
+    const model = mockModel([emptyStep(), textStep('Hello! How can I help?')])
+    const engine = track(createEngine(testConfig(), { modelFactory: mockFactory(model) }))
+
+    const result = await runWait(engine, runRequest())
+
+    expect(result.status).toBe('completed')
+    expect(model.doStreamCalls).toHaveLength(2)
+    expect(lastText(result)).toBe('Hello! How can I help?')
+  })
+
+  it('a whitespace-only reply is empty; it is dropped from the messages and the re-ask prompt', async () => {
+    const model = mockModel([streamFrom([START, ...textChunks('  \n'), finish('stop')]), textStep('Answer.')])
+    const engine = track(createEngine(testConfig(), { modelFactory: mockFactory(model) }))
+
+    const result = await runWait(engine, runRequest())
+
+    expect(result.status).toBe('completed')
+    expect(result.messages.filter((m) => m.role === 'assistant')).toHaveLength(1)
+    const reaskPrompt = model.doStreamCalls[1]!.prompt as Array<{ role: string }>
+    expect(reaskPrompt.filter((m) => m.role === 'assistant')).toHaveLength(0)
+    expect(lastText(result)).toBe('Answer.')
+  })
+
+  it('the re-ask is empty too → completed with the fallback in the run locale (ru)', async () => {
+    const model = mockModel([emptyStep(), emptyStep()])
+    const engine = track(createEngine(testConfig(), { modelFactory: mockFactory(model) }))
+
+    const result = await runWait(engine, runRequest({ meta: { locale: 'ru' } } as never))
+
+    expect(model.doStreamCalls).toHaveLength(2)
+    expect(lastUserText(model.doStreamCalls[1]!.prompt as never)).toContain('[engine] Твой предыдущий ответ пустой')
+    expect(result.status).toBe('completed')
+    expect(result.finish_reason).toBe('end_turn')
+    expect(result.answer_source).toBe('fallback')
+    expect(lastText(result)).toBe('Не получилось сформулировать ответ. Отправьте запрос ещё раз или переформулируйте его.')
+
+    const entries = await logs(engine, result.run_id, 'empty_answer')
+    expect(entries.at(-1)).toMatchObject({ outcome: 'fallback', reason: 'empty_text' })
+  })
+
+  it('a provider failure on the re-ask → the fallback, not failed', async () => {
+    let calls = 0
+    const model = mockModel(async () => {
+      calls++
+      if (calls === 1) return emptyStep()
+      throw Object.assign(new Error('bad request'), { statusCode: 400 })
+    })
+    const engine = track(createEngine(testConfig(), { modelFactory: mockFactory(model) }))
+
+    const result = await runWait(engine, runRequest())
+
+    expect(result.status).toBe('completed')
+    expect(result.answer_source).toBe('fallback')
+    expect(result.error).toBeNull()
+    expect(lastText(result)).toBe(fallbackText)
+    const entries = await logs(engine, result.run_id, 'empty_answer')
+    expect(entries.at(-1)).toMatchObject({ outcome: 'fallback', reason: 'provider_error' })
+  })
+
+  it('the provider still calls tools on the re-ask → sealed not_executed; its text is the answer', async () => {
+    const tools = await toolServer()
+    const model = mockModel([
+      emptyStep(),
+      streamFrom([START, ...textChunks('Here is the answer.'), toolCall('c1', 'getStatus', { id: '1' }), finish('tool-calls')]),
+    ])
+    const engine = track(
+      createEngine(testConfig(), { modelFactory: mockFactory(model, { honorsToolChoiceNone: false }) }),
+    )
+
+    const result = await runWait(engine, runRequest({ tools: [readTool(tools.url)] as never }))
+
+    expect(tools.requests).toHaveLength(0)
+    expect(result.status).toBe('completed')
+    expect(result.answer_source).toBeUndefined()
+    expect(result.messages.at(-1)).toMatchObject({ role: 'tool', call_id: 'c1', error: 'not_executed: empty_answer' })
+  })
+
+  it('max_steps = 1 → no room for a re-ask: the fallback at once', async () => {
+    const model = mockModel([emptyStep()])
+    const engine = track(createEngine(testConfig(), { modelFactory: mockFactory(model) }))
+
+    const result = await runWait(engine, runRequest({ limits: { max_steps: 1 } as never }))
+
+    expect(model.doStreamCalls).toHaveLength(1)
+    expect(result.status).toBe('completed')
+    expect(result.answer_source).toBe('fallback')
+    expect(lastText(result)).toBe(fallbackText)
+  })
+
+  it('the re-ask falls on the last allowed step → the max_steps final step wins', async () => {
+    const tools = await toolServer()
+    const model = mockModel([emptyStep(), emptyStep()])
+    const engine = track(createEngine(testConfig(), { modelFactory: mockFactory(model) }))
+
+    const result = await runWait(engine, runRequest({ tools: [readTool(tools.url)] as never, limits: { max_steps: 2 } as never }))
+
+    expect(lastUserText(model.doStreamCalls[1]!.prompt as never)).toContain('[engine] Step limit reached')
+    expect(result.status).toBe('stopped_limit')
+    expect(result.finish_reason).toBe('max_steps')
+    expect(result.answer_source).toBe('fallback')
+  })
+
+  it('final_answer: false → the pre-fix behavior: an empty reply ends the run completed', async () => {
+    const model = mockModel([emptyStep()])
+    const engine = track(createEngine(testConfig(), { modelFactory: mockFactory(model) }))
+
+    const result = await runWait(engine, runRequest({ limits: { final_answer: false } as never }))
+
+    expect(model.doStreamCalls).toHaveLength(1)
+    expect(result.status).toBe('completed')
+    expect(result.answer_source).toBeUndefined()
+  })
+})

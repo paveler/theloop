@@ -1029,7 +1029,8 @@ engine cuts this without a new status:
 3. **The second repeat in a run** (`limits.max_repeated_calls`, default 1 forgiven repeat:
    `0` — the first repeat already disables tools, `n` — repeat `n + 1` does, clamped to 3)
    → all following steps go with `tool_choice: none`: the
-   model must answer in text with what it has, and the run ends `completed`. For
+   model must answer in text with what it has, and the run ends `completed` (an empty
+   answer is re-asked once, §10.1 rule 8). For
    Anthropic the request keeps `tools` and carries `tool_choice: { "type": "none" }`;
    for GigaChat and GLM the engine sends no tools on such steps (§9.1) — both accept
    tool pairs in the history without tool definitions. If a provider ignores `none` and still returns tool
@@ -1234,7 +1235,8 @@ endpoints are **not** covered by the signature — they have their own `tools[].
   from the text-only final step (§10.1): a limit was hit, and the model still answered.
   Absent otherwise.
 - `answer_source: "fallback"` — the last assistant message is the engine's fixed text in
-  the run locale (§10.1, Appendix B), not the model's: the final step produced no answer.
+  the run locale (§10.1, Appendix B), not the model's: the final step, or the re-ask after an
+  empty answer (§10.1 rule 8, then with `completed / end_turn`), produced no answer.
   Absent means the model's (`"model"` is never sent). With the final step on
   (`limits.final_answer`, default), `stopped_limit / max_steps | max_tool_calls` always
   carries a non-empty answer; a harness that rendered `stopped_limit` as an error SHOULD
@@ -1625,7 +1627,7 @@ Time zone — `meta.timezone` (IANA), else env `DEFAULT_TIMEZONE`, else `UTC`.
 | `max_tool_calls` (per run) | 16 | 64 | the batch is not executed, the next step is text-only (§10.1) |
 | `max_repeated_calls` | 1 | 3 | repeats forgiven before `tool_choice: none` (§6.7); `0` — the first repeat disables tools |
 | `max_presentations` | — (no limit) | — | presenting tools hidden and refused, presenting fences cut (§6.9) |
-| `final_answer` (bool) | `true` | — | `false` — the pre-1.2 behavior: `max_steps` / `max_tool_calls` end the run at once, without an answer |
+| `final_answer` (bool) | `true` | — | `false` — the pre-1.2 behavior: `max_steps` / `max_tool_calls` end the run at once, without an answer, and an empty answer is not re-asked (§10.1 rule 8) |
 | `max_total_tokens` (the **full** prompt input including cache read / write, + output; all attempts) | 200 000 | 1 000 000 | `stopped_limit / max_total_tokens` — an estimated budget, checked before every attempt (§10.2) |
 | `max_cost` (needs `pricing`) | — | — | `stopped_limit / max_cost` — an estimated budget, checked before every attempt (§10.2) |
 | `timeout_ms` (run; waiting for a provider slot §11.6 is included) | 120 000 | 600 000 | `failed / run_timeout`, partial kept; ran out in the provider queue — `failed / provider_queue_timeout` |
@@ -1690,7 +1692,22 @@ A step = one model call + execution of its tool calls. The same rules for read a
 7. `limits.final_answer: false` turns rules 1, 2 and 6 back to the pre-1.2 behavior: the
    tool calls of the last allowed step are sealed and the run ends
    `stopped_limit / max_steps`; a refused batch ends it `stopped_limit / max_tool_calls`;
-   no answer. For callers whose continuation logic keys on `stopped_limit`.
+   no answer. For callers whose continuation logic keys on `stopped_limit`. It turns rule 8
+   off as well.
+8. **An empty answer never ends a run.** A step with no tool calls and no visible text
+   (empty or whitespace only, `finish_reason` other than `length`) — typically after §6.7
+   disabled tools, when a model has nothing to call and answers nothing — is not a final
+   answer. The empty message is dropped from `messages`, and the engine makes **one**
+   text-only re-ask: `tool_choice: none` as in rule 1, with an ephemeral engine note at the
+   end of the prompt (Appendix B): *your previous reply was empty, the user saw nothing,
+   answer now with what you have*. The model answers → `completed / end_turn`, no
+   `limit_reached`; the format gate (§5.4) applies. The re-ask is empty too, returns only
+   tool calls (sealed `not_executed: empty_answer`), fails at the provider, or there is no
+   step left for it (`max_steps: 1`) → `completed / end_turn` with a fixed fallback text in
+   the run locale (Appendix B) and `answer_source: "fallback"`; a §10.2 budget that refuses
+   the re-ask → `stopped_limit / max_total_tokens | max_cost` with the same fallback. The
+   re-ask is a regular step and counts toward `max_steps`; if it falls on the last allowed
+   step, that step is the rule 1 final step instead (its note and fallback win).
 
 Every boundary MUST be covered by tests (§13).
 
@@ -2013,7 +2030,7 @@ without `LOG_DIR` a restart or deploy means an empty journal.
 | `locale_unsupported` | warn | `meta.locale` is not a supported locale (Appendix B): `requested`, `locale` — the one the run uses | — |
 | `llm_param_unsupported` | warn | an `llm.params` entry is not supported by the provider or model and was not sent (§9.3): `param`, `provider`, `model` | — |
 | `run_start` | info | start: model, tools as `name:effect`, limits, window, cache, history by role, `meta`, callback | `system_sha256` (`system` when read back, §4.9), `history_tail` (the last 6 messages as a string) |
-| `step_start` | debug | before a step: messages in the prompt, token estimate, `tools_disabled`, `tool_calls_used`, `final_answer_step: true` on the text-only final step (§10.1), `presentations_used` with `max_presentations`, `tools_visible` without hidden presenting tools | `engine_note` on the final step |
+| `step_start` | debug | before a step: messages in the prompt, token estimate, `tools_disabled`, `tool_calls_used`, `final_answer_step: true` on the text-only final step (§10.1), `empty_answer_reask: true` on the re-ask after an empty answer (§10.1 rule 8), `presentations_used` with `max_presentations`, `tools_visible` without hidden presenting tools | `engine_note` on the final step and the re-ask |
 | `context_trimmed` | warn | context trimmed (§5.1): messages before / after, estimate, window | — |
 | `thinking_blocks_dropped` | info | the provider dropped stale thinking blocks after an engine-made prefix edit (§9.3): `step`, `dropped`, `reasons` | — |
 | `provider_attempt` | info | every provider attempt (§8): status, `finish_reason`, tokens, `provider_request_id` | — |
@@ -2023,6 +2040,7 @@ without `LOG_DIR` a restart or deploy means an empty journal.
 | `step_done` | info | a step finished: `finish_reason`, tokens, tool call names | `text`, `reasoning`, `tool_calls` with args |
 | `limit_hit` | warn | a §10 limit / §10.2 budget: `limit` and numbers (`step`, `used`, `requested`, `spent_tokens`, …); `final_answer: true` — the run goes on to the text-only step (§10.1) | — |
 | `final_answer` | info / warn | the text-only final step decided (§10.1): `limit`, `outcome` — `model \| fallback`; `reason` for `fallback` — `empty_text \| tool_calls_ignored_none \| provider_error \| budget` | — |
+| `empty_answer` | info / warn | a step answered with no text and no tool calls (§10.1 rule 8): `outcome` — `reask` (the next step is the re-ask) \| `model` (the re-ask answered) \| `fallback`; `reason` for `fallback` — `empty_text \| tool_calls_ignored_none \| provider_error \| budget` | — |
 | `tool_call` | info | a call went to its endpoint: `effect`, `endpoint` (query scrubbed), `timeout_ms` | `args` |
 | `tool_http` | debug / warn | every HTTP attempt of a tool: `attempt`, `http_status` or `error`, `retry` | `body` on 4xx / 5xx |
 | `tool_accepted` | info | a tool answered `accepted`, waiting for `result_url` | — |
@@ -2083,7 +2101,9 @@ equivalent of the following suites.
    empty result → marker for the model, `null` in history; a repeated call →
    `repeated_call` without hitting the endpoint, a second repeat and a second empty result
    of one tool → `tool_choice: none` and `completed`; every §10.1 boundary, the text-only
-   final step (note, `limit_reached`, every fallback reason, `final_answer: false`); cancel
+   final step (note, `limit_reached`, every fallback reason, `final_answer: false`); the
+   empty-answer re-ask (note, dropped empty message, every fallback reason, `max_steps: 1`,
+   the final step winning, `final_answer: false`); cancel
    mid-stream (partial + synthetic tool errors + `unknown`); run timeout; provider retries
    with attempt records.
 3. **HTTP end-to-end** in-process (Hono `app.request` + fake tool server + fake callback):
@@ -2303,6 +2323,8 @@ providers, the network and tools is passed through as received.
 | Presentation limit (§6.9) | `presentation_limit: <tool> was not called — the user already sees a result of this run. Answer in text about what is shown.` |
 | Ungrounded value (§5.4) | `"<value>" is not among the values returned by <tool>, <tool>` |
 | Final step fallback answer (§10.1) | `I ran out of steps before finishing. Please send the request again, or narrow it down.` |
+| Empty answer re-ask note (§10.1 rule 8) | `[engine] Your previous reply was empty: the user saw nothing. Tools are unavailable on this step. Answer the user now in text with what you already have: what is done, what is not, and what the user can do next. Do not promise to call tools.` |
+| Empty answer fallback (§10.1 rule 8) | `I could not put an answer together. Please send the request again, or rephrase it.` |
 | Invalid tool input (§6.1) | `invalid_tool_input: <reason>`, e.g. `arguments: missing required field "id"`, `n: expected integer, got string` |
 | Skill index header (§6.8) | `[engine] Skills. Before working on a topic a skill covers, call load_skill with its name: the instructions, and the tools the skill unlocks, arrive on the next step.` |
 | `load_skill` description (§6.8) | `Load a skill listed in the system prompt: returns its instructions and makes its tools available from the next step.`; argument `name`: `Skill name, exactly as listed.` |

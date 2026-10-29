@@ -31,6 +31,8 @@ export interface Texts {
   /* the text-only final step on a limit (§10.1) */
   finalAnswerNote(limit: 'max_steps' | 'max_tool_calls'): string
   finalAnswerFallback: string
+  emptyAnswerNote: string
+  emptyAnswerFallback: string
 
   /* presentations (§6.9) and grounded values (§5.4) */
   presentationLimit(tool: string): string
@@ -114,6 +116,11 @@ const ru: Texts = {
     'Ответь пользователю сейчас тем, что уже есть: что сделано, что нет и что пользователь может ' +
     'сделать дальше. Не обещай вызвать тулы.',
   finalAnswerFallback: 'Не успел закончить за отведённые шаги. Отправьте запрос ещё раз или уточните его.',
+  emptyAnswerNote:
+    '[engine] Твой предыдущий ответ пустой: пользователь ничего не увидел. На этом шаге тулы недоступны. ' +
+    'Ответь пользователю сейчас текстом тем, что уже есть: что сделано, что нет и что пользователь может ' +
+    'сделать дальше. Не обещай вызвать тулы.',
+  emptyAnswerFallback: 'Не получилось сформулировать ответ. Отправьте запрос ещё раз или переформулируйте его.',
   presentationLimit: (tool) =>
     `presentation_limit: ${tool} не вызван — пользователь уже видит результат этого run. ` +
     'Ответь текстом про то, что ему показано.',
@@ -210,6 +217,11 @@ const en: Texts = {
     'Answer the user now with what you already have: what is done, what is not, and what the ' +
     'user can do next. Do not promise to call tools.',
   finalAnswerFallback: 'I ran out of steps before finishing. Please send the request again, or narrow it down.',
+  emptyAnswerNote:
+    '[engine] Your previous reply was empty: the user saw nothing. Tools are unavailable on this step. ' +
+    'Answer the user now in text with what you already have: what is done, what is not, and what the ' +
+    'user can do next. Do not promise to call tools.',
+  emptyAnswerFallback: 'I could not put an answer together. Please send the request again, or rephrase it.',
   presentationLimit: (tool) =>
     `presentation_limit: ${tool} was not called — the user already sees a result of this run. ` +
     'Answer in text about what is shown.',
