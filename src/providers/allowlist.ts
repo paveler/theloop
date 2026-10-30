@@ -35,6 +35,12 @@ export interface ProviderEntry {
    * caches only the prefix common to all requests, not the conversation history (SPEC §9.1).
    */
   sessionHeader?: string
+  /**
+   * Thinking blocks arrive without a signature (only an empty one in content_block_start, which
+   * the Anthropic adapter does not read), yet must go back in the history of a tool loop. A
+   * closed block is stored with an empty signature, or the adapter drops it (SPEC §5.2).
+   */
+  unsignedThinking?: boolean
 }
 
 export const PROVIDERS: Record<ProviderId, ProviderEntry> = {
@@ -98,6 +104,21 @@ export const PROVIDERS: Record<ProviderId, ProviderEntry> = {
     includeUsage: false,
     honorsToolChoiceNone: true,
   },
+  kimi: {
+    // Anthropic-compatible API (SPEC §9.1): K3 always thinks, and the thinking blocks must
+    // come back in the history of a tool loop.
+    // Only the K3 line is served there (kimi-k3, kimi-k3.1-pro, -highspeed)
+    kind: 'anthropic',
+    unsignedThinking: true,
+    baseUrl: 'https://api.moonshot.ai/anthropic/v1',
+    envKey: 'kimi',
+    // verified live: two tool_use per turn, Anthropic-style usage with cache read / write
+    capabilities: { parallel_tools: true, usage_in_stream: true },
+    // thinking counts toward max_tokens and cannot be disabled
+    maxTokensCap: 64_000,
+    includeUsage: false,
+    honorsToolChoiceNone: true,
+  },
   'openai-compatible': {
     kind: 'openai-compatible',
     baseUrl: null, // from the request; env keys are never used with it (SPEC §9.1)
@@ -129,6 +150,7 @@ const CONTEXT_PROFILES: Array<[RegExp, number]> = [
   [/^gigachat/i, 32_000],
   [/^minimax-m3/i, 1_000_000],
   [/^minimax-m2/i, 204_800],
+  [/^kimi-k3/i, 1_048_576],
 ]
 
 export function contextWindowFor(model: string, fallback: number): number {
@@ -140,10 +162,14 @@ export function providerEntry(id: ProviderId): ProviderEntry {
   return PROVIDERS[id]
 }
 
+export function hasUnsignedThinking(provider: string): boolean {
+  return PROVIDERS[provider as ProviderId]?.unsignedThinking === true
+}
+
 /**
  * The providerMetadata / providerOptions key in the AI SDK. The Anthropic adapter always
  * writes and reads `anthropic`, openai-compatible uses the name it was created with (= provider).
- * Not to be confused with `reasoning.provider`: for MiniMax it is `minimax`, so that its
+ * Not to be confused with `reasoning.provider`: for MiniMax it is `minimax` (Kimi: `kimi`), so that its
  * signature never goes to the real Anthropic and vice versa (SPEC §5.2).
  */
 export function sdkKeyFor(provider: string): string {

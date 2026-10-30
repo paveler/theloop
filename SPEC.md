@@ -539,7 +539,7 @@ schemas + history + the `max_tokens` reserve for the answer. The window is
 `llm.context_window_tokens`, else a built-in model profile (`claude-*` — 1M, 200k for
 `claude-3-*`, Opus / Sonnet 4.0, Opus 4.1 and Opus / Sonnet / Haiku 4.5; `gpt-*`,
 `deepseek-*`, `glm-*` — 1M for `glm-5.2` / `5.3*`, 200k for `glm-5` / `5.1` / `4.6` /
-`4.7`; `GigaChat*`, `MiniMax-M3*` — 1M, `MiniMax-M2*` — 204 800), else
+`4.7`; `GigaChat*`, `MiniMax-M3*` — 1M, `MiniMax-M2*` — 204 800, `kimi-k3*` — 1 048 576), else
 `MAX_CONTEXT_FALLBACK`. The estimate is a **heuristic**: `chars / 3` for Cyrillic,
 `chars / 4` for Latin, `+10 %` margin; an image is 1600 tokens. Code, emoji and dense
 punctuation can be underestimated — the margin covers that.
@@ -567,7 +567,10 @@ skipped.
 `provider` is the engine provider id (`llm.provider`), not the SDK adapter. MiniMax uses
 the Anthropic adapter, and the SDK files its signature under the `anthropic` key, but in
 the history the part is marked `minimax`: a MiniMax signature never goes to Anthropic
-and vice versa. The `providerOptions` key on replay is the one the adapter reads.
+and vice versa (Kimi likewise — `kimi`). The `providerOptions` key on replay is the one the
+adapter reads. Kimi thinking blocks are unsigned: the empty signature arrives only in
+`content_block_start`, which the adapter does not read, so the engine stores a closed
+Kimi block with `signature: ""` — without one the adapter would drop it on replay.
 
 SSE does not carry `reasoning` unless `stream.expose_reasoning` is set. The harness
 stores the part and decides whether to show `text`.
@@ -1359,7 +1362,7 @@ at `lost` runs and `unknown_calls`.
 
 ### 9.1 Allowlist by type
 
-`llm.provider` ∈ `anthropic | openai | deepseek | glm | gigachat | minimax | openai-compatible`.
+`llm.provider` ∈ `anthropic | openai | deepseek | glm | gigachat | minimax | kimi | openai-compatible`.
 Named providers are defined in code: kind (native `anthropic` / OpenAI dialect), a
 **built-in** `base_url`, the env key name, hard caps (§10), capabilities (§9.2), window
 profiles (§5.1). `openai-compatible` takes `base_url` from the request (HTTPS,
@@ -1447,6 +1450,26 @@ text — use `limits.max_tokens` of 16k or more for MiniMax. MiniMax ignores `st
 the SDK does not send it when thinking is on. Images — M3 / M3.1 only (JPEG, PNG, GIF,
 WEBP); M2.x refuse images with a provider error.
 
+**Kimi (Moonshot AI)** — an Anthropic-compatible API, `https://api.moonshot.ai/anthropic/v1`,
+the `@ai-sdk/anthropic` adapter, key in `x-api-key` (international platform,
+platform.kimi.ai). It serves the K3 line only. K3 always thinks, and the thinking blocks
+must come back in the history of a tool loop (§5.2) — the Anthropic format carries them
+natively; on the OpenAI-compatible API (`/v1`) they sit in `reasoning_content`, which the
+openai-compatible adapter does not return to the history. Thinking cannot be disabled, only
+its depth set: `output_config.effort` — `low` / `high` / `max`, provider default `max`
+(§9.3); a change of depth breaks the prefix cache. Kimi has no `thinking` request field.
+Sampling is fixed on K3 (`temperature` 1, `top_p` 0.95; other values are an error on the
+OpenAI API), so the engine does not send it (§9.3). Caching is automatic; `cache_control`
+markers are accepted, usage is Anthropic-style with cache read / write. Images — base64
+JPEG, PNG, GIF, WEBP. Rate limits — concurrency, RPM, TPM per account tier, set by the
+cumulative top-up: the lowest tier allows 3 RPM, too few for any real traffic.
+
+| Model | Window | Images | Thinking |
+|---|---|---|---|
+| `kimi-k3.1-pro` | 1 048 576 | yes | always; depth `low` / `high` / `max` |
+| `kimi-k3.1-pro-highspeed` | 1 048 576 | yes | always; same model, faster |
+| `kimi-k3` | 1 048 576 | yes | always; depth `low` / `high` / `max` |
+
 **GLM (z.ai)** — an OpenAI-compatible API, `https://api.z.ai/api/paas/v4`
 (pay-as-you-go). Coding-plan endpoints (`/api/coding/paas/v4`, `/api/anthropic`) are not
 used: that subscription is for developer tools, not products. Thinking arrives in
@@ -1481,13 +1504,14 @@ some tiers; the default `PROVIDER_MAX_CONCURRENCY_GLM` is 4 (§11.6).
 | GLM | full; ignores `tool_choice: none` — such steps go without tools (§9.1) | yes | yes (`include_usage`) | read (automatic) | `reasoning_content`, interleaved |
 | GigaChat | full, through the `functions` translator (§9.1) | no | yes (final chunk) | read (`precached_prompt_tokens`, within an `X-Session-ID` session) | — |
 | MiniMax | full (Anthropic format) | yes | yes | read / write (`cache_control`) | thinking (signed, interleaved) |
+| Kimi | full (Anthropic format) | yes | yes | read / write (automatic) | thinking (unsigned, always on) |
 | openai-compatible | as declared | `capabilities.parallel_tools`, default no | `capabilities.usage_in_stream`, default no | — | — |
 
 The engine branches on two axes: parallel tools and usage in stream (otherwise
 `estimated`). The rest is informational. One more, internal: **tool references** —
 Anthropic models with tool search (Opus / Sonnet / Haiku 4.5 and later, every Fable and
 Mythos, later versions of the same lines matched in advance) activate deferred tools
-through `tool_reference` (§6.8); every other model, MiniMax included, uses `tools_array`.
+through `tool_reference` (§6.8); every other model, MiniMax and Kimi included, uses `tools_array`.
 
 ### 9.3 Model parameters
 
@@ -1500,6 +1524,7 @@ through `tool_reference` (§6.8); every other model, MiniMax included, uses `too
 |---|---|
 | `anthropic` | Opus / Sonnet 4.6, Haiku 4.5 and older — extended thinking with `budget_tokens` as is; newer Claude models (below) — `thinking: { type: "adaptive" }` and `output_config.effort`: `high` for `budget_tokens` ≥ 16000, `medium` ≥ 4000, else `low` |
 | `minimax` | `thinking: { type: "adaptive" }`, no budget: turns thinking on for M3, M2.x always think |
+| `kimi` | `output_config.effort`, no `thinking` field: `max` for `budget_tokens` ≥ 16000, `high` ≥ 4000, else `low`; without `thinking` — `low` (thinking cannot be disabled, the provider default `max` is slow and expensive) |
 | `openai`, `openai-compatible` | `reasoning_effort`: `high` for `budget_tokens` ≥ 8000, else `medium` |
 | `glm` | without `thinking` — `thinking: { type: "disabled" }`; for `glm-5.3*` (cannot be disabled) — `reasoning_effort: "low"`; with `thinking` — `{ type: "enabled" }`, plus for 5.2+ `reasoning_effort`: `max` for `budget_tokens` ≥ 16000, `high` ≥ 4000, else `low` |
 | `deepseek`, `gigachat` | nothing — reasoning is chosen by the model or its own field; warning `llm_param_unsupported` in the journal, the run proceeds |
@@ -1512,7 +1537,8 @@ also to `temperature` together with `top_p`). The engine does not send `temperat
 `top_p` to these models; the run proceeds, and each dropped parameter is logged as warning
 `llm_param_unsupported`. Matching is a regular expression over the model id; newer versions
 of the same lines are dropped proactively: an unnecessary drop costs a warning, a miss
-costs a failed run. Opus / Sonnet 4.6, Haiku 4.5 and older accept sampling as is. `top_k`
+costs a failed run. Opus / Sonnet 4.6, Haiku 4.5 and older accept sampling as is. `kimi`
+is treated the same way: K3 sampling is fixed, `temperature` / `top_p` are not sent. `top_k`
 is not supported by the engine at all (an unknown param, §4.2). Style on newer Claude
 models is set by the prompt.
 
@@ -1543,7 +1569,7 @@ that breaks the cache, and on newer Claude models also breaks signed thinking bl
   arbitrary order;
 - the engine never rewrites history.
 
-Anthropic and MiniMax: `cache_control` is placed at four points — the Anthropic maximum:
+Anthropic, MiniMax and Kimi: `cache_control` is placed at four points — the Anthropic maximum:
 
 1. the tail of `tools` (the last non-deferred tool by name; deferred tools follow it, §6.8);
 2. `system`;
@@ -1606,7 +1632,7 @@ thinking blocks — an edit of the history. Harnesses SHOULD therefore send `cre
 In a continuation run whose last message is `tool`, the model sees the time of the
 question, not the current time. Repair synthetics (§5.4) never become the anchor.
 
-How the line is attached: for Anthropic and MiniMax — as a separate text part, with a
+How the line is attached: for Anthropic, MiniMax and Kimi — as a separate text part, with a
 cache point before the current time (§9.3). For the others — appended to the last text
 after a blank line: a single-text message stays a string, since not every
 OpenAI-compatible API accepts part arrays.
@@ -1623,7 +1649,7 @@ Time zone — `meta.timezone` (IANA), else env `DEFAULT_TIMEZONE`, else `UTC`.
 | `limits.` | Default | Server ceiling | When exceeded |
 |---|---|---|---|
 | `max_steps` (logical loop steps; transport attempts are separate, in usage and §10.2 budgets) | 8 | 32 | the last step is text-only (§10.1): `completed` + `limit_reached`, or `stopped_limit / max_steps` with the fallback answer |
-| `max_tokens` (output per call) | 4096 | per provider (Anthropic 32k, MiniMax and GLM 64k — with thinking, GigaChat 8k) | `stopped_limit / max_tokens`, text kept |
+| `max_tokens` (output per call) | 4096 | per provider (Anthropic 32k, MiniMax, Kimi and GLM 64k — with thinking, GigaChat 8k) | `stopped_limit / max_tokens`, text kept |
 | `max_tool_calls` (per run) | 16 | 64 | the batch is not executed, the next step is text-only (§10.1) |
 | `max_repeated_calls` | 1 | 3 | repeats forgiven before `tool_choice: none` (§6.7); `0` — the first repeat disables tools |
 | `max_presentations` | — (no limit) | — | presenting tools hidden and refused, presenting fences cut (§6.9) |
@@ -1817,7 +1843,7 @@ One HTTP client for tools, the callback, `openai-compatible` and images (§5.3):
 - connect and body timeouts, body size limits — §6.2.
 
 **Provider proxies.** A named provider with env `<PROVIDER>_PROXY_URL` (`ANTHROPIC_`,
-`OPENAI_`, `DEEPSEEK_`, `GLM_`, `GIGACHAT_`, `MINIMAX_`) goes through the proxy; others go
+`OPENAI_`, `DEEPSEEK_`, `GLM_`, `GIGACHAT_`, `MINIMAX_`, `KIMI_`) goes through the proxy; others go
 directly, `openai-compatible` always directly. Schemes `http:`, `https:` (CONNECT) or
 `socks5:`, credentials in the URL; a malformed URL — the engine does not start. TLS to
 the provider is end-to-end: the proxy sees only the host, never the key. The proxy
@@ -2088,7 +2114,9 @@ equivalent of the following suites.
    message, upload to `/files` once per run, an upload refusal as the attempt's answer,
    deletion at the end of the run and waiting for it on shutdown, MIME per provider);
    MiniMax through the real Anthropic adapter (URL, key, `adaptive`, signed thinking →
-   history → next step unchanged, MiniMax and Anthropic signatures never mixed); tool
+   history → next step unchanged, MiniMax and Anthropic signatures never mixed); Kimi
+   (URL, key, effort from the budget, no sampling, unsigned thinking stored with an empty
+   signature and replayed, parallel calls); tool
    ordering by name; date lines from `created_at` and the current-time anchor.
 2. **Loop on `MockLanguageModelV3`** (AI SDK): text without tools; one tool call; parallel
    calls (result order = call order); a tool error → the model continues; `accepted` +
@@ -2213,7 +2241,7 @@ SHUTDOWN_GRACE_MS=7000
 MAX_CONTEXT_FALLBACK=128000
 PROVIDER_THROTTLE=1                        # provider queue and AIMD (§11.6); 0 — off
 PROVIDER_MAX_CONCURRENCY_DEFAULT=16        # ceiling of parallel calls per provider key
-PROVIDER_MAX_CONCURRENCY_GIGACHAT=6        # likewise _ANTHROPIC / _OPENAI / _DEEPSEEK / _MINIMAX / _OPENAI_COMPATIBLE
+PROVIDER_MAX_CONCURRENCY_GIGACHAT=6        # likewise _ANTHROPIC / _OPENAI / _DEEPSEEK / _MINIMAX / _KIMI / _OPENAI_COMPATIBLE
 PROVIDER_MAX_CONCURRENCY_GLM=4
 PROVIDER_QUEUE_TIMEOUT_MS=60000            # max wait for a slot; cut by the remaining timeout_ms
 PROVIDER_THROTTLE_COOLDOWN_MS=1000         # pause in granting slots after a 429
@@ -2231,8 +2259,8 @@ LOG_DIR=                                   # disk journal (§12.4): day files he
 LOG_RETENTION_DAYS=7                       # day files older than this are deleted; 0 — today only
 LOG_DIR_MAX_BYTES=2147483648               # 2 GB; over it the oldest days are deleted first
 LOG_DISK_CONTENT_MAX_CHARS=200000          # cap of one content field on disk
-ANTHROPIC_API_KEY= OPENAI_API_KEY= DEEPSEEK_API_KEY= GLM_API_KEY= MINIMAX_API_KEY=
-ANTHROPIC_PROXY_URL= OPENAI_PROXY_URL=     # provider proxy (§11.4); likewise DEEPSEEK_ / GLM_ / GIGACHAT_ / MINIMAX_
+ANTHROPIC_API_KEY= OPENAI_API_KEY= DEEPSEEK_API_KEY= GLM_API_KEY= MINIMAX_API_KEY= KIMI_API_KEY=
+ANTHROPIC_PROXY_URL= OPENAI_PROXY_URL=     # provider proxy (§11.4); likewise DEEPSEEK_ / GLM_ / GIGACHAT_ / MINIMAX_ / KIMI_
 GIGACHAT_AUTH_KEY= GIGACHAT_SCOPE=GIGACHAT_API_PERS
 NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt   # set in the Dockerfile
 ```

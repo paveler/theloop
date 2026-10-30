@@ -178,6 +178,7 @@ export const PROVIDER_IDS = [
   'glm',
   'gigachat',
   'minimax',
+  'kimi',
   'openai-compatible',
 ] as const
 

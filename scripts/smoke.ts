@@ -66,6 +66,10 @@ const CASES: Case[] = [
     vision: true,
     maxTokens: 16_000,
   },
+  // K3 always thinks; the thinking block (empty signature) goes back on the second step.
+  // Without params.thinking the depth is low, with it — from the budget (SPEC §9.3)
+  { id: 'kimi', provider: 'kimi', model: 'kimi-k3.1-pro', envKey: 'KIMI_API_KEY', maxTokens: 16_000 },
+  { id: 'kimi-think', provider: 'kimi', model: 'kimi-k3.1-pro', envKey: 'KIMI_API_KEY', thinking: true, vision: true, maxTokens: 16_000 },
 ]
 
 /** PNG with a request code (4721) on it — the model must read the code. */
