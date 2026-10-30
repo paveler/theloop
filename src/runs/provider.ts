@@ -20,7 +20,7 @@ import type { AssistantPart } from '../contracts.js'
 import type { ErrorCode } from '../errors.js'
 import { texts, type Texts } from '../i18n.js'
 import { redactSecrets } from '../log.js'
-import { sdkKeyFor } from '../providers/allowlist.js'
+import { hasUnsignedThinking, sdkKeyFor } from '../providers/allowlist.js'
 import { GigachatOAuthError, isCertificateError } from '../providers/gigachat.js'
 import { parseRetryAfter } from '../providers/throttle.js'
 
@@ -209,6 +209,10 @@ export async function streamStep(params: StreamStepParams): Promise<StepOutcome>
               provider_metadata: Record<string, unknown>
             }
             part.provider_metadata = mergeMeta(part.provider_metadata, chunk.providerMetadata, params.provider)
+            // without a signature the adapter would drop the block from the history (SPEC §5.2)
+            if (hasUnsignedThinking(params.provider) && part.provider_metadata.signature == null) {
+              part.provider_metadata.signature = ''
+            }
           }
           break
         }

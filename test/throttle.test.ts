@@ -53,6 +53,7 @@ function settings(overrides: Partial<ThrottleSettings> = {}): ThrottleSettings {
       glm: 16,
       gigachat: 4,
       minimax: 16,
+      kimi: 16,
       'openai-compatible': 16,
     },
     queueTimeoutMs: 60_000,

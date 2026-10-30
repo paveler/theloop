@@ -128,6 +128,7 @@ const PROXY_ENV: Partial<Record<ProviderId, string>> = {
   glm: 'GLM_PROXY_URL',
   gigachat: 'GIGACHAT_PROXY_URL',
   minimax: 'MINIMAX_PROXY_URL',
+  kimi: 'KIMI_PROXY_URL',
 }
 
 const PROXY_PROTOCOLS = new Set(['http:', 'https:', 'socks5:'])
@@ -252,6 +253,7 @@ export function createConfig(env: Env = process.env): Config {
       glm: env.GLM_API_KEY,
       gigachat: env.GIGACHAT_AUTH_KEY,
       minimax: env.MINIMAX_API_KEY,
+      kimi: env.KIMI_API_KEY,
     },
     providerProxies: providerProxies(env),
     gigachatScope: env.GIGACHAT_SCOPE ?? 'GIGACHAT_API_PERS',

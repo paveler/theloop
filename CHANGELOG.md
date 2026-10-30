@@ -4,6 +4,17 @@ All notable changes to theloop. The contract is versioned separately (`contract_
 [SPEC.md](SPEC.md)); every change below is additive to it. Releases follow semver: no breaking
 changes within 1.x.
 
+## v1.3.0 — 2026-10-30
+
+### Added
+
+- **Kimi provider** (`llm.provider: "kimi"`, env `KIMI_API_KEY`, SPEC §9.1). Moonshot AI's
+  Anthropic-compatible API, K3 line (`kimi-k3.1-pro`, `-highspeed`, `kimi-k3`, 1M window).
+  `params.thinking` maps to `output_config.effort` (`low` / `high` / `max`); without it the
+  depth is `low`, since K3 always thinks and the provider default `max` is slow. Sampling is
+  not sent (fixed on K3). Kimi thinking blocks are unsigned; the engine stores them with an
+  empty signature so they go back in the history of a tool loop.
+
 ## v1.2.1 — 2026-10-29
 
 ### Fixed

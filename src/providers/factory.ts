@@ -76,8 +76,8 @@ export function isNewClaude(model: string): boolean {
 /**
  * Claude models with tool search (SPEC §9.2): the model table of the tool search docs —
  * Opus / Sonnet / Haiku 4.5 and later, every Fable and Mythos — with later versions of the
- * same lines matched in advance, like NEW_CLAUDE. MiniMax uses the Anthropic adapter but
- * its API has no defer_loading.
+ * same lines matched in advance, like NEW_CLAUDE. MiniMax and Kimi use the Anthropic adapter
+ * but their APIs have no defer_loading.
  */
 const TOOL_REFERENCE_CLAUDE = /^claude-(fable|mythos)-|^claude-(opus|sonnet|haiku)-(4-[5-9]|[5-9]|\d{2,})/i
 
@@ -106,6 +106,17 @@ export function bindsThinkingToPrefix(provider: string, model: string): boolean 
  */
 function claudeEffort(budgetTokens: number): 'low' | 'medium' | 'high' {
   return budgetTokens >= 16_000 ? 'high' : budgetTokens >= 4_000 ? 'medium' : 'low'
+}
+
+/**
+ * Kimi K3 (SPEC §9.3): thinking cannot be disabled, only its depth set through
+ * `output_config.effort` — `low` / `high` / `max`, no `medium`. The provider default is `max`,
+ * slow and expensive, so without `params.thinking` the depth is `low`. No `thinking` field:
+ * the Messages API of Kimi has none.
+ */
+function kimiEffort(thinking: { budget_tokens: number } | undefined): 'low' | 'high' | 'max' {
+  if (!thinking) return 'low'
+  return thinking.budget_tokens >= 16_000 ? 'max' : thinking.budget_tokens >= 4_000 ? 'high' : 'low'
 }
 
 /**
@@ -160,6 +171,8 @@ export function buildModel(llm: Llm, config: Config, egress: EgressClient): Reso
   const thinking = llm.params.thinking
   if (llm.provider === 'glm') {
     providerOptions.glm = glmThinking(llm.model, thinking)
+  } else if (llm.provider === 'kimi') {
+    providerOptions.anthropic = { effort: kimiEffort(thinking) }
   } else if (thinking) {
     if (llm.provider === 'minimax') {
       // MiniMax has no budget: M3 enables thinking only as `adaptive`, M2.x always
@@ -181,8 +194,9 @@ export function buildModel(llm: Llm, config: Config, egress: EgressClient): Reso
     }
   }
 
-  // new Claude models answer 400 to sampling: not sent, the run proceeds (SPEC §9.3)
-  const acceptsSampling = !newClaude
+  // new Claude models answer 400 to sampling; Kimi K3 has it fixed (temperature 1, top_p 0.95)
+  // and rejects other values on its OpenAI API. Not sent, the run proceeds (SPEC §9.3)
+  const acceptsSampling = !newClaude && llm.provider !== 'kimi'
   if (!acceptsSampling) {
     for (const param of ['temperature', 'top_p'] as const) {
       if (llm.params[param] != null) {

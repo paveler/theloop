@@ -82,7 +82,7 @@ intents, limits and everything else — [SPEC.md](SPEC.md).
   price list, with token and cost budgets.
 - **Controlled egress.** HTTPS only, host allowlist, no private IPs, no redirects, header
   filtering; provider keys never in logs, SSE, callbacks or error bodies.
-- **Providers.** Anthropic, OpenAI, DeepSeek, GLM (z.ai), GigaChat, MiniMax and any
+- **Providers.** Anthropic, OpenAI, DeepSeek, GLM (z.ai), GigaChat, MiniMax, Kimi and any
   OpenAI-compatible endpoint, with per-key queues and AIMD rate limiting.
 - **Skills and deferred tools.** `skills[]` in the `SKILL.md` shape: the model sees an index
   and loads a skill's instructions and tools mid-run. Deferred tools stay out of the context
