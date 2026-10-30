@@ -4,7 +4,7 @@ All notable changes to theloop. The contract is versioned separately (`contract_
 [SPEC.md](SPEC.md)); every change below is additive to it. Releases follow semver: no breaking
 changes within 1.x.
 
-## Unreleased
+## v1.3.0 — 2026-10-30
 
 ### Added
 
