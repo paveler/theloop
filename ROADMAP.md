@@ -66,10 +66,8 @@ Mistral, Qwen, Kimi, YandexGPT. **Local models** (Ollama, vLLM, llama.cpp, LM St
 `openai-compatible` with an explicit `EGRESS_PRIVATE_ALLOWLIST` — today private addresses are
 refused unconditionally. — **M**
 
-**1.2 Model fallbacks.** `llm.fallbacks[]`: on `provider_unavailable`, `provider_rate_limited`
-or `provider_auth` **before the first content event**, the step moves to the next model.
-Every attempt stays in `usage.calls[]` with its provider; `reasoning` parts stay tagged by
-provider, so a mixed history replays correctly. — **S**
+**1.2 Model fallbacks** — **done in v1.4.0** as `llm` given as an array (SPEC §9.5): any
+provider failure before the first content event moves the run to the next model.
 
 **1.3 Stream-delivered tools.** `tools[].transport: "stream"`: the engine does not call an
 endpoint; it emits the call with args to Bearer-authenticated SSE subscribers and waits for
