@@ -230,6 +230,12 @@ export const LlmSchema = z.object({
 
 export type Llm = z.infer<typeof LlmSchema>
 
+/** At most this many entries in an `llm` array (SPEC §9.5). */
+export const LLM_CHAIN_MAX = 5
+
+/** `llm`: one model, or a fallback chain tried in order (SPEC §9.5). */
+export const LlmFieldSchema = z.union([LlmSchema, z.array(LlmSchema).min(1).max(LLM_CHAIN_MAX)])
+
 /* ------------------------------------------------------------------ tools */
 
 export const ToolEffectSchema = z.enum(['read', 'write'])
@@ -340,7 +346,7 @@ export const RunRequestSchema = z.object({
   contract_version: z.literal(CONTRACT_VERSION),
   idempotency_key: z.string().min(1).nullish(),
   history_revision: z.union([z.number(), z.string()]).nullish(),
-  llm: LlmSchema,
+  llm: LlmFieldSchema,
   system: z.string().nullish(),
   messages: z.array(StoredMessageSchema).min(1),
   tools: z.array(ToolDefSchema).default([]),
@@ -352,6 +358,11 @@ export const RunRequestSchema = z.object({
   meta: MetaSchema,
   output_checks: z.array(OutputCheckSchema).max(OUTPUT_CHECK_LIMITS.max_checks).nullish(),
 })
+  // the engine works with the chain; `llm` is its first entry, so a single-model request reads as before
+  .transform(({ llm, ...rest }) => {
+    const chain = Array.isArray(llm) ? llm : [llm]
+    return { ...rest, llm: chain[0]!, llm_chain: chain, llm_is_array: Array.isArray(llm) }
+  })
 
 export type RunRequest = z.infer<typeof RunRequestSchema>
 
@@ -544,5 +555,22 @@ export interface RunResult {
   answer_source?: 'model' | 'fallback'
   /** What reached the user, in order; only with limits.max_presentations (SPEC §6.9). */
   presentations?: Presentation[]
+  /** The `llm` entry active at the end of the run; only when `llm` was an array (SPEC §9.5). */
+  llm_used?: LlmRef
+  /** Entries given up on, in order; only when `llm` was an array, [] — no fallback (SPEC §9.5). */
+  llm_fallbacks?: LlmFallback[]
   error: RunErrorBody | null
+}
+
+/** An entry of the `llm` array (SPEC §9.5). */
+export interface LlmRef {
+  index: number
+  provider: ProviderId
+  model: string
+}
+
+/** One switch to the next `llm` entry: which entry failed, on which step, and why (SPEC §9.5). */
+export interface LlmFallback extends LlmRef {
+  step: number
+  error: { code: string; message: string; retriable: boolean; provider_status?: number }
 }

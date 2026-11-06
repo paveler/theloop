@@ -4,6 +4,21 @@ All notable changes to theloop. The contract is versioned separately (`contract_
 [SPEC.md](SPEC.md)); every change below is additive to it. Releases follow semver: no breaking
 changes within 1.x.
 
+## Unreleased
+
+### Added
+
+- **`llm` fallback chain** (SPEC §9.5). `llm` may be an array of 1–5 full `llm` objects. The
+  run starts on the first entry; any provider failure before the first content event (auth,
+  4xx, 429, 5xx, network, queue timeout, context too large) moves it to the next entry,
+  without retrying the failed one; the last entry keeps the usual retries. The switch is
+  sticky for the rest of the run. Every entry is validated on receipt. The result carries
+  `llm_used` and `llm_fallbacks` (only for array requests); new SSE event `llm_fallback`,
+  journal event `llm_fallback`, error-webhook event `llm_fallback` for runs that survived a
+  switch, and `llm_fallbacks` in `run_failed`. Each attempt is billed at its own entry's
+  price and gets `max_tokens` clamped to its own model's cap. A single `llm` object behaves
+  exactly as before.
+
 ## v1.3.0 — 2026-10-30
 
 ### Added

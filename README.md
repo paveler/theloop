@@ -84,6 +84,9 @@ intents, limits and everything else — [SPEC.md](SPEC.md).
   filtering; provider keys never in logs, SSE, callbacks or error bodies.
 - **Providers.** Anthropic, OpenAI, DeepSeek, GLM (z.ai), GigaChat, MiniMax, Kimi and any
   OpenAI-compatible endpoint, with per-key queues and AIMD rate limiting.
+- **Fallback chain.** Send `llm` as an array, and a provider failure moves the run to the
+  next model instead of failing it. The result says which model answered and why the
+  others were skipped.
 - **Skills and deferred tools.** `skills[]` in the `SKILL.md` shape: the model sees an index
   and loads a skill's instructions and tools mid-run. Deferred tools stay out of the context
   until a skill or `search_tools` (BM25) brings them in, and the prompt cache survives

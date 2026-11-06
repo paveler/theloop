@@ -61,13 +61,18 @@ export interface AttemptRecord {
    * gets the actual estimate (§8.2); the reserve lives only in the budget.
    */
   reservedOutput?: number
+  /** The price of this attempt's model; absent — the tracker's own (SPEC §9.5: a chain mixes models). */
+  pricing?: Pricing | null
 }
 
 export class UsageTracker {
   private readonly attempts: UsageCall[] = []
   /** Alongside usage we keep the output for the budget — it may be larger. */
   private readonly budgetOutputs: number[] = []
+  /** The price each attempt is billed at: a fallback chain mixes models (SPEC §9.5). */
+  private readonly prices: Pricing[] = []
 
+  /** @param pricing the run's price list; null — no cost at all (with a chain: the first entry's, set only if every entry is priced). */
   constructor(private readonly pricing?: Pricing | null) {}
 
   record(record: AttemptRecord): UsageCall {
@@ -84,6 +89,7 @@ export class UsageTracker {
     }
     this.attempts.push(call)
     this.budgetOutputs.push(Math.max(record.tokens.output_tokens, record.reservedOutput ?? 0))
+    if (this.pricing) this.prices.push(record.pricing ?? this.pricing)
     return call
   }
 
@@ -120,7 +126,7 @@ export class UsageTracker {
     if (!this.pricing) return undefined
     const total = this.total()
     return {
-      amount: costOf(total, this.pricing),
+      amount: this.sumCost((call) => call.output_tokens),
       currency: this.pricing.currency,
       pricing_version: this.pricing.version ?? null,
       estimated: total.estimated,
@@ -139,7 +145,17 @@ export class UsageTracker {
   }
 
   spentCost(): number {
-    return this.pricing ? costOf(this.budgetTotal(), this.pricing) : 0
+    return this.pricing ? this.sumCost((call, index) => this.budgetOutputs[index] ?? call.output_tokens) : 0
+  }
+
+  /** Cost summed per attempt at its own price; failed attempts carry 0 tokens. */
+  private sumCost(output: (call: UsageCall, index: number) => number): number {
+    let amount = 0
+    this.attempts.forEach((call, index) => {
+      if (call.status === 'failed') return
+      amount += costOf({ ...call, output_tokens: output(call, index) }, this.prices[index] ?? this.pricing!)
+    })
+    return amount
   }
 
   /** Same as total(), but with the worst-case output reserve (SPEC §10.2.3). */

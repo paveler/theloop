@@ -301,6 +301,7 @@ maximum size of any incoming request body is `MAX_REQUEST_BYTES` (env, default 1
 |---|---|---|
 | `idempotency_key` | **yes if there are write tools**; otherwise no | Usually the id of the user message. A repeat with the same key while the run is retained → `200` with the same `run_id`, `stream_url`, `cancel_url` (same token), no second execution; the result is read via `GET`. Same key, different body → `409 idempotency_mismatch`. Sent to tools as `origin_request_id` (§6.1). Durable idempotency (after a restart, beyond retention) is the harness's job, by message id. |
 | `history_revision` | **yes if there are write tools**; otherwise no | History revision at request time (turn count or session record version). The engine does not interpret it and **echoes** it in the result and `GET`; the harness uses it to place late results (§3). |
+| `llm` | yes | One model (the object below), or an array of 1–5 such objects — a fallback chain tried in order (§9.5). Every `llm.*` row applies to each entry. |
 | `llm.provider` | yes | From the allowlist, §9.1. |
 | `llm.model` | yes | Free-form string, validated by the provider. |
 | `llm.api_key` | yes for `openai-compatible` | Overrides env. An env key is used **only** with the built-in `base_url` of a named provider. |
@@ -990,6 +991,7 @@ data: {"text":"Order 12345 "}
 | `snapshot` | `{ through_event_id, text, tool_calls: [{ call_id, tool, status }], step }` (+ `reasoning` with `expose_reasoning`, + `output_checks: [{ fence, attempt, status }]` with the §5.4 gate) — accumulated state **up to and including event `through_event_id`** | on connect without `Last-Event-ID`, or with an id outside the buffer window |
 | `step` | `{ index, finish_reason, usage }` | yes |
 | `output_check` | `{ fence, attempt, status, errors? }` — format gate (§5.4) | yes, if the request has `output_checks` |
+| `llm_fallback` | `{ step, from: { index, provider, model }, to: { index, provider, model }, error: { code, message } }` — the run moved to the next `llm` entry (§9.5) | yes, if `llm` is an array |
 | `done` | `{ status, finish_reason, usage, error? }` — `error` without `provider_body` (§7) | yes |
 
 - By default only text and anonymized progress go out: tool results may contain tenant
@@ -1099,7 +1101,8 @@ query again in a run is a §6.7 repeat. The query is model text: in the journal 
 `content` only.
 
 **Activation mechanisms**, one per run, chosen from the model (§9.2) and written to
-`run_start` as `activation`:
+`run_start` as `activation`. With an `llm` chain (§9.5) it is `tool_reference` only if every
+entry supports it, so a fallback never changes the mechanism mid-run:
 
 - `tool_reference` — Anthropic models with tool search. Every step carries every tool:
   non-deferred by name (built-ins among them), then deferred by name with
@@ -1249,6 +1252,10 @@ endpoints are **not** covered by the signature — they have their own `tools[].
   run locale (Appendix B); `code` is the stable machine field. `provider_body` only with
   `ENGINE_TOKEN` (callback, `GET`, `cancel`): a provider body may quote the prompt, so SSE
   `done` and run-token `cancel` return `error` without it (§4.4, §6.6).
+- `llm_used: { index, provider, model }` — the `llm` entry active at the end of the run;
+  `llm_fallbacks: [{ index, provider, model, step, error: { code, message, retriable,
+  provider_status? } }]` — the entries given up on, in order, `[]` — none. Both only when
+  `llm` was an array (§9.5); a single-object request never carries them.
 - `tool_calls[].status`: `ok | error | timeout | deferred | cancelled | not_executed |
   presentation_limit | duplicate_write_intent | http_error | protocol_error`.
 - `presentations` — what reached the user, in order (§6.9); only with
@@ -1350,7 +1357,9 @@ If the request has `llm.pricing`, the engine computes
 `cost = (input·p.input + output·p.output + cache_read·p.cache_read + cache_write·p.cache_write) / per_tokens`
 per attempt and in total; for the example above `(3830·3 + 310·15 + 3450·0.3) / 10⁶ =
 0.017175`. `pricing_version` is echoed for recalculation. No price list — no `cost` and
-no `limits.max_cost`.
+no `limits.max_cost`. With an `llm` chain (§9.5) each attempt is billed at its own entry's
+price, `cost` and `max_cost` need a price on every entry, and `pricing_version` is the first
+entry's.
 
 ### 8.4 Reconciliation
 
@@ -1643,6 +1652,63 @@ For other providers — inside the same single system message after a blank line
 answers `422` to a second system message.
 
 Time zone — `meta.timezone` (IANA), else env `DEFAULT_TIMEZONE`, else `UTC`.
+
+### 9.5 Fallback chain
+
+`llm` MAY be an array of 1–5 entries, each a full `llm` object (§4.2) with its own
+`provider`, `model`, key, `params`, `pricing` and window. The engine starts on entry 0; a
+provider failure moves the run to the next entry, and the run reports which entry answered.
+A single object behaves exactly as before; a one-entry array is the same run plus the
+`llm_used` / `llm_fallbacks` fields.
+
+- **Checked on receipt.** Every entry is validated before the run starts — allowlist, key,
+  `base_url` egress, image support (§5.3) — with the usual `400`s. A broken fallback is a
+  refused request, not a surprise when the primary goes down. Prices of different entries
+  MUST share a currency (`400 bad_request`).
+- **What moves the run.** Any provider failure of an attempt **before its first content
+  event**: auth, 4xx, 429, 5xx, network, `provider_queue_timeout`, and
+  `context_too_large` (the next model may have a larger window; the prompt is trimmed again
+  for it). The failed entry is not retried: retries (§11.3) are only for the last entry.
+- **What does not.** A failure after the first content event stays
+  `provider_stream_interrupted` (§11.3: the client has seen text). Cancel, `run_timeout` and
+  budget limits are not provider failures. No fallback once `timeout_ms` has run out.
+- **Sticky, never back.** The entry that answered serves the rest of the run. A failure on a
+  later step moves forward from there; earlier entries are not tried again. The next run
+  starts on entry 0.
+- **Per step, rebuilt prompt.** A switch rebuilds the step's prompt for the new provider:
+  its message format, its window for trimming (§5.1), its cache markers. Reasoning parts of
+  another provider are not replayed (§5.2). Each attempt gets `limits.max_tokens` clamped to
+  its own model's cap.
+- **One run, shared limits.** Steps, tool calls and `max_total_tokens` count across entries
+  and are not reset by a switch. `usage.calls[]` names the provider and model of every
+  attempt; each is billed at its own entry's price (§8.3).
+- **Skills.** One activation mechanism per run: `tool_reference` only if every entry
+  supports it (§6.8).
+- **Every entry failed** → `failed / <last error.code>`, the last error in `error`,
+  the earlier ones in `llm_fallbacks`.
+
+Reported in the result (§7: `llm_used`, `llm_fallbacks`), on SSE (§6.6: `llm_fallback`),
+in the journal (§12.4: `llm_fallback`) and on the error webhook (§12.3: `llm_fallback` for a
+run that survived a switch, `llm_fallbacks` in `run_failed`), so a failing primary is never
+silent even when every run still answers.
+
+```json
+"llm": [
+  { "provider": "anthropic", "model": "claude-sonnet-5", "api_key": "sk-ant-…" },
+  { "provider": "openai", "model": "gpt-5.1", "api_key": "sk-…" }
+]
+```
+
+Result of a run whose primary was down:
+
+```json
+"llm_used": { "index": 1, "provider": "openai", "model": "gpt-5.1" },
+"llm_fallbacks": [
+  { "index": 0, "provider": "anthropic", "model": "claude-sonnet-5", "step": 1,
+    "error": { "code": "provider_unavailable", "message": "…", "retriable": true,
+               "provider_status": 529 } }
+]
+```
 
 ## 10. Limits and timeouts
 
@@ -1989,7 +2055,8 @@ If env `ERROR_WEBHOOK_URL` is set, the engine POSTs JSON to it:
 | `event` | When | Fields beyond the common ones |
 |---|---|---|
 | `callback_failed` | all callback attempts exhausted (§7) | `status`, `finish_reason`, `callback { url, attempts, last_error }` |
-| `run_failed` | a run finished `failed` | `status`, `finish_reason`, `error { code, message, retriable, provider_status }`, `provider`, `model` |
+| `run_failed` | a run finished `failed` | `status`, `finish_reason`, `error { code, message, retriable, provider_status }`, `provider`, `model`; `llm_fallbacks` if an `llm` chain switched (§9.5) |
+| `llm_fallback` | a run that did not fail switched to a later `llm` entry (§9.5) | `status`, `finish_reason`, `llm_used`, `llm_fallbacks` |
 | `ack_missing` | a terminal run was deleted without `ack` (§3.1) — the session lock hung for the whole retention | `status`, `reason` |
 | `run_crashed` | an exception in the loop bypassed normal handling | `error { message }` |
 | `unhandled_error` | an unhandled exception in the HTTP layer (`500 internal_error`) | `path`, `error { message }` |
@@ -2055,12 +2122,13 @@ without `LOG_DIR` a restart or deploy means an empty journal.
 | `run_replayed` | info | a repeat by `idempotency_key` returned an existing run | — |
 | `locale_unsupported` | warn | `meta.locale` is not a supported locale (Appendix B): `requested`, `locale` — the one the run uses | — |
 | `llm_param_unsupported` | warn | an `llm.params` entry is not supported by the provider or model and was not sent (§9.3): `param`, `provider`, `model` | — |
-| `run_start` | info | start: model, tools as `name:effect`, limits, window, cache, history by role, `meta`, callback | `system_sha256` (`system` when read back, §4.9), `history_tail` (the last 6 messages as a string) |
+| `run_start` | info | start: model (`llm_chain` as `provider:model` with an `llm` array of 2+, §9.5), tools as `name:effect`, limits, window, cache, history by role, `meta`, callback | `system_sha256` (`system` when read back, §4.9), `history_tail` (the last 6 messages as a string) |
 | `step_start` | debug | before a step: messages in the prompt, token estimate, `tools_disabled`, `tool_calls_used`, `final_answer_step: true` on the text-only final step (§10.1), `empty_answer_reask: true` on the re-ask after an empty answer (§10.1 rule 8), `presentations_used` with `max_presentations`, `tools_visible` without hidden presenting tools | `engine_note` on the final step and the re-ask |
 | `context_trimmed` | warn | context trimmed (§5.1): messages before / after, estimate, window | — |
 | `thinking_blocks_dropped` | info | the provider dropped stale thinking blocks after an engine-made prefix edit (§9.3): `step`, `dropped`, `reasons` | — |
 | `provider_attempt` | info | every provider attempt (§8): status, `finish_reason`, tokens, `provider_request_id` | — |
-| `provider_failure` | warn | an attempt failed: `kind`, `code`, `message`, `provider_status`, `retry_in_ms`, `retry_after_ms` (the provider's `Retry-After`), `retry_skipped` — `retries_exhausted \| run_deadline`; for 429 — `rate_limit_retry` (429 retries so far) | `provider_body`, `partial_text` |
+| `llm_fallback` | warn | the run moved to the next `llm` entry (§9.5): `step`, `from`, `to` (`{ index, provider, model }`), `code`, `provider_status` | — |
+| `provider_failure` | warn | an attempt failed: `kind`, `code`, `message`, `provider_status`, `retry_in_ms`, `retry_after_ms` (the provider's `Retry-After`), `retry_skipped` — `retries_exhausted \| run_deadline \| llm_fallback`; for 429 — `rate_limit_retry` (429 retries so far) | `provider_body`, `partial_text` |
 | `provider_queue_wait` | info / warn | an attempt waited in the provider queue (§11.6): `outcome` — `granted \| timeout \| aborted`, `wait_ms`, `queue_depth`, `limit`, `active`, `queue_timeout_ms`, `throttle_key`; no event for an immediate slot | — |
 | `provider_throttle` | warn / info | AIMD changed a key's ceiling (§11.6): `direction` — `down` (429: `limit_from` → `limit_to`, `cooldown_ms`, `retry_after_ms`, `run_id` of the run) or `up` (a success streak); `provider`, `throttle_key`, `max`, `active`, `queued` | — |
 | `step_done` | info | a step finished: `finish_reason`, tokens, tool call names | `text`, `reasoning`, `tool_calls` with args |
@@ -2088,7 +2156,7 @@ without `LOG_DIR` a restart or deploy means an empty journal.
 | `tool_protocol_error` | error / warn | a write tool answered anything but `deferred`, or `deferred` without `operation_id` | `body` |
 | `tool_calls_sealed` | info | unresolved tool calls got a synthetic error (§6.5, §10.1) | — |
 | `run_timeout` | warn | `limits.timeout_ms` fired | — |
-| `run_done` | info / error | terminal: status, reason, steps, tools, tokens, cost, error, `context_tokens`, `context_window` (`result.context`, §7), `limit_reached`, `answer_source` | `answer`, `provider_body` |
+| `run_done` | info / error | terminal: status, reason, steps, tools, tokens, cost, error, `context_tokens`, `context_window` (`result.context`, §7), `limit_reached`, `answer_source`, `llm_used` + `llm_fallbacks` (count) after a switch | `answer`, `provider_body` |
 | `gigachat_files_deleted` | info / warn | end of a run that uploaded images to GigaChat (§5.3): `files`, `failed`, `errors` for undeleted ones | — |
 | `run_failed`, `run_crashed`, `unhandled_error` | error | an exception bypassed normal handling, with `stack` | — |
 | `callback_attempt_failed` | warn | a callback attempt failed: `error`, `next_in_ms`, `shutdown` (an attempt in shutdown mode, §11.1) | — |
@@ -2133,7 +2201,10 @@ equivalent of the following suites.
    empty-answer re-ask (note, dropped empty message, every fallback reason, `max_steps: 1`,
    the final step winning, `final_answer: false`); cancel
    mid-stream (partial + synthetic tool errors + `unknown`); run timeout; provider retries
-   with attempt records.
+   with attempt records; the §9.5 `llm` chain (every failure kind moves on, no retry of a
+   non-last entry, the last keeps its retries, sticky across steps, a later-step switch, no
+   switch after content, all entries failing, per-entry `max_tokens` and price, SSE and
+   webhook signals).
 3. **HTTP end-to-end** in-process (Hono `app.request` + fake tool server + fake callback):
    `POST /runs` → SSE → callback; `wait: true`; `idempotency_key` (same / mismatch); a write
    tool without `idempotency_key` / `meta.session_id` / `history_revision` →
