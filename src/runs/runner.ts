@@ -17,6 +17,9 @@ import {
   type AssistantPart,
   type FinalAnswerLimit,
   type Limits,
+  type Llm,
+  type LlmFallback,
+  type LlmRef,
   type OutputCheckFailReason,
   type OutputCheckResult,
   type Presentation,
@@ -37,6 +40,7 @@ import { sendAlert } from '../alerts.js'
 import { sha256 } from '../ids.js'
 import { log, safeUrl } from '../log.js'
 import type { ResolvedModel } from '../providers/factory.js'
+import type { LlmCandidate } from './validate.js'
 import {
   rateLimitBackoff,
   throttleLabel,
@@ -105,7 +109,8 @@ export interface RunnerDeps {
 
 export interface RunPlan {
   request: RunRequest
-  resolved: ResolvedModel
+  /** The `llm` chain in order (SPEC §9.5); a single-model request has one entry. */
+  candidates: LlmCandidate[]
   limits: Limits
   /** Format gate for the final answer (SPEC §5.4); [] — no checks, the loop as before. */
   outputChecks: CompiledOutputCheck[]
@@ -135,14 +140,18 @@ class RunExecution {
   private toolSet: ToolSet = {}
   /** Skills version + presenting tools hidden: the tool set is rebuilt when either changes. */
   private toolSetKey = ''
-  private readonly resolveImage: (url: string) => Promise<{ data: Uint8Array; mediaType: string }>
+  private resolveImage!: (url: string) => Promise<{ data: Uint8Array; mediaType: string }>
   /** `system` with the skill index (SPEC §6.8). */
   private readonly systemText: string | null
   private readonly systemTokens: number
   /** Schemas of the visible tools only: deferred tools cost nothing until activated. */
   private toolTokens = 0
-  private readonly cacheEnabled: boolean
+  private cacheEnabled = false
   private readonly skills: SkillState
+  /** The active `llm` entry (SPEC §9.5): moves forward on a provider failure, never back. */
+  private llmIndex = 0
+  /** Entries given up on, in order — result.llm_fallbacks. */
+  private readonly llmFallbacks: LlmFallback[] = []
   private readonly restored: Restored
 
   private seq = 0
@@ -194,32 +203,30 @@ class RunExecution {
     private readonly plan: RunPlan,
     private readonly deps: RunnerDeps,
   ) {
-    this.usage = new UsageTracker(plan.request.llm.pricing)
+    // a cost needs a price for every attempt: with a chain, every entry must be priced (SPEC §9.5)
+    const priced = plan.candidates.every((c) => c.llm.pricing)
+    this.usage = new UsageTracker(priced ? this.llm.pricing : null)
     record.liveUsage = () => this.usage.snapshot()
 
     for (const def of plan.request.tools) this.toolsByName.set(def.name, def)
 
-    this.cacheEnabled = plan.resolved.supportsCacheControl && plan.request.llm.params.cache !== false
     // engine text locale (SPEC Appendix B) — before anything that writes text for the model
     const locale = resolveLocale(plan.request.meta.locale, deps.config.engineLocale)
     if (locale.unsupported) {
       log.warn('locale_unsupported', { run_id: record.runId, requested: locale.unsupported, locale: locale.locale })
     }
     this.texts = texts(locale.locale)
-    this.skills = new SkillState(plan.request, plan.resolved.toolReferences, this.texts)
+    // one activation mechanism for the whole run: tool_reference only if every entry has it (SPEC §9.5)
+    this.skills = new SkillState(
+      plan.request,
+      plan.candidates.every((c) => c.resolved.toolReferences),
+      this.texts,
+    )
+    this.applyLlm()
     this.restored = this.skills.restore(plan.request.messages)
-    this.refreshTools()
     const index = this.skills.index()
     const system = plan.request.system && plan.request.system.trim().length > 0 ? plan.request.system : null
     this.systemText = index ? (system ? `${system}\n\n${index}` : index) : (plan.request.system ?? null)
-    this.resolveImage = createImageResolver(
-      deps.egress,
-      deps.config,
-      record.abort.signal,
-      plan.resolved.providerId,
-      this.texts,
-    )
-
     const timezone =
       typeof plan.request.meta.timezone === 'string' && plan.request.meta.timezone
         ? plan.request.meta.timezone
@@ -228,13 +235,74 @@ class RunExecution {
     this.dateLine = engineDateLine(timezone, new Date(), this.texts)
     this.dateAnchor = plan.request.messages.findLast((m) => m.role === 'user') ?? null
     this.systemTokens = estimateTokens(this.systemText ?? '') + estimateTokens(this.dateLine)
+  }
 
+  /** The active `llm` entry. */
+  private get llm(): Llm {
+    return this.plan.candidates[this.llmIndex]!.llm
+  }
+
+  private get resolved(): ResolvedModel {
+    return this.plan.candidates[this.llmIndex]!.resolved
+  }
+
+  /** limits.max_tokens clamped to the active model's cap: a chain resolves limits against its largest (SPEC §9.5). */
+  private get maxTokens(): number {
+    return Math.min(this.plan.limits.max_tokens, this.resolved.maxTokensCap)
+  }
+
+  /** Everything that depends on the provider, set for the active entry — at start and after a fallback. */
+  private applyLlm(): void {
+    const { record, deps } = this
+    this.cacheEnabled = this.resolved.supportsCacheControl && this.llm.params.cache !== false
+    this.cacheCreated = false
+    this.toolSetKey = ''
+    this.refreshTools()
+    this.resolveImage = createImageResolver(
+      deps.egress,
+      deps.config,
+      record.abort.signal,
+      this.resolved.providerId,
+      this.texts,
+    )
     // GigaChat's cache lives in a session (SPEC §9.1): all steps and chat turns go into one. Hashed so
     // the client's id never reaches the provider and the header does not break on non-ASCII
-    const sessionHeader = plan.resolved.sessionHeader
+    const sessionHeader = this.resolved.sessionHeader
     this.providerHeaders = sessionHeader
       ? { [sessionHeader]: sha256(record.sessionId ?? record.runId).slice(0, 32) }
       : undefined
+  }
+
+  /** A failure may move the run to the next `llm` entry (SPEC §9.5): one left, time left, not aborted. */
+  private canFallback(): boolean {
+    return (
+      this.llmIndex < this.plan.candidates.length - 1 &&
+      !this.record.abort.signal.aborted &&
+      Date.now() < this.deadline
+    )
+  }
+
+  /** Gives up on the active entry and moves to the next one; the caller rebuilds the prompt for it. */
+  private fallBack(step: number, error: LlmFallback['error']): void {
+    const from = this.llmRef()
+    this.llmFallbacks.push({ ...from, step, error })
+    this.llmIndex++
+    this.applyLlm()
+    const to = this.llmRef()
+    log.warn('llm_fallback', {
+      run_id: this.record.runId,
+      step,
+      from,
+      to,
+      code: error.code,
+      provider_status: error.provider_status,
+      ...this.repairFields(),
+    })
+    this.record.sse.emit('llm_fallback', { step, from, to, error: { code: error.code, message: error.message } })
+  }
+
+  private llmRef(): LlmRef {
+    return { index: this.llmIndex, provider: this.resolved.providerId, model: this.llm.model }
   }
 
   private readonly timezone: string
@@ -244,7 +312,7 @@ class RunExecution {
   private readonly dateLine: string
   /** The request's last user message: without created_at, the current time goes at its end (SPEC §9.4). */
   private readonly dateAnchor: StoredMessage | null
-  private readonly providerHeaders: Record<string, string> | undefined
+  private providerHeaders: Record<string, string> | undefined
 
   /**
    * The tool set and its token estimate, rebuilt only when the visible set changed. Tools go
@@ -313,8 +381,11 @@ class RunExecution {
       {
         run_id: record.runId,
         session_id: record.sessionId,
-        provider: plan.resolved.providerId,
-        model: request.llm.model,
+        provider: this.resolved.providerId,
+        model: this.llm.model,
+        ...(plan.candidates.length > 1
+          ? { llm_chain: plan.candidates.map((c) => `${c.resolved.providerId}:${c.llm.model}`) }
+          : {}),
         idempotency_key: request.idempotency_key ?? null,
         history_revision: request.history_revision ?? null,
         wait: request.wait,
@@ -324,7 +395,7 @@ class RunExecution {
           ? { skills: this.skills.skillNames(), activation: this.skills.mechanism, tool_search: this.skills.toolSearch }
           : {}),
         limits: plan.limits,
-        context_window: plan.resolved.contextWindow,
+        context_window: this.resolved.contextWindow,
         cache: this.cacheEnabled,
         history: { messages: request.messages.length, ...roles },
         meta: request.meta,
@@ -347,8 +418,8 @@ class RunExecution {
 
     record.sse.emit('start', {
       run_id: record.runId,
-      provider: plan.resolved.providerId,
-      model: plan.request.llm.model,
+      provider: this.resolved.providerId,
+      model: this.llm.model,
     })
 
     this.deadline = Date.now() + plan.limits.timeout_ms
@@ -412,8 +483,7 @@ class RunExecution {
       const reask = !final && this.emptyReask
       const note = final ? this.texts.finalAnswerNote(final) : reask ? this.texts.emptyAnswerNote : undefined
 
-      const prompt = await this.buildPrompt(step, [], note)
-      const outcome = await this.callProvider(prompt, step, final || reask ? 'final' : 'main')
+      const outcome = await this.callProvider(() => this.buildPrompt(step, [], note), step, final || reask ? 'final' : 'main')
       if (typeof outcome === 'string') {
         // a final step that hit a budget or a provider failure did not finish the run itself
         if ((final || reask) && !this.finished) {
@@ -432,7 +502,7 @@ class RunExecution {
 
       if (outcome.toolCalls.length === 0) {
         if (partialByLength) {
-          this.logLimit('max_tokens', { step, max_tokens: limits.max_tokens })
+          this.logLimit('max_tokens', { step, max_tokens: this.maxTokens })
           this.finish('stopped_limit', 'max_tokens')
           return
         }
@@ -480,7 +550,7 @@ class RunExecution {
       // §10.1: step boundaries — tools of the last allowed step are not executed,
       // a batch larger than the remaining max_tool_calls is not executed at all
       if (partialByLength) {
-        this.logLimit('max_tokens', { step, max_tokens: limits.max_tokens, pending_tool_calls: outcome.toolCalls.length })
+        this.logLimit('max_tokens', { step, max_tokens: this.maxTokens, pending_tool_calls: outcome.toolCalls.length })
         this.sealUnresolvedToolCalls('not_executed: max_tokens', 'not_executed')
         this.finish('stopped_limit', 'max_tokens')
         return
@@ -578,8 +648,8 @@ class RunExecution {
       messages: history,
       systemTokens: this.systemTokens,
       toolTokens: this.toolTokens,
-      reserveTokens: plan.limits.max_tokens,
-      contextWindow: plan.resolved.contextWindow,
+      reserveTokens: this.maxTokens,
+      contextWindow: this.resolved.contextWindow,
       dates: { timezone: this.timezone, texts: this.texts },
       ...(this.skills.enabled ? { pinned: (block) => this.skills.isPinned(block) } : {}),
     })
@@ -591,14 +661,14 @@ class RunExecution {
         messages_before: history.length,
         messages_after: trim.messages.length,
         estimated_tokens: trim.estimatedTokens,
-        context_window: plan.resolved.contextWindow,
+        context_window: this.resolved.contextWindow,
       })
     }
 
     // trimming may have dropped the last user message — then the date goes into system
     const anchor = this.dateAnchor && trim.messages.includes(this.dateAnchor) ? this.dateAnchor : null
     const converted = await toModelMessages(trim.messages, {
-      provider: plan.resolved.providerId,
+      provider: this.resolved.providerId,
       resolveImage: this.resolveImage,
       dates: { timezone: this.timezone, anchor, now: this.dateLine },
       cacheBreakpoints: this.cacheEnabled,
@@ -609,7 +679,7 @@ class RunExecution {
 
     const historyTokens = Math.max(
       0,
-      trim.estimatedTokens - this.systemTokens - this.toolTokens - plan.limits.max_tokens,
+      trim.estimatedTokens - this.systemTokens - this.toolTokens - this.maxTokens,
     )
     log.debug('step_start', {
       run_id: this.record.runId,
@@ -628,8 +698,8 @@ class RunExecution {
     }, engineNote ? { engine_note: engineNote } : undefined)
     // the engine's own edit of a signed prefix: stale thinking blocks are dropped, not a 400 (SPEC §9.3)
     const dropStaleThinking =
-      plan.resolved.thinkingPrefixBinding === true &&
-      editsSignedPrefix(trim.messages, { provider: plan.resolved.providerId, trimmed: trim.trimmed, anchor })
+      this.resolved.thinkingPrefixBinding === true &&
+      editsSignedPrefix(trim.messages, { provider: this.resolved.providerId, trimmed: trim.trimmed, anchor })
     return { messages: [...system, ...converted], historyTokens, dropStaleThinking }
   }
 
@@ -643,20 +713,26 @@ class RunExecution {
    * `final` — the text-only final step on a limit (§10.1): tool_choice none, tool_call is not
    * sent to SSE; a budget or a provider failure after retries does not end the run — the
    * caller ends it with the fallback answer.
+   *
+   * A failure before the first content event with another `llm` entry left moves the run to it
+   * (SPEC §9.5): no retries of the failed entry, the prompt is rebuilt for the new provider.
+   *
+   * @param build the step's prompt for the active entry; called again after a fallback.
    */
   private async callProvider(
-    prompt: Prompt,
+    build: () => Promise<Prompt>,
     step: number,
     mode: 'main' | 'repair' | 'final' = 'main',
   ): Promise<StepOutcome | 'budget_exceeded' | 'aborted' | 'failed'> {
     const { plan, record } = this
     const repair = mode === 'repair'
-    const params = plan.request.llm.params
+    let prompt = await build()
     let separated = false
     let rateLimitRetries = 0
     let otherRetries = 0
 
     for (let attempt = 1; ; attempt++) {
+      const params = this.llm.params
       // budgets — before EVERY attempt, including transport retries (SPEC §10.2).
       // With message caching the history is a worst-case cache write: it costs more than plain input
       const cacheable = this.cacheEnabled ? this.systemTokens + this.toolTokens : 0
@@ -666,10 +742,10 @@ class RunExecution {
           input: this.cacheEnabled ? 0 : prompt.historyTokens + this.systemTokens + this.toolTokens,
           cacheWrite: (this.cacheEnabled ? prompt.historyTokens : 0) + (this.cacheCreated ? 0 : cacheable),
           cacheRead: this.cacheCreated ? cacheable : 0,
-          output: plan.limits.max_tokens,
+          output: this.maxTokens,
         },
         plan.limits,
-        plan.request.llm.pricing,
+        this.llm.pricing,
       )
       if (!budget.ok) {
         this.logLimit(budget.exceeded!, {
@@ -700,6 +776,17 @@ class RunExecution {
         // time ran out in the queue — provider_queue_timeout; cancel / shutdown in the queue
         // and a run aborted before it reached the queue are a plain abort
         const timedOut = isQueueTimeout(ticket, record.abortReason)
+        if (timedOut && this.canFallback()) {
+          this.fallBack(step, {
+            code: 'provider_queue_timeout',
+            message: this.texts.queueTimeout(this.resolved.providerId, ticket.waitedMs, ticket.queueDepth, ticket.limit),
+            retriable: true,
+          })
+          prompt = await build()
+          rateLimitRetries = 0
+          otherRetries = 0
+          continue
+        }
         if (repair) return ticket.kind === 'aborted' ? 'aborted' : 'failed'
         if (!timedOut) {
           this.finishAborted()
@@ -707,7 +794,7 @@ class RunExecution {
         }
         this.finish('failed', 'provider_queue_timeout', {
           code: 'provider_queue_timeout',
-          message: this.texts.queueTimeout(plan.resolved.providerId, ticket.waitedMs, ticket.queueDepth, ticket.limit),
+          message: this.texts.queueTimeout(this.resolved.providerId, ticket.waitedMs, ticket.queueDepth, ticket.limit),
           retriable: true,
         })
         return 'failed'
@@ -721,21 +808,21 @@ class RunExecution {
       try {
         outcome = await streamStep({
           texts: this.texts,
-          model: plan.resolved.model,
-          provider: plan.resolved.providerId,
+          model: this.resolved.model,
+          provider: this.resolved.providerId,
           messages: prompt.messages,
           // a provider that calls tools even with none simply does not get them on such steps (SPEC §9.2)
-          tools: noTools && !plan.resolved.honorsToolChoiceNone ? {} : this.toolSet,
+          tools: noTools && !this.resolved.honorsToolChoiceNone ? {} : this.toolSet,
           ...(noTools ? { toolChoice: 'none' as const } : {}),
-          maxTokens: plan.limits.max_tokens,
+          maxTokens: this.maxTokens,
           // newer Claude models reject sampling params — the factory cleared the flag (SPEC §9.3)
-          temperature: plan.resolved.acceptsSampling ? params.temperature : undefined,
-          topP: plan.resolved.acceptsSampling ? params.top_p : undefined,
+          temperature: this.resolved.acceptsSampling ? params.temperature : undefined,
+          topP: this.resolved.acceptsSampling ? params.top_p : undefined,
           stopSequences: params.stop,
           seed: params.seed,
           providerOptions: prompt.dropStaleThinking
-            ? withDropBlock(plan.resolved.providerOptions)
-            : plan.resolved.providerOptions,
+            ? withDropBlock(this.resolved.providerOptions)
+            : this.resolved.providerOptions,
           ...(this.providerHeaders ? { headers: this.providerHeaders } : {}),
           abortSignal: record.abort.signal,
           onTextDelta: (text) => {
@@ -785,9 +872,13 @@ class RunExecution {
 
       this.recordAttempt(outcome, outcome.failure.kind, prompt.historyTokens, attempt)
       const rateLimited = outcome.failure.code === 'provider_rate_limited'
+      // any failure before content moves to the next entry instead of retrying this one (SPEC §9.5)
+      const fallback = !outcome.sawContent && this.canFallback()
       // no retry after the first content event (below); 429 has its own ladder
-      const retry =
-        outcome.sawContent || !outcome.failure.retriable
+      const retry: { delayMs: number | null; skipped: 'retries_exhausted' | 'run_deadline' | 'llm_fallback' | undefined } =
+        fallback
+          ? { delayMs: null, skipped: 'llm_fallback' }
+          : outcome.sawContent || !outcome.failure.retriable
           ? { delayMs: null, skipped: undefined }
           : rateLimited
             ? this.rateLimitRetryDelay(rateLimitRetries + 1, outcome.failure.retryAfterMs)
@@ -795,7 +886,7 @@ class RunExecution {
               ? { delayMs: PROVIDER_RETRY_DELAYS_MS[otherRetries]!, skipped: undefined }
               : { delayMs: null, skipped: 'retries_exhausted' as const }
       // the final step does not wait out retries for a model that keeps calling tools: the fallback answers now
-      if (mode === 'final' && outcome.failure.toolChoiceViolation) {
+      if (mode === 'final' && outcome.failure.toolChoiceViolation && !fallback) {
         this.finalIgnoredNone = true
         retry.delayMs = null
       }
@@ -806,7 +897,7 @@ class RunExecution {
           run_id: record.runId,
           step,
           attempt,
-          provider: plan.resolved.providerId,
+          provider: this.resolved.providerId,
           kind: outcome.failure.kind,
           code: outcome.failure.code,
           message: outcome.failure.message,
@@ -835,6 +926,19 @@ class RunExecution {
           ...(outcome.failure.providerBody ? { provider_body: outcome.failure.providerBody } : {}),
         })
         return 'failed'
+      }
+
+      if (fallback) {
+        this.fallBack(step, {
+          code: outcome.failure.code,
+          message: outcome.failure.message,
+          retriable: outcome.failure.retriable,
+          ...(outcome.failure.providerStatus ? { provider_status: outcome.failure.providerStatus } : {}),
+        })
+        prompt = await build()
+        rateLimitRetries = 0
+        otherRetries = 0
+        continue
       }
 
       if (willRetry) {
@@ -869,7 +973,7 @@ class RunExecution {
     const { plan, record, deps } = this
     const remaining = Math.max(0, this.deadline - Date.now())
     const timeoutMs = Math.min(deps.throttle.settings.queueTimeoutMs, remaining)
-    const ticket = await deps.throttle.acquire(plan.resolved.throttleKey, record.abort.signal, timeoutMs)
+    const ticket = await deps.throttle.acquire(this.resolved.throttleKey, record.abort.signal, timeoutMs)
     this.queueWaitMs += ticket.waitedMs
     // queueDepth 0 — never queued: the slot was granted at once or the run was aborted before the queue
     if (ticket.queueDepth > 0) {
@@ -879,8 +983,8 @@ class RunExecution {
         run_id: record.runId,
         step,
         attempt,
-        provider: plan.resolved.providerId,
-        throttle_key: throttleLabel(plan.resolved.throttleKey),
+        provider: this.resolved.providerId,
+        throttle_key: throttleLabel(this.resolved.throttleKey),
         outcome,
         wait_ms: ticket.waitedMs,
         queue_depth: ticket.queueDepth,
@@ -922,8 +1026,8 @@ class RunExecution {
         run_id: this.record.runId,
         step: this.steps,
         attempt,
-        provider: plan.resolved.providerId,
-        model: plan.request.llm.model,
+        provider: this.resolved.providerId,
+        model: this.llm.model,
         status: last?.status,
         ...this.repairFields(),
         aborted: outcome.aborted || undefined,
@@ -942,8 +1046,9 @@ class RunExecution {
     if (kind === 'failed') {
       this.usage.record({
         status: 'failed',
-        provider: plan.resolved.providerId,
-        model: plan.request.llm.model,
+        provider: this.resolved.providerId,
+        model: this.llm.model,
+        pricing: this.llm.pricing,
         tokens: {
           input_tokens: 0,
           output_tokens: 0,
@@ -963,12 +1068,13 @@ class RunExecution {
     const reported = normalizeUsage(outcome.usage)
     const hasReported = outcome.usage?.inputTokens != null || outcome.usage?.outputTokens != null
 
-    if (kind === 'ok' && hasReported && plan.resolved.capabilities.usage_in_stream) {
+    if (kind === 'ok' && hasReported && this.resolved.capabilities.usage_in_stream) {
       if (reported.cache_read_tokens > 0 || reported.cache_write_tokens > 0) this.cacheCreated = true
       const call = this.usage.record({
         status: 'ok',
-        provider: plan.resolved.providerId,
-        model: plan.request.llm.model,
+        provider: this.resolved.providerId,
+        model: this.llm.model,
+        pricing: this.llm.pricing,
         tokens: reported,
         finishReason: outcome.finishReason,
         durationMs: outcome.durationMs,
@@ -994,15 +1100,16 @@ class RunExecution {
     }
     const call = this.usage.record({
       status: kind === 'ok' ? 'ok' : 'unknown',
-      provider: plan.resolved.providerId,
-      model: plan.request.llm.model,
+      provider: this.resolved.providerId,
+      model: this.llm.model,
+      pricing: this.llm.pricing,
       tokens,
       finishReason: outcome.finishReason,
       durationMs: outcome.durationMs,
       providerRequestId: outcome.providerRequestId,
       estimated: true,
       // a cut-off attempt holds the full max_tokens in the budget (SPEC §10.2.3)
-      ...(kind === 'unknown' ? { reservedOutput: plan.limits.max_tokens } : {}),
+      ...(kind === 'unknown' ? { reservedOutput: this.maxTokens } : {}),
     })
     this.noteContextCall(call)
     logAttempt()
@@ -1020,7 +1127,7 @@ class RunExecution {
    * the §5.1 estimate over system, tools and the whole history.
    */
   private contextUsage(): RunContext {
-    const window_tokens = this.plan.resolved.contextWindow
+    const window_tokens = this.resolved.contextWindow
     const sum = (messages: readonly StoredMessage[]) =>
       messages.reduce((acc, m) => acc + estimateMessageTokens(m, { timezone: this.timezone, texts: this.texts }), 0)
     const base = this.contextBase
@@ -1217,7 +1324,7 @@ class RunExecution {
     })
 
     let results: CallResult[]
-    if (plan.resolved.capabilities.parallel_tools) {
+    if (this.resolved.capabilities.parallel_tools) {
       results = await Promise.all(tasks.map((t) => t()))
     } else {
       results = []
@@ -1597,7 +1704,7 @@ class RunExecution {
       this.repairing = { fence: check.fence, attempt }
       let outcome: Awaited<ReturnType<RunExecution['callProvider']>>
       try {
-        outcome = await this.callProvider(await this.buildPrompt(step, trail), step, 'repair')
+        outcome = await this.callProvider(() => this.buildPrompt(step, trail), step, 'repair')
       } finally {
         this.repairing = null
       }
@@ -1923,6 +2030,7 @@ class RunExecution {
       ...(this.limitReached && status === 'completed' ? { limit_reached: this.limitReached } : {}),
       ...(this.fallbackAnswer ? { answer_source: 'fallback' as const } : {}),
       ...(plan.limits.max_presentations != null ? { presentations: this.presentations } : {}),
+      ...(plan.request.llm_is_array ? { llm_used: this.llmRef(), llm_fallbacks: this.llmFallbacks } : {}),
       error: error ?? null,
     }
 
@@ -1957,6 +2065,7 @@ class RunExecution {
         context_window: context.window_tokens,
         limit_reached: result.limit_reached,
         answer_source: result.answer_source,
+        ...(this.llmFallbacks.length > 0 ? { llm_used: this.llmRef(), llm_fallbacks: this.llmFallbacks.length } : {}),
         ...(error ? { error_code: error.code, error_message: error.message } : {}),
       },
       { answer: finalText(this.newMessages) || undefined, provider_body: error?.provider_body },
@@ -1979,6 +2088,18 @@ class RunExecution {
           : null,
         provider: result.usage.calls.at(-1)?.provider ?? null,
         model: result.usage.calls.at(-1)?.model ?? null,
+        ...(this.llmFallbacks.length > 0 ? { llm_fallbacks: this.llmFallbacks } : {}),
+      })
+    } else if (this.llmFallbacks.length > 0) {
+      // the run survived, but an entry of the chain is failing: a silent degradation otherwise (SPEC §9.5)
+      sendAlert('llm_fallback', {
+        run_id: record.runId,
+        session_id: record.sessionId,
+        meta: record.meta,
+        status,
+        finish_reason: finishReason,
+        llm_used: this.llmRef(),
+        llm_fallbacks: this.llmFallbacks,
       })
     }
 
@@ -1995,7 +2116,12 @@ class RunExecution {
   private releaseProvider(): void {
     if (this.released) return
     this.released = true
-    this.record.releasePromise = this.plan.resolved.release?.(this.record.runId) ?? null
+    // every entry the run reached may hold provider-side resources (SPEC §9.5)
+    const releases = this.plan.candidates
+      .slice(0, this.llmIndex + 1)
+      .flatMap((c) => (c.resolved.release ? [c.resolved.release(this.record.runId)] : []))
+    this.record.releasePromise =
+      releases.length === 0 ? null : releases.length === 1 ? releases[0]! : Promise.all(releases).then(() => undefined)
   }
 }
 

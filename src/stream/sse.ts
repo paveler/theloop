@@ -16,6 +16,7 @@ export type SseEventName =
   | 'snapshot'
   | 'step'
   | 'output_check'
+  | 'llm_fallback'
   | 'done'
   | 'gap'
 

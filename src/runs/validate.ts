@@ -11,6 +11,7 @@ import {
   PROVIDER_IDS,
   RunRequestSchema,
   type Limits,
+  type Llm,
   type RunRequest,
 } from '../contracts.js'
 import type { EgressClient } from '../egress/client.js'
@@ -22,9 +23,17 @@ import { assertLastMessage, assertToolInvariant } from './messages.js'
 import { compileOutputChecks, type CompiledOutputCheck } from './output-checks.js'
 import { usesSkills } from './skills.js'
 
+/** One entry of the `llm` chain, built and checked on receipt (SPEC §9.5). */
+export interface LlmCandidate {
+  index: number
+  llm: Llm
+  resolved: ResolvedModel
+}
+
 export interface ValidatedRun {
   request: RunRequest
-  resolved: ResolvedModel
+  /** The `llm` chain in order; one entry for a single-model request (SPEC §9.5). */
+  candidates: LlmCandidate[]
   limits: Limits
   sessionId: string | null
   /** Format gate for the final answer (SPEC §5.4); [] — no checks. */
@@ -36,9 +45,12 @@ export function validateRunRequest(
   deps: { config: Config; egress: EgressClient; modelFactory: ModelFactory },
 ): ValidatedRun {
   // a provider outside the allowlist gets its own code, not a generic bad_request (SPEC §12.1)
-  const rawProvider = (raw as { llm?: { provider?: unknown } })?.llm?.provider
-  if (typeof rawProvider === 'string' && !(PROVIDER_IDS as readonly string[]).includes(rawProvider)) {
-    throw new EngineError('provider_not_allowed', `provider ${rawProvider} is not in the allowlist`)
+  const rawLlm = (raw as { llm?: unknown } | null)?.llm
+  for (const entry of Array.isArray(rawLlm) ? rawLlm : [rawLlm]) {
+    const rawProvider = (entry as { provider?: unknown } | null | undefined)?.provider
+    if (typeof rawProvider === 'string' && !(PROVIDER_IDS as readonly string[]).includes(rawProvider)) {
+      throw new EngineError('provider_not_allowed', `provider ${rawProvider} is not in the allowlist`)
+    }
   }
 
   const parsed = RunRequestSchema.safeParse(raw)
@@ -80,22 +92,28 @@ export function validateRunRequest(
   // egress: tools, callback, images (SPEC §11.4, §5.3)
   for (const tool of request.tools) deps.egress.assertAllowed(tool.endpoint, `tool:${tool.name}`)
   if (request.callback) deps.egress.assertAllowed(request.callback.url, 'callback')
-  validateImages(request.messages, deps.egress, deps.config, request.llm.provider)
+  // every entry is checked now: a broken fallback must not wait for the primary to fail (SPEC §9.5)
+  for (const llm of request.llm_chain) validateImages(request.messages, deps.egress, deps.config, llm.provider)
+  assertSameCurrency(request.llm_chain)
 
   // a schema that does not compile is a 400 on receipt, not a surprise at the end of the run (SPEC §5.4)
   const outputChecks = compileOutputChecks(request.output_checks)
 
-  const resolved = deps.modelFactory(request.llm, deps.config, deps.egress)
-  const limits = resolveLimits(request, resolved.maxTokensCap)
+  const candidates = request.llm_chain.map((llm, index) => ({
+    index,
+    llm,
+    resolved: deps.modelFactory(llm, deps.config, deps.egress),
+  }))
+  const limits = resolveLimits(request, Math.max(...candidates.map((c) => c.resolved.maxTokensCap)))
 
-  warnUnknownParams(request)
+  for (const llm of request.llm_chain) warnUnknownParams(llm)
 
   const sessionId =
     typeof request.meta.session_id === 'string' && request.meta.session_id.length > 0
       ? request.meta.session_id
       : null
 
-  return { request, resolved, limits, sessionId, outputChecks }
+  return { request, candidates, limits, sessionId, outputChecks }
 }
 
 /**
@@ -128,15 +146,26 @@ function assertSkills(request: RunRequest): void {
 
 const KNOWN_PARAMS = new Set(['temperature', 'top_p', 'stop', 'seed', 'thinking', 'cache'])
 
-function warnUnknownParams(request: RunRequest): void {
-  const unknown = Object.keys(request.llm.params).filter((k) => !KNOWN_PARAMS.has(k))
+function warnUnknownParams(llm: Llm): void {
+  const unknown = Object.keys(llm.params).filter((k) => !KNOWN_PARAMS.has(k))
   if (unknown.length > 0) {
-    log.warn('llm_params_unknown', { params: unknown, provider: request.llm.provider })
-    for (const key of unknown) delete (request.llm.params as Record<string, unknown>)[key]
+    log.warn('llm_params_unknown', { params: unknown, provider: llm.provider })
+    for (const key of unknown) delete (llm.params as Record<string, unknown>)[key]
   }
 }
 
-/** Defaults and server caps; the request can only tighten them (SPEC §10). */
+/** usage.cost is one sum over the whole chain (SPEC §9.5): one currency. */
+function assertSameCurrency(chain: readonly Llm[]): void {
+  const currencies = new Set(chain.flatMap((llm) => (llm.pricing ? [llm.pricing.currency] : [])))
+  if (currencies.size > 1) {
+    throw new EngineError('bad_request', `llm[].pricing.currency must be the same for every entry, got ${[...currencies].join(', ')}`)
+  }
+}
+
+/**
+ * Defaults and server caps; the request can only tighten them (SPEC §10). With an `llm` chain
+ * `providerMaxTokens` is the largest cap of the chain; each attempt is clamped to its own (§9.5).
+ */
 export function resolveLimits(request: RunRequest, providerMaxTokens: number): Limits {
   const input = request.limits
   const limits: Limits = {
@@ -160,8 +189,9 @@ export function resolveLimits(request: RunRequest, providerMaxTokens: number): L
     ...(input.max_presentations != null ? { max_presentations: input.max_presentations } : {}),
   }
   // max_cost works only with pricing (SPEC §8.3)
+  // with a chain, every entry needs a price: an unpriced attempt would spend outside the budget (SPEC §9.5)
   if (input.max_cost != null) {
-    if (request.llm.pricing) limits.max_cost = input.max_cost
+    if (request.llm_chain.every((llm) => llm.pricing)) limits.max_cost = input.max_cost
     else log.warn('max_cost_ignored', { reason: 'max_cost without llm.pricing — the limit is ignored' })
   }
   return limits

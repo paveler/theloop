@@ -13,7 +13,7 @@ import { CONTRACT_VERSION } from './contracts.js'
 import type { EgressClient } from './egress/client.js'
 import { log, safeUrl } from './log.js'
 
-export type AlertEvent = 'callback_failed' | 'run_failed' | 'ack_missing' | 'run_crashed' | 'unhandled_error'
+export type AlertEvent = 'callback_failed' | 'run_failed' | 'llm_fallback' | 'ack_missing' | 'run_crashed' | 'unhandled_error'
 
 const ALERT_TIMEOUT_MS = 5000
 const ALERT_RESPONSE_MAX_BYTES = 65_536

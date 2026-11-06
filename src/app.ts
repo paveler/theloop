@@ -157,7 +157,7 @@ export function createEngine(
 
   async function acceptRun(c: Context, raw: unknown): Promise<Response> {
     const validated = validateRunRequest(raw, deps)
-    const { request, resolved, limits, sessionId, outputChecks } = validated
+    const { request, candidates, limits, sessionId, outputChecks } = validated
 
     // idempotency is checked BEFORE the session lock (SPEC §11.2)
     const requestHash = hashBody(raw)
@@ -204,7 +204,7 @@ export function createEngine(
       liveUsage: () => registry.emptyUsage(),
     })
 
-    const running = startRun(record, { request, resolved, limits, outputChecks }, deps).catch((err) => {
+    const running = startRun(record, { request, candidates, limits, outputChecks }, deps).catch((err) => {
       log.error('run_crashed', {
         run_id: record.runId,
         err: String(err),
