@@ -4,7 +4,7 @@
  *   terminal 1:  npm run dev                 # the engine; .env: ENGINE_TOKEN, ALLOW_INSECURE_EGRESS=1, a provider key
  *   terminal 2:  npm run example:sqlite      # this harness, the same .env
  *
- * Try "Where is my order 1042?", then "Please refund it", then /approve <id>.
+ * Try "Where is my order 1042?", then "Please refund it", then /approve.
  */
 import { createServer } from 'node:http'
 import { createInterface } from 'node:readline/promises'
@@ -45,7 +45,7 @@ await new Promise<void>((resolve) => server.listen(PORT, resolve))
 setInterval(() => void harness.recover().catch((err) => console.error('recover:', err)), 10_000).unref()
 
 console.log(`harness on http://localhost:${PORT}, engine ${ENGINE_URL}, session ${SESSION}`)
-console.log('commands: /approve <id>, /reject <id>, /history, /quit\n')
+console.log('commands: /approve [id], /reject [id], /history, /quit\n')
 
 /** Streams the answer from SSE, then waits until the callback has recorded the result. */
 async function follow(runId: string, streamUrl: string): Promise<void> {
@@ -93,10 +93,12 @@ for await (const raw of rl) {
     for (const message of store.history(SESSION)) console.log(JSON.stringify(message))
   } else if (line) {
     try {
-      const decision = /^\/(approve|reject)\s+(\S+)$/.exec(line)
+      const decision = /^\/(approve|reject)(?:\s+(\S+))?$/.exec(line)
       if (decision) {
-        const op = store.operation(decision[2]!)
-        if (!op) console.log('no such operation')
+        // without an id: the only pending approval of this session
+        const pending = harness.pendingApprovals(SESSION)
+        const op = decision[2] ? store.operation(decision[2]) : pending.length === 1 ? pending[0] : undefined
+        if (!op) console.log(decision[2] || !pending.length ? 'no such operation' : 'several approvals pending — name one')
         else {
           const next = await harness.decide(op.id, decision[1] === 'approve' ? 'approve' : 'reject', op.version)
           if (next) await follow(next.runId, next.streamUrl)
