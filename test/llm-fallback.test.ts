@@ -134,12 +134,22 @@ describe('llm chain: contract', () => {
     expect(result.llm_used).toEqual({ index: 0, provider: 'anthropic', model: 'model-a' })
   })
 
-  it('an empty array and more than five entries are 400 bad_request', async () => {
+  it('a bad llm field is a 400 that names the field and the reason, not a bare "Invalid input"', async () => {
     const engine = track(createEngine(testConfig(), { modelFactory: chainFactory({ 'model-a': mockModel([]) }) }))
-    for (const llm of [[], [A, A, A, A, A, A]]) {
+    const cases: Array<[unknown, string]> = [
+      [[A, A, A, A, A, A], 'invalid body: llm: an llm array takes at most 5 models, got 6'],
+      [[], 'invalid body: llm: an llm array needs at least one model'],
+      [[A, { provider: 'openai' }], 'invalid body: llm.1.model: '],
+      [{ provider: 'anthropic' }, 'invalid body: llm.model: '],
+      ['anthropic', 'invalid body: llm: expected an llm object or an array of them'],
+    ]
+    for (const [llm, message] of cases) {
       const res = await post(engine, runRequest({ llm: llm as never }))
       expect(res.status).toBe(400)
-      expect(((await res.json()) as any).error.code).toBe('bad_request')
+      const error = ((await res.json()) as any).error
+      expect(error.code).toBe('bad_request')
+      expect(error.message).toContain(message)
+      expect(error.message).not.toContain('Invalid input"')
     }
   })
 
@@ -147,7 +157,9 @@ describe('llm chain: contract', () => {
     const engine = track(createEngine(testConfig(), { modelFactory: chainFactory({ 'model-a': mockModel([]) }) }))
     const res = await post(engine, runRequest({ llm: [A, { provider: 'nope', model: 'x' }] as never }))
     expect(res.status).toBe(400)
-    expect(((await res.json()) as any).error.code).toBe('provider_not_allowed')
+    const error = ((await res.json()) as any).error
+    expect(error.code).toBe('provider_not_allowed')
+    expect(error.message).toContain('llm.1.provider')
   })
 
   it('a missing key in a later entry is refused on receipt, not when the primary fails', async () => {
@@ -155,7 +167,9 @@ describe('llm chain: contract', () => {
     const engine = track(createEngine(testConfig({ OPENAI_API_KEY: '' })))
     const res = await post(engine, runRequest({ llm: [A, { provider: 'openai', model: 'gpt-x' }] as never }))
     expect(res.status).toBe(400)
-    expect(((await res.json()) as any).error.code).toBe('provider_key_missing')
+    const error = ((await res.json()) as any).error
+    expect(error.code).toBe('provider_key_missing')
+    expect(error.message).toMatch(/^llm\.1: /)
   })
 
   it('pricing in different currencies is 400 bad_request', async () => {

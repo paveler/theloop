@@ -46,17 +46,20 @@ export function validateRunRequest(
 ): ValidatedRun {
   // a provider outside the allowlist gets its own code, not a generic bad_request (SPEC §12.1)
   const rawLlm = (raw as { llm?: unknown } | null)?.llm
-  for (const entry of Array.isArray(rawLlm) ? rawLlm : [rawLlm]) {
+  const entries = Array.isArray(rawLlm) ? rawLlm : [rawLlm]
+  entries.forEach((entry, index) => {
     const rawProvider = (entry as { provider?: unknown } | null | undefined)?.provider
     if (typeof rawProvider === 'string' && !(PROVIDER_IDS as readonly string[]).includes(rawProvider)) {
-      throw new EngineError('provider_not_allowed', `provider ${rawProvider} is not in the allowlist`)
+      const where = Array.isArray(rawLlm) ? `llm.${index}.provider` : 'llm.provider'
+      throw new EngineError('provider_not_allowed', `${where}: provider ${rawProvider} is not in the allowlist`)
     }
-  }
+  })
 
   const parsed = RunRequestSchema.safeParse(raw)
   if (!parsed.success) {
     const issue = parsed.error.issues[0]
-    throw new EngineError('bad_request', `invalid body: ${issue?.path.join('.') ?? ''} ${issue?.message ?? ''}`.trim())
+    const path = issue?.path.join('.') ?? ''
+    throw new EngineError('bad_request', `invalid body: ${path ? `${path}: ` : ''}${issue?.message ?? ''}`.trim())
   }
   const request = parsed.data
 
@@ -93,7 +96,9 @@ export function validateRunRequest(
   for (const tool of request.tools) deps.egress.assertAllowed(tool.endpoint, `tool:${tool.name}`)
   if (request.callback) deps.egress.assertAllowed(request.callback.url, 'callback')
   // every entry is checked now: a broken fallback must not wait for the primary to fail (SPEC §9.5)
-  for (const llm of request.llm_chain) validateImages(request.messages, deps.egress, deps.config, llm.provider)
+  request.llm_chain.forEach((llm, index) =>
+    inEntry(request, index, () => validateImages(request.messages, deps.egress, deps.config, llm.provider)),
+  )
   assertSameCurrency(request.llm_chain)
 
   // a schema that does not compile is a 400 on receipt, not a surprise at the end of the run (SPEC §5.4)
@@ -102,7 +107,7 @@ export function validateRunRequest(
   const candidates = request.llm_chain.map((llm, index) => ({
     index,
     llm,
-    resolved: deps.modelFactory(llm, deps.config, deps.egress),
+    resolved: inEntry(request, index, () => deps.modelFactory(llm, deps.config, deps.egress)),
   }))
   const limits = resolveLimits(request, Math.max(...candidates.map((c) => c.resolved.maxTokensCap)))
 
@@ -151,6 +156,16 @@ function warnUnknownParams(llm: Llm): void {
   if (unknown.length > 0) {
     log.warn('llm_params_unknown', { params: unknown, provider: llm.provider })
     for (const key of unknown) delete (llm.params as Record<string, unknown>)[key]
+  }
+}
+
+/** A refusal about one entry of an `llm` array names it: `llm.2: …` (SPEC §9.5). */
+function inEntry<T>(request: RunRequest, index: number, check: () => T): T {
+  try {
+    return check()
+  } catch (err) {
+    if (!request.llm_is_array || !(err instanceof EngineError)) throw err
+    throw new EngineError(err.code, `llm.${index}: ${err.message}`, err.details)
   }
 }
 

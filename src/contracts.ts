@@ -233,8 +233,31 @@ export type Llm = z.infer<typeof LlmSchema>
 /** At most this many entries in an `llm` array (SPEC §9.5). */
 export const LLM_CHAIN_MAX = 5
 
-/** `llm`: one model, or a fallback chain tried in order (SPEC §9.5). */
-export const LlmFieldSchema = z.union([LlmSchema, z.array(LlmSchema).min(1).max(LLM_CHAIN_MAX)])
+export const LlmChainSchema = z
+  .array(LlmSchema)
+  .min(1, { error: 'an llm array needs at least one model' })
+  .max(LLM_CHAIN_MAX, {
+    error: (issue) =>
+      `an llm array takes at most ${LLM_CHAIN_MAX} models, got ${Array.isArray(issue.input) ? issue.input.length : 'more'}`,
+  })
+
+/**
+ * `llm`: one model, or a fallback chain tried in order (SPEC §9.5). Dispatched by shape rather
+ * than z.union: a union reports every mistake as a bare "Invalid input" on `llm`, while the
+ * caller needs the exact field (`llm.1.model`) and the reason.
+ */
+export const LlmFieldSchema = z.unknown().transform((value, ctx): Llm | Llm[] => {
+  if (!Array.isArray(value) && (typeof value !== 'object' || value === null)) {
+    ctx.addIssue({ code: 'custom', message: 'expected an llm object or an array of them' })
+    return z.NEVER
+  }
+  const parsed = Array.isArray(value) ? LlmChainSchema.safeParse(value) : LlmSchema.safeParse(value)
+  if (parsed.success) return parsed.data
+  for (const issue of parsed.error.issues) {
+    ctx.addIssue({ code: 'custom', message: issue.message, path: issue.path })
+  }
+  return z.NEVER
+})
 
 /* ------------------------------------------------------------------ tools */
 
