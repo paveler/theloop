@@ -36,6 +36,7 @@ I've requested a refund of 120 — please confirm it.
 The refund of 120 for order 1042 went through.
 ```
 
+With a single approval pending, `/approve` and `/reject` work without the id.
 `/history` prints the stored `StoredMessage` history — exactly what the next run receives.
 The state survives restarts in `harness.db`.
 
