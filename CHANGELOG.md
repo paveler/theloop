@@ -4,6 +4,17 @@ All notable changes to theloop. The contract is versioned separately (`contract_
 [SPEC.md](SPEC.md)); every change below is additive to it. Releases follow semver: no breaking
 changes within 1.x.
 
+## v1.4.1 — 2026-11-07
+
+### Fixed
+
+- **`llm` validation errors say what is wrong** (SPEC §9.5). Since v1.4.0 any mistake in `llm`
+  — an array of six models, an entry without `model`, even a single object without `model` —
+  came back as `400 bad_request` with a bare `invalid body: llm Invalid input`. The field is
+  now parsed by shape, so the refusal names the field and the reason
+  (`invalid body: llm.1.model: …`, `llm: an llm array takes at most 5 models, got 6`), and
+  refusals about one entry of an array (allowlist, key, images) start with `llm.<index>`.
+
 ## v1.4.0 — 2026-11-06
 
 ### Added

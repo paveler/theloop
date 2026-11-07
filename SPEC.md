@@ -1664,7 +1664,9 @@ A single object behaves exactly as before; a one-entry array is the same run plu
 - **Checked on receipt.** Every entry is validated before the run starts — allowlist, key,
   `base_url` egress, image support (§5.3) — with the usual `400`s. A broken fallback is a
   refused request, not a surprise when the primary goes down. Prices of different entries
-  MUST share a currency (`400 bad_request`).
+  MUST share a currency (`400 bad_request`). A refusal names the field or the entry:
+  `invalid body: llm.1.model: …`, `llm: an llm array takes at most 5 models, got 6`,
+  `llm.2: no key for provider …`.
 - **What moves the run.** Any provider failure of an attempt **before its first content
   event**: auth, 4xx, 429, 5xx, network, `provider_queue_timeout`, and
   `context_too_large` (the next model may have a larger window; the prompt is trimmed again
