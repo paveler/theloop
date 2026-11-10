@@ -71,6 +71,15 @@ How it covers the harness obligations of [SPEC Appendix A](../../SPEC.md#appendi
 Not covered, on purpose: multi-tenancy, encrypted key storage, usage accounting and
 reconciliation (H19), a web UI. Each is a table and a page in a real product.
 
+Security the demo leaves to you, because it runs on localhost for one user:
+
+- **Tool routes are not authenticated.** `/tools/*` trusts `meta` from the body; in production,
+  authenticate the engine's calls, or anyone who reaches the routes can send their own `meta`.
+- **Approval has no approver.** `decide` checks the operation's status and version, not who
+  confirms it; a real harness checks that the approver may act on this operation.
+- **No refund policy.** Any amount is accepted, a negative one too; a real harness checks the
+  amount, the remaining refundable balance across operations, and eligibility.
+
 ## Tests
 
 [`test/example-sqlite-harness.test.ts`](../../test/example-sqlite-harness.test.ts) runs this

@@ -3,8 +3,12 @@
  * a mock model, the harness as a real HTTP server for tools and the callback, SQLite in memory.
  * Covers the harness obligations of SPEC Appendix A that a first integration usually trips on.
  */
+import { mkdtempSync, rmSync } from 'node:fs'
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, expect, it } from 'vitest'
 import { createEngine, type Engine } from '../src/app.js'
 import { createHarness, type Harness } from '../examples/sqlite-harness/harness.js'
@@ -172,6 +176,28 @@ describe('example harness: write intents', () => {
     expect(store.session(SESSION, USER).pending_call_ids).toEqual([])
     expect(store.history(SESSION).find((m) => m.call_id === 'c1')).toMatchObject({ is_error: true, error: 'order not found' })
     expect(harness.pendingApprovals(SESSION)).toEqual([])
+  })
+})
+
+describe('example harness: the downstream refund', () => {
+  it('the idempotency record and the order change commit together, so a retry after a failure refunds once', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'theloop-refund-'))
+    cleanup.push(async () => rmSync(dir, { recursive: true, force: true }))
+    const path = join(dir, 'harness.db')
+    const store = openStore(path)
+    store.putOrder({ id: '1042', user_id: USER, status: 'delivered', total: 120, refunded: 0 })
+
+    // the order update fails after the idempotency record was written
+    const other = new DatabaseSync(path)
+    other.exec("CREATE TRIGGER fail_refund BEFORE UPDATE ON orders BEGIN SELECT RAISE(ABORT, 'boom'); END")
+    expect(() => store.refund('op_1', '1042', 120)).toThrow(/boom/)
+    expect(store.order('1042', USER)).toMatchObject({ status: 'delivered', refunded: 0 })
+
+    other.exec('DROP TRIGGER fail_refund')
+    other.close()
+    store.refund('op_1', '1042', 120)
+    store.refund('op_1', '1042', 120)
+    expect(store.order('1042', USER)).toMatchObject({ status: 'refunded', refunded: 120 })
   })
 })
 
