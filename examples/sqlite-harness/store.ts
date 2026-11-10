@@ -96,20 +96,22 @@ export function openStore(path = ':memory:') {
     result: row.result == null ? null : JSON.parse(String(row.result)),
   })
 
+  function transaction<T>(fn: () => T): T {
+    db.exec('BEGIN')
+    try {
+      const out = fn()
+      db.exec('COMMIT')
+      return out
+    } catch (err) {
+      db.exec('ROLLBACK')
+      throw err
+    }
+  }
+
   return {
     db,
 
-    transaction<T>(fn: () => T): T {
-      db.exec('BEGIN')
-      try {
-        const out = fn()
-        db.exec('COMMIT')
-        return out
-      } catch (err) {
-        db.exec('ROLLBACK')
-        throw err
-      }
-    },
+    transaction,
 
     /* ------------------------------------------------------------ sessions */
 
@@ -245,11 +247,17 @@ export function openStore(path = ':memory:') {
       }
     },
 
-    /** The downstream mutation, idempotent by operation id — as a payment provider would be. */
+    /**
+     * The downstream mutation, idempotent by operation id — as a payment provider would be.
+     * The idempotency record and the order change commit together: a crash between them would
+     * leave the record without the refund, and the retry would skip it.
+     */
     refund(operationId: string, orderId: string, amount: number): void {
-      const inserted = db.prepare('INSERT OR IGNORE INTO refunds (operation_id, order_id, amount) VALUES (?, ?, ?)').run(operationId, orderId, amount)
-      if (Number(inserted.changes) === 0) return
-      db.prepare("UPDATE orders SET refunded = refunded + ?, status = 'refunded' WHERE id = ?").run(amount, orderId)
+      transaction(() => {
+        const inserted = db.prepare('INSERT OR IGNORE INTO refunds (operation_id, order_id, amount) VALUES (?, ?, ?)').run(operationId, orderId, amount)
+        if (Number(inserted.changes) === 0) return
+        db.prepare("UPDATE orders SET refunded = refunded + ?, status = 'refunded' WHERE id = ?").run(amount, orderId)
+      })
     },
   }
 }
