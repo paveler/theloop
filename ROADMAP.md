@@ -56,13 +56,13 @@ Effort: **S** — days, **M** — 1–2 weeks, **L** — a month or more.
 | A thin harness SDK (TypeScript): apply results idempotently, ack, deadline recovery, the write-endpoint lookup order — with storage as callbacks, so a harness is mostly glue | M |
 | A first external integration: someone outside the project embeds theloop from the docs alone; every place they get confused becomes a docs or SPEC fix | — |
 
-## Phase 1 — reach (v1.1)
+## Phase 1 — reach
 
 Goal: works with whatever models and tools a team already has.
 
 **1.1 Providers.** OpenRouter as a named provider (one key, hundreds of models, provider-side
 cost in usage). Google Gemini native (thought signatures fit the existing `reasoning` part).
-Mistral, Qwen, Kimi, YandexGPT. **Local models** (Ollama, vLLM, llama.cpp, LM Studio) through
+Mistral, Qwen, YandexGPT (Kimi shipped in v1.3.0). **Local models** (Ollama, vLLM, llama.cpp, LM Studio) through
 `openai-compatible` with an explicit `EGRESS_PRIVATE_ALLOWLIST` — today private addresses are
 refused unconditionally. — **M**
 
@@ -90,7 +90,7 @@ Gemini). Server-tool usage (searches, container time) is added to `usage.calls[]
 content only with an explicit flag, same rules as the journal. Works with Langfuse, Phoenix,
 Datadog. — **S**
 
-## Phase 2 — long-running assistants (v1.2)
+## Phase 2 — long-running assistants
 
 Goal: everything a weeks-long assistant needs from the kernel, without kernel state.
 
