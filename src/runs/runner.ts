@@ -38,7 +38,8 @@ import { EngineError, type ErrorCode } from '../errors.js'
 import { resolveLocale, texts, type Texts } from '../i18n.js'
 import { sendAlert } from '../alerts.js'
 import { sha256 } from '../ids.js'
-import { log, safeUrl } from '../log.js'
+import { contextFor, log, safeUrl } from '../log.js'
+import { classList, describeView, isAllClasses } from '../log-policy.js'
 import type { ResolvedModel } from '../providers/factory.js'
 import type { LlmCandidate } from './validate.js'
 import {
@@ -376,6 +377,8 @@ class RunExecution {
     const { request } = plan
     const roles = { user: 0, assistant: 0, tool: 0 }
     for (const message of request.messages) roles[message.role]++
+    const logContext = contextFor({ run_id: record.runId })
+    const view = describeView(logContext)
     log.info(
       'run_start',
       {
@@ -402,10 +405,11 @@ class RunExecution {
         ...(plan.outputChecks.length > 0
           ? { output_checks: plan.outputChecks.map((c) => `${c.fence}:${c.maxRepairs}`) }
           : {}),
+        ...(isAllClasses(logContext.classes) ? {} : { content_classes: classList(logContext.classes) }),
       },
       {
         system: this.systemText,
-        history_tail: request.messages.slice(-HISTORY_TAIL_IN_LOG).map(describeMessage),
+        history_tail: request.messages.slice(-HISTORY_TAIL_IN_LOG).map((m) => describeMessage(m, view)),
       },
     )
 

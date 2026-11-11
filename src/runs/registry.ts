@@ -10,7 +10,7 @@ import type { RunRequest, RunResult, RunStatus, Usage } from '../contracts.js'
 import { EngineError } from '../errors.js'
 import { hashBody, newToken, timingSafeEqualStr } from '../ids.js'
 import { sendAlert } from '../alerts.js'
-import { log } from '../log.js'
+import { log, releaseRunContext } from '../log.js'
 import { SseHub } from '../stream/sse.js'
 import { ToolWaitTimeout, type AsyncToolResult } from '../tools/http.js'
 
@@ -298,6 +298,8 @@ export class RunRegistry {
       sendAlert('ack_missing', { run_id: runId, session_id: run.sessionId, meta: run.meta, status: run.status, reason })
     }
     log.debug('run_deleted', { run_id: runId, reason, acked: run.acked, status: run.status })
+    // the log context outlives the run while its delivery job may still log (SPEC §12.5)
+    void Promise.resolve(run.deliveryPromise).finally(() => releaseRunContext(runId))
     run.sse.close()
     for (const call of run.calls.values()) this.closeCall(call)
     if (run.idempotencyKey && this.byIdempotency.get(run.idempotencyKey) === runId) {

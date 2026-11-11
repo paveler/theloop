@@ -17,7 +17,15 @@ import { EgressClient } from './egress/client.js'
 import { EngineError } from './errors.js'
 import { newRunId, hashBody, timingSafeEqualStr } from './ids.js'
 import { configureAlerts, sendAlert } from './alerts.js'
-import { diskJournal, flushJournal, initLogger, log, logBuffer, logContentEnabled, logger, safeUrl } from './log.js'
+import { diskJournal, flushJournal, initLogger, log, logBuffer, logContentClasses, classList, logger, safeUrl, bindRunContext } from './log.js'
+import {
+  intersectClasses,
+  newLogContext,
+  parseClasses,
+  requestLogContext,
+  NO_CLASSES,
+  type LogContext,
+} from './log-policy.js'
 import { formatLogText, LOG_LEVELS, type LogEntry, type LogLevel, type LogQuery } from './log-buffer.js'
 import { buildModel, type ModelFactory } from './providers/factory.js'
 import { pinnedProviderHosts } from './providers/allowlist.js'
@@ -142,22 +150,28 @@ export function createEngine(
 
   app.post('/runs', async (c) => {
     let raw: unknown
+    let ctx = newLogContext(logContentClasses())
     try {
       if (shuttingDown) throw new EngineError('shutting_down', 'engine is shutting down')
       requireEngineToken(c.req.header('authorization'), config)
       raw = await readJsonBody(c.req.raw, config.maxRequestBytes)
-      return await acceptRun(c, raw)
+      ctx = requestContextFor(raw)
+      return await requestLogContext.run(ctx, () => acceptRun(c, raw, ctx))
     } catch (err) {
       // the caller gets the refusal, but the journal needs it too — otherwise "the harness
       // sends, but there is no run" cannot be diagnosed (SPEC §12.4)
-      if (err instanceof EngineError) logRunRejected(err, raw)
+      if (err instanceof EngineError) requestLogContext.run(ctx, () => logRunRejected(err, raw))
       throw err
     }
   })
 
-  async function acceptRun(c: Context, raw: unknown): Promise<Response> {
+  async function acceptRun(c: Context, raw: unknown, ctx: LogContext): Promise<Response> {
     const validated = validateRunRequest(raw, deps)
     const { request, candidates, limits, sessionId, outputChecks } = validated
+    // declared names are identifiers: safe in every logging mode (SPEC §12.5)
+    for (const t of request.tools) ctx.declared.add(t.name)
+    for (const s of request.skills) ctx.declared.add(s.name)
+    for (const o of request.output_checks ?? []) ctx.declared.add(o.fence)
 
     // idempotency is checked BEFORE the session lock (SPEC §11.2)
     const requestHash = hashBody(raw)
@@ -203,6 +217,7 @@ export function createEngine(
       sessionId,
       liveUsage: () => registry.emptyUsage(),
     })
+    bindRunContext(record.runId, ctx)
 
     const running = startRun(record, { request, candidates, limits, outputChecks }, deps).catch((err) => {
       log.error('run_crashed', {
@@ -426,6 +441,24 @@ export function createEngine(
 
 /* ------------------------------------------------------------- helpers */
 
+/**
+ * The request's log context (SPEC §12.5): env classes narrowed by `logging.content`. A
+ * `logging` that is present but invalid means `none` for the refusal that follows.
+ */
+function requestContextFor(raw: unknown): LogContext {
+  const env = logContentClasses()
+  const logging = (raw as { logging?: { content?: unknown } } | null)?.logging
+  if (logging == null) return newLogContext(env)
+  const content = typeof logging === 'object' ? logging.content : undefined
+  try {
+    if (typeof content !== 'string' && !Array.isArray(content)) throw new Error('logging.content')
+    if (Array.isArray(content) && content.some((c) => typeof c !== 'string')) throw new Error('logging.content')
+    return newLogContext(intersectClasses(env, parseClasses(content as string | string[])))
+  } catch {
+    return newLogContext(NO_CLASSES)
+  }
+}
+
 function logRunRejected(err: EngineError, raw: unknown): void {
   const body = (raw ?? {}) as {
     llm?: { provider?: unknown; model?: unknown }
@@ -573,7 +606,7 @@ async function logsResponse(c: Context, query: LogQuery, format: 'json' | 'text'
       truncated,
       next_since: nextSince,
       source,
-      buffer: { ...stats, content: logContentEnabled(), disk: diskJournal() !== null },
+      buffer: { ...stats, content: logContentClasses().size > 0, content_classes: classList(logContentClasses()), disk: diskJournal() !== null },
     }),
   )
 }

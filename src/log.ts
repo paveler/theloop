@@ -4,8 +4,9 @@
  *
  * An event = metadata + optional content (prompt, model texts, tool args /
  * results). Metadata goes to stdout and the journal, with run_id on every line that has one.
- * content goes only to the journal (LOG_BUFFER_CONTENT, on by default), to stdout only
- * with LOG_PROMPTS=1 (local). Every content field is clipped to LOG_CONTENT_MAX_CHARS in
+ * content goes only to the journal, to stdout only with LOG_PROMPTS=1 (local). LOG_CONTENT and a
+ * request's `logging` narrow what is written: with a class excluded, every field goes through
+ * the field registry (log-policy.ts, SPEC §12.5). Every content field is clipped to LOG_CONTENT_MAX_CHARS in
  * memory and stdout, to LOG_DISK_CONTENT_MAX_CHARS on disk. `content.system` is journaled
  * once by hash as `system_sha256`. Keys and header values are never written anywhere.
  */
@@ -14,6 +15,17 @@ import pino from 'pino'
 import type { Config } from './config.js'
 import { LogBuffer, type LogLevel, type PromptBlob } from './log-buffer.js'
 import { DiskJournal, type PruneReport } from './log-disk.js'
+import {
+  ALL_CLASSES,
+  classList,
+  isAllClasses,
+  newLogContext,
+  requestLogContext,
+  sanitizeContent,
+  sanitizeFields,
+  type ClassSet,
+  type LogContext,
+} from './log-policy.js'
 
 export type Logger = pino.Logger
 export type LogFields = Record<string, unknown>
@@ -24,7 +36,7 @@ type LogSettings = Pick<
   | 'logPrompts'
   | 'logBufferMaxEntries'
   | 'logBufferMaxBytes'
-  | 'logBufferContent'
+  | 'logContent'
   | 'logContentMaxChars'
   | 'logDir'
   | 'logRetentionDays'
@@ -33,8 +45,16 @@ type LogSettings = Pick<
 >
 
 let root: Logger = pino({ level: process.env.LOG_LEVEL ?? 'info' })
+/** Tests capture stdout here; null — process stdout. */
+let stdoutSink: pino.DestinationStream | null = null
+
+export function setStdoutSink(sink: pino.DestinationStream | null): void {
+  stdoutSink = sink
+}
 let buffer = new LogBuffer(20_000, 33_554_432)
-let contentToBuffer = true
+let envContext: LogContext = newLogContext(ALL_CLASSES)
+/** run_id → the run's context, until the run and its delivery job are gone (SPEC §12.5). */
+const runContexts = new Map<string, LogContext>()
 let contentToStdout = false
 let contentMaxChars = 4000
 let disk: DiskJournal | null = null
@@ -42,9 +62,10 @@ let diskContentMaxChars = 200_000
 let exitHook = false
 
 export function initLogger(settings: LogSettings): Logger {
-  root = pino({ level: settings.logLevel })
+  root = stdoutSink ? pino({ level: settings.logLevel }, stdoutSink) : pino({ level: settings.logLevel })
   buffer = new LogBuffer(settings.logBufferMaxEntries, settings.logBufferMaxBytes)
-  contentToBuffer = settings.logBufferContent
+  envContext = newLogContext(settings.logContent)
+  runContexts.clear()
   contentToStdout = settings.logPrompts
   contentMaxChars = settings.logContentMaxChars
   diskContentMaxChars = settings.logDiskContentMaxChars
@@ -97,15 +118,52 @@ export function logBuffer(): LogBuffer {
   return buffer
 }
 
-export function logContentEnabled(): boolean {
-  return contentToBuffer
+/** The env content classes (GET /logs `buffer.content_classes`). */
+export function logContentClasses(): ClassSet {
+  return envContext.classes
 }
 
-function emit(level: LogLevel, event: string, fields: LogFields = {}, content?: LogFields): void {
+export function envLogContext(): LogContext {
+  return envContext
+}
+
+export function bindRunContext(runId: string, ctx: LogContext): void {
+  runContexts.set(runId, ctx)
+}
+
+export function releaseRunContext(runId: string): void {
+  runContexts.delete(runId)
+}
+
+/** The run's context by run_id, else the POST /runs request scope, else env. */
+export function contextFor(fields: LogFields): LogContext {
+  const runId = fields.run_id
+  if (typeof runId === 'string') {
+    const ctx = runContexts.get(runId)
+    if (ctx) return ctx
+  }
+  return requestLogContext.getStore() ?? envContext
+}
+
+/** Fields of an error-webhook body, under the same rules as log events (SPEC §12.3). */
+export function sanitizeAlert(event: string, fields: LogFields): LogFields {
+  const ctx = contextFor(fields)
+  if (isAllClasses(ctx.classes)) return fields
+  return sanitizeFields(`alert:${event}`, fields, ctx)
+}
+
+export { classList }
+
+function emit(level: LogLevel, event: string, rawFields: LogFields = {}, rawContent?: LogFields): void {
+  const ctx = contextFor(rawFields)
+  const strict = !isAllClasses(ctx.classes)
+  const fields = strict ? sanitizeFields(event, rawFields, ctx) : rawFields
+  const content = rawContent && strict ? sanitizeContent(event, rawContent, ctx) : rawContent
+
   if (content && contentToStdout) root[level]({ ...fields, content: clipContent(content, contentMaxChars) }, event)
   else root[level](fields, event)
 
-  if (!content || !contentToBuffer) {
+  if (!content) {
     const entry = buffer.push(level, event, fields, undefined)
     disk?.append(entry, undefined, undefined)
     return
@@ -199,6 +257,9 @@ export function safeUrl(url: string): string {
   try {
     const relative = !/^[a-z][a-z0-9+.-]*:/i.test(url)
     const u = new URL(url, relative ? 'http://engine.local' : undefined)
+    // credentials in a URL are secrets in every mode (SPEC §11.4)
+    u.username = ''
+    u.password = ''
     for (const key of [...new Set(u.searchParams.keys())]) u.searchParams.set(key, '<redacted>')
     return relative ? u.pathname + u.search : u.toString()
   } catch {

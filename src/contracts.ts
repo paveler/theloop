@@ -2,6 +2,7 @@
  * API and message format contracts (SPEC §4, §5, §6, §7, §8, §10).
  * Everything that comes from outside goes through zod; engine types are derived from here.
  */
+import { CONTENT_CLASSES } from './log-policy.js'
 import { z } from 'zod'
 
 export const CONTRACT_VERSION = '1'
@@ -330,6 +331,11 @@ export const CallbackSchema = z.object({
 
 export const MetaSchema = z.record(z.string(), z.unknown()).default({})
 
+/** What the engine may write to its logs for this run: narrows LOG_CONTENT, never widens (SPEC §12.5). */
+export const LoggingSchema = z.object({
+  content: z.union([z.enum(['all', 'none']), z.array(z.enum(CONTENT_CLASSES))]),
+})
+
 /* --------------------------------------------------------- output checks */
 
 /** Format gate for blocks in the final answer (SPEC §5.4). The schema is compiled in validate.ts. */
@@ -380,6 +386,7 @@ export const RunRequestSchema = z.object({
   wait: z.boolean().default(false),
   meta: MetaSchema,
   output_checks: z.array(OutputCheckSchema).max(OUTPUT_CHECK_LIMITS.max_checks).nullish(),
+  logging: LoggingSchema.nullish(),
 })
   // the engine works with the chain; `llm` is its first entry, so a single-model request reads as before
   .transform(({ llm, ...rest }) => {

@@ -4,6 +4,7 @@
  * Our own versioned DTO, not the AI SDK ModelMessage: reasoning with provider_metadata,
  * tool pairs and event parts live in the history and must survive a round trip.
  */
+import { OMITTED, type ContentClass, type DescribeView } from '../log-policy.js'
 import type {
   AssistantModelMessage,
   ModelMessage,
@@ -101,27 +102,41 @@ const DESCRIBE_MAX_CHARS = 600
  * A message as one line for the log: `user: …`, `assistant: … → tool(args)`,
  * `tool name: result`. Not for the model — only to make the history readable by eye.
  */
-export function describeMessage(message: StoredMessage): string {
+/**
+ * One history message as a journal line. `view` (strict logging, SPEC §12.5) filters each part
+ * by its class before formatting: text by `messages`, tool args / results by `tools`, call ids
+ * become engine refs, undeclared tool names `model_names`.
+ */
+export function describeMessage(message: StoredMessage, view?: DescribeView): string {
+  const keep = (cls: ContentClass) => !view || view.keep(cls)
+  const tool = (name: string) => (view ? view.tool(name) : name)
+  const ref = (callId: string) => (view ? view.ref(callId) : callId)
   let text: string
   if (message.role === 'user') {
     text = message.content
-      .map((part) =>
-        part.type === 'text' ? part.text : part.type === 'image' ? '[image]' : eventToText(part.name, part.data),
-      )
+      .map((part) => {
+        if (part.type === 'image') return '[image]'
+        if (!keep('messages')) return OMITTED
+        return part.type === 'text' ? part.text : eventToText(part.name, part.data)
+      })
       .join(' ')
   } else if (message.role === 'assistant') {
     text = message.content
       .map((part) => {
-        if (part.type === 'text') return part.text
+        if (part.type === 'text') return keep('messages') ? part.text : OMITTED
         if (part.type === 'reasoning') return '[reasoning]'
         const op = part.operation_id ? ` op=${part.operation_id}` : ''
-        return `→ ${part.tool}(${safeJson(part.args)})${op}`
+        return `→ ${tool(part.tool)}(${keep('tools') ? safeJson(part.args) : OMITTED})${op}`
       })
       .join(' ')
     if (message.partial) text = `[partial] ${text}`
   } else {
-    const body = message.is_error ? `error: ${message.error ?? ''}` : safeJson(message.result)
-    text = `${message.tool}#${message.call_id}: ${body}`
+    const body = !keep('tools')
+      ? OMITTED
+      : message.is_error
+        ? `error: ${message.error ?? ''}`
+        : safeJson(message.result)
+    text = `${tool(message.tool)}#${ref(message.call_id)}: ${body}`
   }
   const line = `${message.role}: ${text}`
   return line.length > DESCRIBE_MAX_CHARS ? `${line.slice(0, DESCRIBE_MAX_CHARS)}…` : line

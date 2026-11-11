@@ -11,7 +11,7 @@
 import { ENGINE_SECRET_HEADER } from './config.js'
 import { CONTRACT_VERSION } from './contracts.js'
 import type { EgressClient } from './egress/client.js'
-import { log, safeUrl } from './log.js'
+import { log, safeUrl, sanitizeAlert } from './log.js'
 
 export type AlertEvent = 'callback_failed' | 'run_failed' | 'llm_fallback' | 'ack_missing' | 'run_crashed' | 'unhandled_error'
 
@@ -70,7 +70,8 @@ export function sendAlert(event: AlertEvent, fields: Record<string, unknown>): v
         event,
         at: new Date(now).toISOString(),
         engine_version: target.version,
-        ...fields,
+        // the same content rules as the journal (SPEC §12.3, §12.5)
+        ...sanitizeAlert(event, fields),
       }),
       timeoutMs: ALERT_TIMEOUT_MS,
       maxBytes: ALERT_RESPONSE_MAX_BYTES,

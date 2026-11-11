@@ -5,6 +5,7 @@
 import { PROVIDER_IDS, type ProviderId } from './contracts.js'
 import { DEFAULT_LOCALE, isLocale, LOCALES, type Locale } from './i18n.js'
 import type { ThrottleSettings } from './providers/throttle.js'
+import { NO_CLASSES, parseClasses, type ClassSet } from './log-policy.js'
 
 /** Header carrying the engine secret from env CALLBACK_SECRET: callback (SPEC §7) and error webhook (§12.3). */
 export const ENGINE_SECRET_HEADER = 'X-Engine-Secret'
@@ -45,8 +46,8 @@ export interface Config {
   /** In-memory journal for GET /logs (SPEC §12.4); 0 entries — off. */
   logBufferMaxEntries: number
   logBufferMaxBytes: number
-  /** Event content in the journal; on by default. */
-  logBufferContent: boolean
+  /** Content classes written to logs (SPEC §12.5): all by default; LOG_BUFFER_CONTENT=0 is none. */
+  logContent: ClassSet
   logContentMaxChars: number
   /** The journal on disk (SPEC §12.4); unset — memory only. */
   logDir: string | undefined
@@ -185,6 +186,22 @@ function defaultTimezone(env: Env): string {
   return raw
 }
 
+/** LOG_CONTENT, with LOG_BUFFER_CONTENT=0 as an alias of `none` (SPEC §12.5). */
+function logContent(env: Env): ClassSet {
+  const legacyOff = env.LOG_BUFFER_CONTENT != null && env.LOG_BUFFER_CONTENT !== '' && !bool(env, 'LOG_BUFFER_CONTENT')
+  const raw = env.LOG_CONTENT?.trim()
+  let classes: ClassSet
+  try {
+    classes = raw ? parseClasses(raw) : legacyOff ? NO_CLASSES : parseClasses('all')
+  } catch (err) {
+    throw new Error(`env LOG_CONTENT: ${(err as Error).message}`)
+  }
+  if (legacyOff && raw && classes.size > 0) {
+    throw new Error('env LOG_BUFFER_CONTENT=0 is an alias of LOG_CONTENT=none: they conflict')
+  }
+  return classes
+}
+
 /**
  * ENGINE_TOKEN is required, there is no default (SPEC §4.1): the engine does not start without it.
  */
@@ -227,7 +244,7 @@ export function createConfig(env: Env = process.env): Config {
     logPrompts: bool(env, 'LOG_PROMPTS'),
     logBufferMaxEntries: num(env, 'LOG_BUFFER_MAX_ENTRIES', 20_000),
     logBufferMaxBytes: num(env, 'LOG_BUFFER_MAX_BYTES', 33_554_432),
-    logBufferContent: bool(env, 'LOG_BUFFER_CONTENT', true),
+    logContent: logContent(env),
     logContentMaxChars: num(env, 'LOG_CONTENT_MAX_CHARS', 4000),
     logDir: env.LOG_DIR?.trim() || undefined,
     logRetentionDays: int(env, 'LOG_RETENTION_DAYS', 7, 0),
