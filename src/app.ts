@@ -28,7 +28,8 @@ import {
 } from './log-policy.js'
 import { formatLogText, LOG_LEVELS, type LogEntry, type LogLevel, type LogQuery } from './log-buffer.js'
 import { buildModel, type ModelFactory } from './providers/factory.js'
-import { pinnedProviderHosts } from './providers/allowlist.js'
+import { pinnedProviderHosts, registerEndpoints } from './providers/allowlist.js'
+import { configureMetrics, countRunStarted, renderMetrics } from './metrics.js'
 import { ProviderThrottle } from './providers/throttle.js'
 import { RunRegistry, isTerminal, type RunRecord } from './runs/registry.js'
 import { startRun } from './runs/runner.js'
@@ -64,7 +65,15 @@ export function createEngine(
 ): Engine {
   initLogger(config)
   const egress = overrides.egress ?? new EgressClient(config)
-  for (const host of pinnedProviderHosts()) egress.allowHost(host)
+  // a closed network turns the built-in public hosts off (SPEC §11.4)
+  if (config.egressPublicProviders) for (const host of pinnedProviderHosts()) egress.allowHost(host)
+  // overrides and endpoints: their exact origin, for the provider purpose only
+  for (const url of Object.values(config.providerBaseUrls)) egress.allowProviderOrigin(url)
+  if (config.gigachatOAuthUrl) egress.allowProviderOrigin(config.gigachatOAuthUrl)
+  for (const ep of Object.values(config.endpoints)) egress.allowProviderOrigin(ep.url)
+  registerEndpoints(
+    Object.values(config.endpoints).map((e) => ({ name: e.name, kind: e.kind, unsigned: e.reasoning === 'unsigned' })),
+  )
   const registry = overrides.registry ?? new RunRegistry(config)
   registry.startSweeper()
   configureAlerts(
@@ -85,6 +94,18 @@ export function createEngine(
 
   let shuttingDown = false
   const startedAt = Date.now()
+  configureMetrics({
+    maxModels: config.metricsMaxModels,
+    gauges: {
+      runsActive: () => registry.activeCount,
+      runsRetained: () => registry.retainedCount,
+      queues: () => deps.throttle.snapshot().limiters.map((l) => ({ provider: l.provider, active: l.active, queued: l.queued })),
+      journal: () => {
+        const stats = logBuffer().stats()
+        return { memoryBytes: stats.bytes, memoryDropped: stats.dropped, diskBytes: diskJournal()?.sizeBytes() ?? null }
+      },
+    },
+  })
   const app = new Hono()
 
   if (config.allowedOrigins.length > 0) {
@@ -133,8 +154,12 @@ export function createEngine(
 
   /* --------------------------------------------------------------- health */
 
-  app.get('/health', (c) =>
-    c.json({
+  app.get('/health', (c) => {
+    // HEALTH_DETAILS=0: ok / shutting_down only, unless the caller holds ENGINE_TOKEN (SPEC §4.7)
+    if (!config.healthDetails && !matchesEngineToken(c.req.header('authorization'), config)) {
+      return c.json({ ok: true, shutting_down: shuttingDown })
+    }
+    return c.json({
       ok: true,
       version,
       uptime_s: Math.round((Date.now() - startedAt) / 1000),
@@ -143,8 +168,21 @@ export function createEngine(
       shutting_down: shuttingDown,
       // provider queue: AIMD ceiling, busy slots, waiters (SPEC §4.7, §11.6)
       provider_throttle: deps.throttle.snapshot(),
-    }),
-  )
+    })
+  })
+
+  /* -------------------------------------------------------------- metrics */
+
+  // Prometheus text; its own token, never ENGINE_TOKEN; unset — off (SPEC §4.10)
+  app.get('/metrics', (c) => {
+    if (!config.metricsToken) throw new EngineError('not_found', 'metrics are off: set METRICS_TOKEN')
+    const header = c.req.header('authorization') ?? ''
+    const match = /^Bearer\s+(.+)$/i.exec(header.trim())
+    if (!match?.[1] || !timingSafeEqualStr(config.metricsToken, match[1])) {
+      throw new EngineError('unauthorized', 'requires Authorization: Bearer <METRICS_TOKEN>')
+    }
+    return c.text(renderMetrics(), 200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8', 'Cache-Control': 'no-store' })
+  })
 
   /* ---------------------------------------------------------- POST /runs */
 
@@ -218,6 +256,7 @@ export function createEngine(
       liveUsage: () => registry.emptyUsage(),
     })
     bindRunContext(record.runId, ctx)
+    countRunStarted()
 
     const running = startRun(record, { request, candidates, limits, outputChecks }, deps).catch((err) => {
       log.error('run_crashed', {

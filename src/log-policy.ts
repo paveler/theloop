@@ -232,6 +232,9 @@ const FIELDS: Record<string, Rule> = {
   default_timezone: 'safe',
   port: 'safe',
   tls: 'safe',
+  metrics: 'safe',
+  public_providers: 'safe',
+  context_window_default: 'safe',
   blocks: 'safe',
   // GigaChat file ids come from the provider
   files: 'safe',

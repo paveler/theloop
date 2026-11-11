@@ -259,8 +259,10 @@ export function editsSignedPrefix(
 export type ImageResolver = (url: string) => Promise<{ data: Uint8Array; mediaType: string }>
 
 export interface ConvertOptions {
-  /** Provider id — reasoning from another provider is skipped (SPEC §5.2). */
+  /** Reasoning owner — reasoning from another provider / endpoint is skipped (SPEC §5.2). */
   provider: string
+  /** false — reasoning is never sent back, even its own (endpoint _REASONING_REPLAY=none). */
+  replayReasoning?: boolean
   resolveImage: ImageResolver
   /**
    * Dates go into user messages (SPEC §9.4), not into system: a changing line in system
@@ -418,7 +420,7 @@ export async function toModelMessages(
             toolName: part.tool,
             input: part.args,
           })
-        } else if (part.provider === options.provider) {
+        } else if (part.provider === options.provider && options.replayReasoning !== false) {
           // reasoning goes back to the provider as is (SPEC §5.2); the key is the one the
           // SDK adapter reads: for MiniMax it is `anthropic`
           content.push({

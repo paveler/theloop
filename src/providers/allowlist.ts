@@ -119,6 +119,16 @@ export const PROVIDERS: Record<ProviderId, ProviderEntry> = {
     includeUsage: false,
     honorsToolChoiceNone: true,
   },
+  endpoint: {
+    // a placeholder: the operator's LLM_ENDPOINT_<NAME>_* defines everything (SPEC §9.1)
+    kind: 'openai-compatible',
+    baseUrl: null,
+    envKey: null,
+    capabilities: { parallel_tools: false, usage_in_stream: false },
+    maxTokensCap: 32_000,
+    includeUsage: true,
+    honorsToolChoiceNone: true,
+  },
   'openai-compatible': {
     kind: 'openai-compatible',
     baseUrl: null, // from the request; env keys are never used with it (SPEC §9.1)
@@ -162,7 +172,26 @@ export function providerEntry(id: ProviderId): ProviderEntry {
   return PROVIDERS[id]
 }
 
+/** Endpoint kinds by name, for the reasoning owner `endpoint:<name>` (SPEC §5.2, §9.1). */
+const ENDPOINT_KINDS = new Map<string, { kind: 'openai' | 'anthropic'; unsigned: boolean }>()
+
+export function registerEndpoints(list: Array<{ name: string; kind: 'openai' | 'anthropic'; unsigned: boolean }>): void {
+  ENDPOINT_KINDS.clear()
+  for (const e of list) ENDPOINT_KINDS.set(e.name, { kind: e.kind, unsigned: e.unsigned })
+}
+
+export const ENDPOINT_OWNER_PREFIX = 'endpoint:'
+
+function endpointOf(owner: string): { name: string; kind: 'openai' | 'anthropic'; unsigned: boolean } | null {
+  if (!owner.startsWith(ENDPOINT_OWNER_PREFIX)) return null
+  const name = owner.slice(ENDPOINT_OWNER_PREFIX.length)
+  const entry = ENDPOINT_KINDS.get(name)
+  return entry ? { name, ...entry } : null
+}
+
 export function hasUnsignedThinking(provider: string): boolean {
+  const endpoint = endpointOf(provider)
+  if (endpoint) return endpoint.kind === 'anthropic' && endpoint.unsigned
   return PROVIDERS[provider as ProviderId]?.unsignedThinking === true
 }
 
@@ -173,6 +202,8 @@ export function hasUnsignedThinking(provider: string): boolean {
  * signature never goes to the real Anthropic and vice versa (SPEC §5.2).
  */
 export function sdkKeyFor(provider: string): string {
+  const endpoint = endpointOf(provider)
+  if (endpoint) return endpoint.kind === 'anthropic' ? 'anthropic' : endpoint.name
   return PROVIDERS[provider as ProviderId]?.kind === 'anthropic' ? 'anthropic' : provider
 }
 

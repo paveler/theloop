@@ -10,6 +10,7 @@
  * 2xx = ack: the harness answers 2xx only after a durable write (SPEC §3.1),
  * so the session lock is released right here.
  */
+import { countCallback } from '../metrics.js'
 import { ENGINE_SECRET_HEADER, type Config } from '../config.js'
 import type { RunResult } from '../contracts.js'
 import type { EgressClient } from '../egress/client.js'
@@ -105,6 +106,7 @@ export async function deliverCallback(run: RunRecord, result: RunResult, deps: D
         // phase 3: the delivery job is no longer needed — drop the callback headers
         delivery.url = null
         delivery.headers = null
+        countCallback('sent')
         log.info('callback_sent', {
           run_id: run.runId,
           session_id: run.sessionId,
@@ -144,6 +146,7 @@ export async function deliverCallback(run: RunRecord, result: RunResult, deps: D
   delivery.nextAttemptAt = null
   delivery.url = null
   delivery.headers = null
+  countCallback('failed')
   log.error('callback_failed', {
     run_id: run.runId,
     session_id: run.sessionId,

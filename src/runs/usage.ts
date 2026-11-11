@@ -48,6 +48,7 @@ export function normalizeUsage(usage: LanguageModelUsage | undefined): Normalize
 export interface AttemptRecord {
   status: 'ok' | 'failed' | 'unknown'
   provider: string
+  endpoint?: string
   model: string
   tokens: NormalizedTokens
   finishReason: string | null
@@ -80,6 +81,7 @@ export class UsageTracker {
       index: this.attempts.length,
       status: record.status,
       provider: record.provider,
+      ...(record.endpoint ? { endpoint: record.endpoint } : {}),
       model: record.model,
       ...record.tokens,
       finish_reason: record.finishReason,

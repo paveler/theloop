@@ -3,12 +3,13 @@
  * shutdown. Routes and all logic live in app.ts, so e2e tests can drive app.request
  * without a socket.
  */
+import { classList } from './log-policy.js'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { serve } from '@hono/node-server'
 import { createEngine } from './app.js'
-import { createConfig, describeProxies } from './config.js'
+import { createConfig, describeEndpoints, describeOverrides, describeProxies } from './config.js'
 import { log } from './log.js'
 
 function readVersion(): string {
@@ -35,7 +36,18 @@ const server = serve({ fetch: engine.app.fetch, port: config.port }, (info) => {
     provider_proxies: describeProxies(config),
     locale: config.engineLocale,
     default_timezone: config.defaultTimezone,
+    private_cidrs: config.egressPrivateCidrs.map((c) => c.text),
+    http_hosts: config.egressHttpHosts,
+    public_providers: config.egressPublicProviders,
+    provider_overrides: describeOverrides(config),
+    endpoints: describeEndpoints(config),
+    content_classes: classList(config.logContent),
+    metrics: Boolean(config.metricsToken),
   })
+  // a local server cuts a long prompt silently: the engine must trim first (SPEC §9.1)
+  for (const ep of Object.values(config.endpoints)) {
+    if (ep.contextWindow == null) log.warn('endpoint_context_default', { endpoint: ep.name, context_window: config.maxContextFallback })
+  }
 })
 
 let stopping = false

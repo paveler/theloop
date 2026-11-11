@@ -153,6 +153,19 @@ export class DiskJournal {
     this.flush()
   }
 
+  /** Bytes of the retained day files (GET /metrics). */
+  sizeBytes(): number {
+    let total = 0
+    for (const { name } of this.dayFiles()) {
+      try {
+        total += statSync(join(this.settings.dir, name)).size
+      } catch {
+        // pruned meanwhile
+      }
+    }
+    return total
+  }
+
   /** Retention by age, then the size ceiling; the current UTC day is never deleted. */
   prune(now = Date.now()): PruneReport {
     const today = utcDay(now)

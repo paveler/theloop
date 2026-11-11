@@ -181,6 +181,8 @@ export const PROVIDER_IDS = [
   'minimax',
   'kimi',
   'openai-compatible',
+  // an operator-defined model server, named by llm.endpoint (SPEC §9.1)
+  'endpoint',
 ] as const
 
 export type ProviderId = (typeof PROVIDER_IDS)[number]
@@ -223,6 +225,8 @@ export const LlmSchema = z.object({
   api_key: z.string().min(1).nullish(),
   base_url: z.string().url().nullish(),
   gigachat_scope: z.enum(GIGACHAT_SCOPES).nullish(),
+  /** With provider "endpoint": the LLM_ENDPOINT_<NAME> to use (SPEC §9.1). */
+  endpoint: z.string().min(1).nullish(),
   context_window_tokens: z.number().int().positive().nullish(),
   capabilities: CapabilitiesOverrideSchema.nullish(),
   params: LlmParamsSchema,
@@ -460,6 +464,8 @@ export interface UsageCall {
   index: number
   status: 'ok' | 'failed' | 'unknown'
   provider: string
+  /** With provider "endpoint": its name (SPEC §9.1). */
+  endpoint?: string
   model: string
   input_tokens: number
   output_tokens: number
@@ -596,6 +602,8 @@ export interface RunResult {
 export interface LlmRef {
   index: number
   provider: ProviderId
+  /** With provider "endpoint": its name (SPEC §9.1). */
+  endpoint?: string
   model: string
 }
 

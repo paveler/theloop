@@ -20,7 +20,7 @@ import {
   translateGigachatSse,
 } from './gigachat-translate.js'
 
-const OAUTH_URL = 'https://ngw.devices.sberbank.ru:9443/api/v2/oauth'
+export const GIGACHAT_OAUTH_URL = 'https://ngw.devices.sberbank.ru:9443/api/v2/oauth'
 const OAUTH_TIMEOUT_MS = 15_000
 const REFRESH_MARGIN_MS = 60_000
 
@@ -37,22 +37,24 @@ export function resetGigachatTokenCache(): void {
   inflight.clear()
 }
 
-function cacheKeyFor(authKey: string, scope: string): string {
-  return sha256(`${authKey}|${scope}`)
+/** The issuer is part of the key: an on-prem OAuth must never be served a public token (SPEC §9.1). */
+function cacheKeyFor(authKey: string, scope: string, oauthUrl: string): string {
+  return sha256(`${oauthUrl}|${authKey}|${scope}`)
 }
 
 export async function gigachatAccessToken(
   authKey: string,
   scope: string,
   fetchImpl: typeof fetch = fetch,
+  oauthUrl: string = GIGACHAT_OAUTH_URL,
 ): Promise<string> {
-  const cacheKey = cacheKeyFor(authKey, scope)
+  const cacheKey = cacheKeyFor(authKey, scope, oauthUrl)
   const hit = cache.get(cacheKey)
   if (hit && hit.expiresAtMs - Date.now() > REFRESH_MARGIN_MS) return hit.accessToken
 
   let pending = inflight.get(cacheKey)
   if (!pending) {
-    pending = requestToken(authKey, scope, fetchImpl)
+    pending = requestToken(authKey, scope, fetchImpl, oauthUrl)
       .then((entry) => {
         cache.set(cacheKey, entry)
         return entry
@@ -67,8 +69,8 @@ export async function gigachatAccessToken(
 }
 
 /** Drops the token after a 401, but only if the cache still holds that same token. */
-function invalidateToken(authKey: string, scope: string, token: string): void {
-  const cacheKey = cacheKeyFor(authKey, scope)
+function invalidateToken(authKey: string, scope: string, token: string, oauthUrl: string): void {
+  const cacheKey = cacheKeyFor(authKey, scope, oauthUrl)
   if (cache.get(cacheKey)?.accessToken === token) cache.delete(cacheKey)
 }
 
@@ -94,10 +96,11 @@ async function requestToken(
   authKey: string,
   scope: string,
   fetchImpl: typeof fetch,
+  oauthUrl: string,
 ): Promise<TokenCacheEntry> {
   let res: Response
   try {
-    res = await fetchImpl(OAUTH_URL, {
+    res = await fetchImpl(oauthUrl, {
       method: 'POST',
       headers: {
         Authorization: `Basic ${authKey}`,
@@ -170,7 +173,12 @@ const CHAT_SUFFIX = '/chat/completions'
  * 401 → the token was revoked early: reset the cache and repeat once with a new token.
  * The repeat is safe: a 401 arrives before generation, there is no content yet.
  */
-export function gigachatTransport(authKey: string, scope: string, baseFetch: typeof fetch): GigachatTransport {
+export function gigachatTransport(
+  authKey: string,
+  scope: string,
+  baseFetch: typeof fetch,
+  oauthUrl: string = GIGACHAT_OAUTH_URL,
+): GigachatTransport {
   const authorized: AuthorizedFetch = async (input, init) => {
     const send = async (token: string): Promise<Response> => {
       const headers = new Headers(init?.headers)
@@ -178,14 +186,14 @@ export function gigachatTransport(authKey: string, scope: string, baseFetch: typ
       return baseFetch(input, { ...init, headers })
     }
 
-    const token = await gigachatAccessToken(authKey, scope, baseFetch)
+    const token = await gigachatAccessToken(authKey, scope, baseFetch, oauthUrl)
     const res = await send(token)
     const body = init?.body
     const replayable = body == null || typeof body === 'string' || body instanceof Uint8Array
     if (res.status !== 401 || !replayable) return res
     await res.body?.cancel().catch(() => {})
-    invalidateToken(authKey, scope, token)
-    return send(await gigachatAccessToken(authKey, scope, baseFetch))
+    invalidateToken(authKey, scope, token, oauthUrl)
+    return send(await gigachatAccessToken(authKey, scope, baseFetch, oauthUrl))
   }
 
   const files = new RunFiles(authorized)
