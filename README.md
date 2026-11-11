@@ -25,6 +25,7 @@
   <a href="#quickstart"><b>Quickstart</b></a> ·
   <a href="SPEC.md"><b>SPEC</b></a> ·
   <a href="#trust-model"><b>Trust model</b></a> ·
+  <a href="#on-prem-and-closed-networks"><b>On-prem</b></a> ·
   <a href="#how-it-compares"><b>Compare</b></a> ·
   <a href="examples/sqlite-harness"><b>Example harness</b></a> ·
   <a href="CHANGELOG.md"><b>Changelog</b></a> ·
@@ -152,6 +153,51 @@ harness on SQLite with no dependencies — history, a read tool, a write tool wi
 continuation of the conversation, recovery — and a chat in the terminal:
 `npm run example:sqlite`.
 
+## On-prem and closed networks
+
+theloop runs inside a network with no internet: local models, internal tools, no content in logs,
+installed from files.
+
+**A local model, Ollama first.** Point an endpoint at the server and name it in requests:
+
+```bash
+LLM_ENDPOINT_LOCAL_URL=http://ollama:11434/v1
+LLM_ENDPOINT_LOCAL_CONTEXT_WINDOW=26000     # ~20 % below OLLAMA_CONTEXT_LENGTH
+LLM_ENDPOINT_LOCAL_MAX_CONCURRENCY=2        # = OLLAMA_NUM_PARALLEL
+EGRESS_PRIVATE_CIDRS=172.28.0.0/16          # the private range the model lives in
+EGRESS_HTTP_HOSTS=ollama:11434              # plain http, for this host only
+EGRESS_PUBLIC_PROVIDERS=0                   # refuse public providers on receipt
+```
+
+```json
+"llm": { "provider": "endpoint", "endpoint": "local", "model": "qwen3:8b" }
+```
+
+vLLM, TGI, llama.cpp, LM Studio and internal gateways work the same way (`_KIND=anthropic` for an
+Anthropic-compatible one). No key means no credential header at all. Set the server context
+explicitly: a local server cuts a longer prompt silently, so the engine has to trim first
+([SPEC §9.6](SPEC.md#96-model-endpoints-and-local-models)). `npm run smoke:local` checks a live server.
+
+**A corporate gateway or an on-prem installation of a named provider:** `OPENAI_BASE_URL`,
+`ANTHROPIC_BASE_URL`, `GIGACHAT_BASE_URL` + `GIGACHAT_OAUTH_URL` and the like — the env key goes
+there, nothing else changes.
+
+**No content in logs.** `LOG_CONTENT=none` keeps prompts, messages, tool payloads, provider and
+network error text, URL paths and `meta` values out of stdout, the journal on disk and in memory,
+and the error webhook; a request can ask for the same with `"logging": { "content": "none" }`. A
+canary test holds it ([SPEC §12.5](SPEC.md#125-content-classes-and-content-free-logging)).
+
+**Installed from files.** Every release has image tarballs (amd64, arm64), a plain Node bundle, an
+SBOM, third-party licenses and checksums. The image runs as non-root on a read-only filesystem;
+secrets come from files (`ENGINE_TOKEN_FILE`, `*_API_KEY_FILE`); `GET /metrics` serves Prometheus;
+the engine opens no connection on its own. [`deploy/`](deploy) has a compose file with Ollama and
+a Kubernetes example.
+
+```bash
+sha256sum -c SHA256SUMS
+docker load -i theloop-1.5.0-image-linux-amd64.tar
+```
+
 ## Trust model
 
 A model can ask. It can't act. The engine enforces what it can see; your tool endpoints carry
@@ -229,6 +275,8 @@ src/
   i18n.ts               engine-injected text, en / ru (Appendix B)
   log.ts, log-buffer.ts structured events; the in-memory journal for GET /logs (§12.4)
   log-disk.ts           the journal on disk: day files, retention, reads past memory (§12.4)
+  log-policy.ts         content classes, the field registry, the logging context (§12.5)
+  metrics.ts            GET /metrics, Prometheus text (§4.10)
   alerts.ts             error webhook (§12.3)
   runs/registry.ts      in-memory runs: status, SSE buffer, tokens, session lock, idempotency
   runs/runner.ts        the loop, step by step: one streamText per step → finish-step →
@@ -244,7 +292,8 @@ src/
   tools/http.ts         tool calls: ok / error / accepted / deferred, effect control, retries
   tools/search.ts       BM25 over deferred tools for search_tools (§6.8)
   tools/args.ts         conservative argument validation against input_schema
-  egress/               the single outbound HTTP client: allowlist, private IPs, no redirects
+  egress/               the single outbound HTTP client: allowlist, private ranges, ports,
+                        plain-http hosts, no redirects
   stream/sse.ts         SSE with replay, snapshot, gap, backpressure
   providers/            allowlist, model factory, GigaChat OAuth and translator, per-key queue
 ```
@@ -257,6 +306,7 @@ src/
 npm test                  # vitest, no network, no keys
 npm run typecheck
 npm run smoke             # live run against real providers, keys from .env (not in CI)
+npm run smoke:local       # live run against a local server: SMOKE_LOCAL_URL, SMOKE_LOCAL_MODEL
 npm run build && npm start
 ```
 

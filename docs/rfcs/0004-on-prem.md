@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Draft |
+| Status | Implemented in v1.5.0 (2026-11-12) |
 | Scope | Additive. Every new behavior is opt-in through env or a new request field; with no new env set, the engine behaves exactly as v1.4.x, with one deliberate tightening (§6.8) |
 | Target | v1.5.0 (`contract_version` stays `"1"`) |
 | Touches | SPEC §4.2, §4.7, §4.9, §5.2, §7, §8, §9.1, §9.5, §11.4, §11.6, §12.2–§12.4, §13, §14, §15, Appendix A; `src/config.ts`, `src/log*.ts`, `src/alerts.ts`, `src/egress/*`, `src/providers/*`, `src/contracts.ts`, `src/runs/*`, `src/app.ts`, `src/index.ts`, `Dockerfile`, `.github/workflows/release.yml` |
@@ -563,3 +563,20 @@ Independent PRs, in this order (each with its SPEC section and tests):
 
 v1.5.0 is tagged when all five are merged. Release notes and the site changelog per the usual
 release checklist.
+
+## 12. Implementation notes
+
+Where v1.5.0 differs from the text above; the SPEC describes what shipped.
+
+- Strict mode replaces an excluded `external` message and an exception message with `"[omitted]"`
+  (not a localized engine text); `code`, `provider_status`, `retriable` stay.
+- External call ids become `c1`, `c2`, … in the order a run's records first see them (not
+  `s<step>c<index>`).
+- An event with no run context uses `LOG_CONTENT`; only a request whose `logging` is present but
+  invalid falls back to `none` for its refusal.
+- The engine trims middle turns only (SPEC §5.1): the first user message and the last four are
+  kept, so one oversized message can still exceed a local server's context. Documented in §9.6.
+- The signature of `SHA256SUMS` is produced when the repository has a `COSIGN_PRIVATE_KEY` secret;
+  without it the release carries unsigned checksums.
+- The TLS listener stays out of scope (§10); metrics also carry `theloop_tool_call_duration_seconds`
+  and journal size.

@@ -223,6 +223,7 @@ maximum size of any incoming request body is `MAX_REQUEST_BYTES` (env, default 1
 | `POST /runs/{id}/ack` | harness | result recorded, release the session lock |
 | `GET /logs`, `GET /runs/{id}/logs` | harness, operator | event journal |
 | `GET /health` | anyone | liveness and load |
+| `GET /metrics` | scraper | Prometheus metrics (§4.10), off unless `METRICS_TOKEN` is set |
 
 ### 4.1 Auth and egress
 
@@ -302,9 +303,10 @@ maximum size of any incoming request body is `MAX_REQUEST_BYTES` (env, default 1
 | `idempotency_key` | **yes if there are write tools**; otherwise no | Usually the id of the user message. A repeat with the same key while the run is retained → `200` with the same `run_id`, `stream_url`, `cancel_url` (same token), no second execution; the result is read via `GET`. Same key, different body → `409 idempotency_mismatch`. Sent to tools as `origin_request_id` (§6.1). Durable idempotency (after a restart, beyond retention) is the harness's job, by message id. |
 | `history_revision` | **yes if there are write tools**; otherwise no | History revision at request time (turn count or session record version). The engine does not interpret it and **echoes** it in the result and `GET`; the harness uses it to place late results (§3). |
 | `llm` | yes | One model (the object below), or an array of 1–5 such objects — a fallback chain tried in order (§9.5). Every `llm.*` row applies to each entry. |
-| `llm.provider` | yes | From the allowlist, §9.1. |
+| `llm.provider` | yes | From the allowlist, §9.1; `endpoint` — an operator-defined model server (§9.6). |
+| `llm.endpoint` | with `provider: "endpoint"` only | The endpoint's name (`LLM_ENDPOINT_<NAME>_*`, §9.6). Unknown → `400 bad_request` listing the known names; forbidden with any other provider. |
 | `llm.model` | yes | Free-form string, validated by the provider. |
-| `llm.api_key` | yes for `openai-compatible` | Overrides env. An env key is used **only** with the built-in `base_url` of a named provider. |
+| `llm.api_key` | yes for `openai-compatible` | Overrides env. An env key is used **only** with the built-in `base_url` of a named provider, its operator override (`<PROVIDER>_BASE_URL`, §9.1) or an endpoint (§9.6). |
 | `llm.base_url` | `openai-compatible` only | HTTPS, host in `EGRESS_ALLOWLIST`. |
 | `llm.gigachat_scope` | no | `gigachat` only: `GIGACHAT_API_PERS \| GIGACHAT_API_B2B \| GIGACHAT_API_CORP`. Empty → env `GIGACHAT_SCOPE`. The scope must match the key, otherwise the provider's OAuth refuses (§9.1). Ignored for other providers. |
 | `llm.context_window_tokens` | no | Model window for context trimming (§5.1). Absent → built-in model profile; no profile → `MAX_CONTEXT_FALLBACK` (env, 128k). |
@@ -321,6 +323,7 @@ maximum size of any incoming request body is `MAX_REQUEST_BYTES` (env, default 1
 | `wait` | no | `true` → synchronous `200` with the result body (§7); a configured callback is still sent. For tests and curl. |
 | `meta` | no; **`meta.session_id` is required if there are write tools** | Passed through to tools and the callback. **Reserved** keys read by the engine: `session_id` (lock, part of the `operation_id` hash), `timezone` (§9.4), `locale` (Appendix B). |
 | `output_checks` | no | Up to 4 checks of structured blocks in the final answer: `{ fence, schema, max_repairs?, presents?, interim?, grounded? }` — §5.4. The schema is compiled on receipt: invalid → `400 bad_request` (`output_check_schema_invalid: …`). |
+| `logging` | no | `{ content: "all" \| "none" \| [classes] }` — what the engine may write to its own logs for this run. Narrows `LOG_CONTENT`, never widens it (§12.5). The request path (SSE, callback, `GET`) is unaffected. |
 
 Response `202`:
 
@@ -428,6 +431,11 @@ No auth. Answers 2xx as soon as the server listens, without probing providers.
                   "active": 3, "queued": 5, "cooldown_ms": 640 } ] }
 ```
 
+`HEALTH_DETAILS=0` (env): an unauthenticated `/health` answers `{ "ok": true, "shutting_down": false }`
+only — no version, counters or `provider_throttle` — for installations whose scanners flag
+unauthenticated version disclosure; with `Authorization: Bearer <ENGINE_TOKEN>` the full body as
+above. Default `1`.
+
 Per provider key: `limit` — current AIMD ceiling, `max` — ceiling from env, `active` —
 slots in use, `queued` — waiting for a slot, `cooldown_ms` — remaining pause after a
 429. `key` is the first 8 hex chars of the key hash, never the key. Idle keys at the
@@ -467,8 +475,12 @@ for results is `GET /runs/{id}`.
                  "content": { "result": { "state": "shipped" } } } ],
   "truncated": false, "next_since": 840, "source": "memory",
   "buffer": { "entries": 840, "bytes": 412345, "dropped": 0,
-              "oldest_at": "…", "last_seq": 840, "content": true, "disk": false } }
+              "oldest_at": "…", "last_seq": 840, "content": true,
+              "content_classes": ["prompt", "messages", "tools", "model_names", "external", "meta", "urls"],
+              "disk": false } }
 ```
+
+`buffer.content_classes` — the env content classes (§12.5); `buffer.content` — whether any is on.
 
 `source` — where the entries came from: `memory`, `disk` or `mixed`. Memory is read first;
 the disk journal is scanned (newest day first, streaming, with a `run_id` / `session_id`
@@ -481,6 +493,36 @@ a `since` request. Entries are returned in journal order.
 Tail: the next request uses `since=<next_since>`. `GET /runs/{id}/logs` keeps working
 after the run is deleted from the registry, as long as its events are in the journal
 (memory or disk); neither run nor events → `404 run_not_found`. Responses carry `Cache-Control: no-store`.
+
+### 4.10 `GET /metrics` — Prometheus metrics
+
+Prometheus text exposition format. Auth: `Authorization: Bearer <METRICS_TOKEN>` (env;
+`METRICS_TOKEN_FILE` too). `METRICS_TOKEN` unset → `404`. `ENGINE_TOKEN` is not accepted: a
+scraper must not hold the harness credential. Responses carry `Cache-Control: no-store`.
+
+| Metric | Type | Labels |
+|---|---|---|
+| `theloop_runs_started_total` | counter | — |
+| `theloop_runs_finished_total` | counter | `status`, `finish_reason` |
+| `theloop_runs_active`, `theloop_runs_retained` | gauge | — |
+| `theloop_provider_attempts_total` | counter | `provider`, `model`, `outcome` (`ok` / `failed` / `unknown`), `status_class` (`2xx` / `4xx` / `429` / `5xx` / `network`) |
+| `theloop_provider_attempt_duration_seconds`, `theloop_provider_ttft_seconds` | histogram | `provider`, `model` |
+| `theloop_tokens_total` | counter | `provider`, `model`, `kind` (`input` / `output` / `cache_read` / `cache_write`) |
+| `theloop_provider_queue_active`, `theloop_provider_queue_depth` | gauge | `provider` (summed over keys) |
+| `theloop_provider_queue_wait_seconds` | histogram | `provider` |
+| `theloop_llm_fallbacks_total` | counter | `from_provider`, `to_provider` |
+| `theloop_tool_calls_total` | counter | `outcome` |
+| `theloop_tool_call_duration_seconds` | histogram | — |
+| `theloop_callback_deliveries_total` | counter | `outcome` (`sent` / `failed`) |
+| `theloop_egress_denied_total` | counter | `purpose` (`tool` / `callback` / `image` / `provider` / `error_webhook`), `reason` (`not_allowlisted` / `private_ip` / `scheme` / `userinfo` / `invalid_url`) |
+| `theloop_journal_bytes` | gauge | `store` (`memory` / `disk`) |
+| `theloop_journal_dropped_total` | counter | `store` (`memory`) |
+
+Label cardinality is bounded by construction: `provider` is a provider id or `endpoint:<name>`
+(an operator-defined set); no key hashes, `meta`, session, run, tenant or tool-name labels.
+`model` comes from requests: the first `METRICS_MAX_MODELS` (env, 50) distinct values get their own
+label, the rest are `other`. Counters reset on restart (one process, §11.2). Per-key queue
+detail stays in `/health`.
 
 ## 5. Message format — `StoredMessage`
 
@@ -572,6 +614,14 @@ and vice versa (Kimi likewise — `kimi`). The `providerOptions` key on replay i
 adapter reads. Kimi thinking blocks are unsigned: the empty signature arrives only in
 `content_block_start`, which the adapter does not read, so the engine stores a closed
 Kimi block with `signature: ""` — without one the adapter would drop it on replay.
+
+An endpoint (§9.6) marks its reasoning `endpoint:<name>`: a signature from one endpoint is
+replayed only to the same endpoint, never to another or to a named provider. The
+`providerOptions` key is `anthropic` for an `anthropic`-kind endpoint and the endpoint name for
+an `openai`-kind one. `_REASONING=unsigned` stores closed blocks with `signature: ""`, as for
+Kimi. An `openai`-kind endpoint replays reasoning per `_REASONING_REPLAY`: `none` (default —
+stored, never sent back), `reasoning` (the field current Ollama and vLLM read; the engine renames
+the SDK's `reasoning_content`), `reasoning_content`.
 
 SSE does not carry `reasoning` unless `stream.expose_reasoning` is set. The harness
 stores the part and decides whether to show `text`.
@@ -1371,7 +1421,8 @@ at `lost` runs and `unknown_calls`.
 
 ### 9.1 Allowlist by type
 
-`llm.provider` ∈ `anthropic | openai | deepseek | glm | gigachat | minimax | kimi | openai-compatible`.
+`llm.provider` ∈ `anthropic | openai | deepseek | glm | gigachat | minimax | kimi | openai-compatible | endpoint`
+(`endpoint` — an operator-defined model server, §9.6).
 Named providers are defined in code: kind (native `anthropic` / OpenAI dialect), a
 **built-in** `base_url`, the env key name, hard caps (§10), capabilities (§9.2), window
 profiles (§5.1). `openai-compatible` takes `base_url` from the request (HTTPS,
@@ -1380,6 +1431,18 @@ used with an arbitrary `base_url`.
 
 Key resolution: `llm.api_key` → else the named provider's env key → else
 `400 provider_key_missing`. **Keys never reach logs, SSE, the callback or error bodies.**
+
+**Base URL overrides.** `<PROVIDER>_BASE_URL` (`ANTHROPIC_`, `OPENAI_`, `DEEPSEEK_`, `GLM_`,
+`GIGACHAT_`, `MINIMAX_`, `KIMI_`) points a named provider at an on-prem installation of the same
+API or a corporate gateway that speaks it. Set by the operator, it is trusted like a built-in
+URL: the env key goes there. Everything else about the provider (dialect, capabilities, caps,
+window profiles, thinking, signatures) stays built in; `llm.base_url` from the request remains
+forbidden. Validated at startup (URL, scheme, no credentials, plain http only for a host in
+`EGRESS_HTTP_HOSTS`); a provider proxy together with an override is a startup error (§11.4).
+GigaChat has two destinations: `GIGACHAT_OAUTH_URL` overrides the OAuth host, and the two are set
+together or not at all; the token cache is keyed by OAuth URL + key + scope.
+`EGRESS_PUBLIC_PROVIDERS=0` turns the built-in public hosts off: an `llm` entry that would use
+one is refused on receipt with `400 egress_denied`.
 
 **GigaChat (Sber).** `api_key` is the "authorization key" (Basic); the engine obtains the
 OAuth token itself (`POST ngw.devices.sberbank.ru:9443/api/v2/oauth`, ≈ 30 min). Scope —
@@ -1712,6 +1775,67 @@ Result of a run whose primary was down:
 ]
 ```
 
+### 9.6 Model endpoints and local models
+
+An endpoint is an operator-defined model server with a name: a local server (Ollama, vLLM, TGI,
+llama.cpp, LM Studio) or an internal gateway (LiteLLM and the like). Defined by env
+`LLM_ENDPOINT_<NAME>_*` (`<NAME>`: `[A-Z0-9_]+`; requests use it lowercased with `_` → `-`, so
+`LLM_ENDPOINT_VLLM_MAIN_URL` is `vllm-main`):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `_URL` | required | base URL (`…/v1`); http only for a host in `EGRESS_HTTP_HOSTS` |
+| `_KIND` | `openai` | wire dialect: `openai` or `anthropic` |
+| `_API_KEY` (`_API_KEY_FILE`) | — | absent → no credential header at all |
+| `_CONTEXT_WINDOW` | `MAX_CONTEXT_FALLBACK` | tokens; set it below the server's context with headroom |
+| `_MAX_TOKENS` | 32 000 | cap for `limits.max_tokens` |
+| `_PARALLEL_TOOLS`, `_USAGE_IN_STREAM` | `0` | capabilities (§9.2) |
+| `_TOOL_CHOICE_NONE` | `1` | honors `tool_choice: none`; `0` — such steps send no tools |
+| `_THINKING` | `effort` (`openai`), `budget` (`anthropic`) | how `params.thinking` is sent: `off`, `effort`, `budget`, `adaptive` |
+| `_REASONING` | `signed` | `anthropic` kind: `signed` or `unsigned` (§5.2) |
+| `_REASONING_REPLAY` | `none` | `openai` kind: `none`, `reasoning`, `reasoning_content` (§5.2) |
+| `_PREFIX_BINDING` | `0` | `anthropic` + `signed` only: the §9.3 edit detector and `drop_block` |
+| `_MAX_CONCURRENCY` | `PROVIDER_MAX_CONCURRENCY_DEFAULT` | provider queue ceiling (§11.6) |
+| `_CONCURRENCY_SCOPE` | `endpoint` | `endpoint` — one queue per server whatever key a request carries; `key` — per key |
+
+Request: `"llm": { "provider": "endpoint", "endpoint": "vllm-main", "model": "qwen3-235b-a22b" }`.
+`llm.base_url` is forbidden; `llm.api_key` overrides `_API_KEY`; `llm.capabilities` and
+`llm.context_window_tokens` win over the endpoint's values. A malformed definition stops the
+engine at startup.
+
+- **Public reference.** Wherever the engine names a model entry — `usage.calls[]`, `llm_used`,
+  `llm_fallbacks[]`, SSE `start` and `llm_fallback`, `run_start` — an endpoint is
+  `{ "provider": "endpoint", "endpoint": "<name>" }`. `endpoint:<name>` is internal: the reasoning
+  owner (§5.2), the queue key (§11.6), the metrics label (§4.10).
+- **Keyless means no credential.** Without a key the request carries no `Authorization`,
+  `x-api-key` or other auth header, and the engine never lets an SDK fall back to its own env
+  (`@ai-sdk/anthropic` would read `ANTHROPIC_API_KEY`).
+- **Egress.** The endpoint origin (scheme, host, port) is allowed for the provider purpose only,
+  never for tools, the callback or images; `EGRESS_PRIVATE_CIDRS` / `EGRESS_HTTP_HOSTS` apply (§11.4).
+- Fallback chains (§9.5) may mix endpoints and named providers; cost works through `llm.pricing`.
+
+**Local models.** Ollama is the easiest to stand up (CPU or one GPU, models copied as files);
+vLLM is the one for load (batching, real concurrency, tool parsers). Points that matter:
+
+- **The context window trap.** A local server's context is whatever it was started with (Ollama
+  picks a default by version and memory, often far below the model's maximum), and a longer
+  prompt is cut **silently**: the model loses earlier turns without an error. Set the server
+  context explicitly (`OLLAMA_CONTEXT_LENGTH` / `num_ctx`; vLLM `--max-model-len`) and
+  `_CONTEXT_WINDOW` about 20 % below it: the engine estimates tokens by characters, not with the
+  model's tokenizer. The engine trims middle turns only — the first user message and the last four
+  messages are kept (§5.1) — so one oversized message can still exceed the server context.
+  `endpoint_context_default` is logged at startup for an endpoint without `_CONTEXT_WINDOW`.
+- **Reasoning must be structured.** The engine streams text to SSE as it arrives and does not
+  parse inline `<think>…</think>` out of it; turn on the server's reasoning output (Ollama
+  `think`, vLLM `--reasoning-parser`), otherwise thinking shows up as answer text.
+- **Tools.** Use models with native tool calling in the server (vLLM needs
+  `--enable-auto-tool-choice` and a tool parser). A server that ignores `tool_choice: none` gets
+  `_TOOL_CHOICE_NONE=0`.
+- **Concurrency.** Set `_MAX_CONCURRENCY` to the server's parallelism (`OLLAMA_NUM_PARALLEL`):
+  excess runs wait in the engine queue instead of timing out inside the server.
+- `npm run smoke:local` (not in CI) checks a live server: a tool call and an answer that uses it,
+  usage, a cancel mid-stream, an oversized history trimmed by the engine.
+
 ## 10. Limits and timeouts
 
 | `limits.` | Default | Server ceiling | When exceeded |
@@ -1908,7 +2032,36 @@ One HTTP client for tools, the callback, `openai-compatible` and images (§5.3):
 - headers from the request: only `Authorization` and `X-*`, **except** `X-Forwarded-*`,
   `X-Original-*`, `X-Real-IP`, `X-HTTP-Method-Override`; `Host`, `Cookie`, hop-by-hop and
   everything else are dropped with a warning;
-- connect and body timeouts, body size limits — §6.2.
+- connect and body timeouts, body size limits — §6.2;
+- credentials in a URL (`user:password@`) are refused (`400 egress_denied`) and never logged.
+
+**Closed networks.** Three env variables relax the rules for named targets only:
+
+- `EGRESS_PRIVATE_CIDRS` — comma-separated CIDR ranges (`10.20.0.0/16,fd12:3456::/48`). An
+  address inside a listed range passes the private-address check; the host still has to pass
+  `EGRESS_ALLOWLIST` (an IP literal may be an entry if it is inside a listed range), and DNS
+  pinning stays: every answer is filtered, the connection goes to an accepted address only.
+  Loopback passes only when listed explicitly (a sidecar model server).
+- **Normalization and unconditional denies.** Every check normalizes first: IPv4-mapped and
+  IPv4-compatible IPv6 become the embedded IPv4; NAT64 and 6to4 are checked as their embedded
+  IPv4. `0.0.0.0/8`, `::/128`, `169.254.0.0/16`, `fe80::/10` (link-local, incl. cloud metadata),
+  `224.0.0.0/3` and `ff00::/8` are refused whatever the env says; a range overlapping them, or a
+  translation range (`::ffff:0:0/96`, `::/96`, `64:ff9b::/96`, `64:ff9b:1::/48`, `2002::/16`), stops
+  the engine at startup.
+- **Ports.** An `EGRESS_ALLOWLIST` entry may carry a port (`llm.corp:8000`, `.svc.corp:443`,
+  `[fd00::1]:8000`): then only that port matches; without one any port matches, as before.
+- `EGRESS_HTTP_HOSTS` — entries in allowlist syntax that may be reached over plain `http:`
+  (the target must also be allowed). Plain HTTP sends `Authorization`, `X-Engine-Secret` and
+  payloads in clear: the first request per host logs `egress_plaintext`.
+  `ALLOW_INSECURE_EGRESS=1` stays a development switch for `http://localhost`.
+- `EGRESS_PUBLIC_PROVIDERS=0` — built-in public provider hosts are not allowed (§9.1).
+- **Internal CA.** `NODE_EXTRA_CA_CERTS` points to one PEM bundle; to trust a corporate CA,
+  mount a bundle that contains it (and the image's extra CAs, if needed) or build a derived image
+  with the CA in `certs/`. `rejectUnauthorized: false` stays forbidden.
+
+A provider proxy sees no DNS answer, so it cannot honor the private-range rules: a proxy
+together with a base URL override for the same provider is a startup error, and endpoints have
+no proxy.
 
 **Provider proxies.** A named provider with env `<PROVIDER>_PROXY_URL` (`ANTHROPIC_`,
 `OPENAI_`, `DEEPSEEK_`, `GLM_`, `GIGACHAT_`, `MINIMAX_`, `KIMI_`) goes through the proxy; others go
@@ -1984,6 +2137,8 @@ steps on top.
   ceiling returns to the env value, and the next burst probes the limit again at the cost
   of a couple of retried 429s.
 - Idle keys at the default ceiling are not kept; a lowered one is kept until it recovers.
+- **Endpoints** (§9.6): the key is `endpoint:<name>` + the hash of the URL (and of the key with
+  `_CONCURRENCY_SCOPE=key`); the ceiling is `_MAX_CONCURRENCY`.
 - **One process** (§11.2): state is in memory, a restart resets the ceiling to env.
   Several instances would share a key's limit blindly — the ceiling is per instance.
 - `PROVIDER_THROTTLE=0` — no queue and no AIMD; §11.3 retries on 429 remain.
@@ -2032,7 +2187,8 @@ JSON (pino) to stdout, one line per event, each with `run_id`; where available �
 catalog is §12.4; stdout is filtered by `LOG_LEVEL`, the journal records every level.
 **Message contents, prompts, tool args / results and keys never go to stdout**
 (`LOG_PROMPTS=1` — local development only): event content goes only to the in-memory
-journal (§12.4), keys go nowhere. In every URL that reaches a log (access log,
+journal (§12.4), keys go nowhere. `LOG_CONTENT` and a request's `logging` narrow what every sink
+gets, metadata included (§12.5). In every URL that reaches a log (access log,
 `callback_sent`, `egress_headers_dropped`) the values of **all** query parameters are
 replaced with `<redacted>`: that is where engine run tokens and third-party secrets live.
 Parameter names stay.
@@ -2170,6 +2326,57 @@ without `LOG_DIR` a restart or deploy means an empty journal.
 | `journal_pruned` | warn | `LOG_DIR_MAX_BYTES` exceeded, oldest days deleted: `deleted`, `bytes_before`, `bytes_after` | — |
 | `journal_disk_ephemeral` | warn | startup: `LOG_DIR` is on the root filesystem (same device as `/`) — a hint, not an error | — |
 | `journal_write_failed` | warn | stdout only: appending to a day file failed, `err` | — |
+| `egress_plaintext` | warn | the first plain-http request to a host in this process (§11.4): `host`, `purpose` | — |
+| `endpoint_context_default` | warn | startup: an endpoint without `_CONTEXT_WINDOW` (§9.6): `endpoint`, `context_window` | — |
+
+### 12.5 Content classes and content-free logging
+
+Every field the engine writes to a sink — stdout (incl. the access log), the memory journal, the
+disk journal, the error-webhook body — is either safe metadata, a declared identifier, or belongs
+to a content class:
+
+| Class | What |
+|---|---|
+| `prompt` | `system`, its hash `system_sha256`, `prompt_blob` lines |
+| `messages` | history text, model text and reasoning, the answer, `partial_text`, engine notes, format-gate `block` / `draft` / `issues` |
+| `tools` | tool args, results, error bodies and messages, async results, the `search_tools` query |
+| `model_names` | names the model produced that the request did not declare (an invented tool or skill), JSON instance paths of format-gate errors, validation reasons quoting model output |
+| `external` | text from outside the engine: provider error bodies and messages, network / TLS errors, image fetch errors, callback receiver responses, webhook errors, GigaChat cleanup errors, exception messages and stacks, `run_rejected` messages and details |
+| `meta` | values of `meta` (keys and `session_id` stay) |
+| `urls` | URL paths and fragments (scheme, host and port stay; query values are always scrubbed) |
+
+**Safe metadata** is what the engine produces (ids it issued, codes, statuses, counts, sizes,
+durations, tokens, enums). **Declared identifiers** are values the harness declared — `session_id`,
+`idempotency_key`, `meta` keys, model and endpoint names, names of tools, skills and fences declared
+in the request; Appendix A H23 keeps content out of them. **External identifiers** — the provider's
+tool `call_id` and `provider_request_id` — are not trusted: in strict mode `call_id` is replaced
+by an engine-issued ref (`c1`, `c2`, … per run) and `provider_request_id` is dropped;
+the request path keeps the real ids.
+
+`LOG_CONTENT` (env) = `all` (default — output as before) | `none` | a comma list of classes to keep.
+`LOG_BUFFER_CONTENT=0` is an alias of `none` (and conflicts with any other `LOG_CONTENT`). A request
+narrows it with `logging.content` (`"none"` or a list): effective classes = env ∩ request. Any value
+other than `all` is **strict mode**:
+
+- every field goes through a field registry in code; an excluded class never reaches any sink —
+  neither the value nor anything derived from it (a hash, a prefix); lengths and counts stay;
+- excluded content keys are absent; excluded metadata becomes `"[omitted]"` (`meta` keeps its keys;
+  a URL keeps its origin; an exception message becomes `"[omitted]"` and its stack is omitted — a
+  message can span lines and forge frame-shaped lines, so no parsing of a stack is trusted);
+- a composite field is filtered by constituent before formatting (`history_tail`: text by
+  `messages`, tool calls and results by `tools`);
+- a string field the registry does not know is dropped.
+
+**Logging context.** `POST /runs` reads `logging` right after JSON parsing, before validation; the
+context covers validation warnings, `run_rejected`, every run event, the callback job, alerts and
+GigaChat cleanup, and stays bound to the run id until the run and its delivery job are gone. A
+`logging` that is present but invalid means `none` for the refusal that follows. An event with no
+run context uses `LOG_CONTENT`. `run_start` carries `content_classes` in strict mode.
+
+URL credentials are secrets, not content: redacted in every mode, including `all`. This section is
+about the engine's own records: `GET /runs/{id}`, SSE and the callback carry content as before, and
+run state lives in memory until retention (§11.5) — short retention is the knob for that. Changing
+`LOG_CONTENT` does not rewrite existing day files.
 
 ## 13. Conformance tests
 
@@ -2264,6 +2471,19 @@ equivalent of the following suites.
    journal — day files, `0600`, flush on shutdown, reads after a restart (`source: disk`)
    and past the memory ceiling (`mixed`, a tail with `since`), `days`, retention by age and
    by size, today kept.
+6b. **Content-free logging** (§12.5): a canary in `system`, every history role, `meta` values, tool
+   args, results and error bodies, a tool endpoint path, a callback path and receiver response, a
+   provider error message, model text, reasoning, tool call ids, an undeclared tool name, an
+   exception message forging a stack frame, a rejected body, an unknown async `call_id` — absent from
+   stdout, the memory and disk journals and webhook bodies with `LOG_CONTENT=none` and with
+   `logging.content: "none"`; a class list keeps exactly its classes; no unregistered field.
+6c. **On-prem** (§9.1, §9.6, §11.4, §4.10, §14): CIDR parsing, normalization (mapped hex, NAT64,
+   6to4), deny overlaps, ports, plain http only for listed hosts, a listed private range through
+   DNS, public providers off incl. chains, overrides with env keys, proxy conflict, the GigaChat
+   pair, endpoint parsing, keyless with every env key set (both kinds), reasoning replay in the
+   second request, purpose scoping, concurrency scope, the public reference, `_FILE` secrets,
+   `/metrics` auth and cardinality, `HEALTH_DETAILS`; and the real entry point started in a child
+   process opens no connection and resolves no name on its own.
 7. **Live smoke** (`npm run smoke`, keys in `.env`, not in CI): Anthropic with a tool call
    and thinking; GigaChat OAuth + TLS; an image with a code in it at Anthropic, OpenAI,
    GigaChat and MiniMax-M3 — the model must read the code; MiniMax M2.7 and M3 with a tool —
@@ -2271,8 +2491,24 @@ equivalent of the following suites.
 
 ## 14. Deployment and configuration
 
-Docker (`node:22-slim`, Russian Trusted Root CA in the image for GigaChat), `EXPOSE 8080`,
-a single always-on container. What the engine expects from the platform and what it means:
+Docker (`node:22-slim` by default, `--build-arg BASE_IMAGE=…` for a customer base image; Russian
+Trusted Root CA in the image for GigaChat), `EXPOSE 8080`, a single always-on container. The image
+runs as uid 1000, works under an arbitrary uid with gid 0 (OpenShift) and with a read-only root
+filesystem: the engine writes nothing outside `LOG_DIR`. `HEALTHCHECK` calls `/health` with `node`.
+
+**Offline install.** Every release carries, besides the registry image: `docker save` tarballs
+for linux/amd64 and arm64, a platform-independent Node bundle (`dist/`, production
+`node_modules` without native addons or install scripts, `certs/`; `node dist/index.js` on Node ≥
+22.9), a CycloneDX SBOM, `THIRD_PARTY_LICENSES.txt` and `SHA256SUMS` (with `SHA256SUMS.sig` when
+the release is signed). Every secret env variable accepts a `_FILE` twin (`ENGINE_TOKEN_FILE`,
+`CALLBACK_SECRET_FILE`, `<PROVIDER>_API_KEY_FILE`, `GIGACHAT_AUTH_KEY_FILE`,
+`<PROVIDER>_PROXY_URL_FILE`, `LLM_ENDPOINT_<NAME>_API_KEY_FILE`, `METRICS_TOKEN_FILE`): read once at
+startup, one trailing newline trimmed; both set, or an unreadable or empty file, stops the engine.
+The engine opens no connection on its own: only requests, runs, callbacks and
+`ERROR_WEBHOOK_URL` cause one. `deploy/` has a compose file with a local model and a Kubernetes
+example.
+
+What the engine expects from the platform and what it means:
 
 - **Health check path = `/health`**: it answers 2xx as soon as the server listens, without
   probing providers — otherwise a deploy would fail while a provider is down.
@@ -2326,7 +2562,7 @@ LOG_LEVEL=info                             # stdout only; the journal records ev
 LOG_PROMPTS=0                              # 1 — event content in stdout too (local only)
 LOG_BUFFER_MAX_ENTRIES=20000               # event journal for GET /logs (§12.4); 0 — off
 LOG_BUFFER_MAX_BYTES=33554432              # 32 MB
-LOG_BUFFER_CONTENT=1                       # 0 — metadata only in the journal
+LOG_BUFFER_CONTENT=1                       # 0 — alias of LOG_CONTENT=none
 LOG_CONTENT_MAX_CHARS=4000                 # cap of one content field, memory and stdout
 LOG_DIR=                                   # disk journal (§12.4): day files here; unset — off. Needs a persistent volume
 LOG_RETENTION_DAYS=7                       # day files older than this are deleted; 0 — today only
@@ -2336,6 +2572,16 @@ ANTHROPIC_API_KEY= OPENAI_API_KEY= DEEPSEEK_API_KEY= GLM_API_KEY= MINIMAX_API_KE
 ANTHROPIC_PROXY_URL= OPENAI_PROXY_URL=     # provider proxy (§11.4); likewise DEEPSEEK_ / GLM_ / GIGACHAT_ / MINIMAX_ / KIMI_
 GIGACHAT_AUTH_KEY= GIGACHAT_SCOPE=GIGACHAT_API_PERS
 NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt   # set in the Dockerfile
+EGRESS_PRIVATE_CIDRS=                      # private ranges egress may reach (§11.4); unset — none
+EGRESS_HTTP_HOSTS=                         # hosts reachable over plain http (allowlist syntax)
+EGRESS_PUBLIC_PROVIDERS=1                  # 0 — built-in public provider hosts are off
+ANTHROPIC_BASE_URL= OPENAI_BASE_URL=       # base URL override (§9.1); likewise DEEPSEEK_ / GLM_ / MINIMAX_ / KIMI_
+GIGACHAT_BASE_URL= GIGACHAT_OAUTH_URL=     # GigaChat on-prem: both or neither
+LLM_ENDPOINT_<NAME>_URL=                   # model endpoint (§9.6); _KIND, _API_KEY, _CONTEXT_WINDOW, …
+LOG_CONTENT=all                            # all | none | classes to keep (§12.5)
+METRICS_TOKEN=                             # GET /metrics (§4.10); unset — off
+METRICS_MAX_MODELS=50                      # distinct model labels before `other`
+HEALTH_DETAILS=1                           # 0 — unauthenticated /health answers ok only
 ```
 
 Code layout of the reference implementation:
@@ -2358,11 +2604,18 @@ src/
   providers/            allowlist (kind, base_url, caps, window), factory, GigaChat OAuth and
                         translator, throttle — queue and AIMD ceiling per key (§11.6)
   log.ts, log-buffer.ts structured events, the in-memory journal
+  log-policy.ts         content classes, the field registry, the logging context (§12.5)
+  log-disk.ts           the disk journal
+  egress/cidr.ts        address normalization, private ranges, unconditional denies
+  metrics.ts            GET /metrics
 ```
 
 ## 15. Out of scope for v1
 
-Several instances (Redis); step-level durable execution; history summarization; approval
+A TLS listener and mTLS (terminate TLS at a proxy); encryption of the disk journal at rest (use
+volume encryption); national-standard TLS suites such as GOST (terminate at a proxy); erasure of
+journal entries by session; an egress proxy for tools / callback / endpoints; inline `<think>`
+parsing for endpoints; OpenTelemetry. Several instances (Redis); step-level durable execution; history summarization; approval
 logic in the engine (it lives in the harness through `deferred`); scoped tokens for several
 server-side clients; RAG / embeddings; multi-agent orchestration; structured / card
 answers as a content type (room is left: a new `type` in `ContentPart` does not break old
@@ -2398,6 +2651,7 @@ come from skipping one of these.
 | H20 | Store the `tool` messages of `load_skill` and `search_tools` verbatim, `result` and `builtin` included: the engine restores loaded skills from them on the next run, and only marked messages count. | §5, §6.8 |
 | H21 | A run that ends other than `awaiting_tool` with a `tool_calls[]` entry carrying `operation_id` and `status: "cancelled"`: cancel that operation, so its approval can no longer execute; the history already closes the call. | §6.5 |
 | H22 | Render the last assistant message of a `stopped_limit` run when it has text — with the final step on it is always there (the model's answer or the `answer_source: "fallback"` text); an error screen is for an empty answer only. | §7, §10.1 |
+| H23 | Keep content out of identifiers — `session_id`, `idempotency_key`, `meta` keys, tool / skill / fence / model / endpoint names: they are logged in every logging mode. | §12.5 |
 
 A reference harness, a conformance test kit for harnesses and examples for common platforms
 are on the roadmap.
