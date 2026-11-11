@@ -84,8 +84,13 @@ jobs:
           node scripts/bundle-check.mjs "$STAGE"
           # the bundle starts and answers /health with nothing but node
           (cd "$STAGE" && ENGINE_TOKEN=t PORT=18080 node dist/index.js & echo $! > /tmp/pid)
-          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:18080/health && break; sleep 1; done
-          kill "$(cat /tmp/pid)"
+          trap 'kill "$(cat /tmp/pid)" 2>/dev/null || true' EXIT
+          healthy=0
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18080/health; then healthy=1; break; fi
+            sleep 1
+          done
+          [ "$healthy" = 1 ] || { echo "the Node bundle did not answer /health"; exit 1; }
           node scripts/third-party-licenses.mjs "$STAGE" > out/THIRD_PARTY_LICENSES.txt
           tar czf "out/theloop-$V-node.tar.gz" "$STAGE"
           npm sbom --omit dev --sbom-format cyclonedx > "out/theloop-$V-sbom.cdx.json"

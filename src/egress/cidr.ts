@@ -143,6 +143,51 @@ const TRANSLATION: Cidr[] = [
   deny('2002::/16'),
 ]
 
+/** Private, loopback, CGNAT, documentation and reserved ranges (SPEC §11.4). */
+const PRIVATE: Cidr[] = [
+  deny('0.0.0.0/8'),
+  deny('10.0.0.0/8'),
+  deny('100.64.0.0/10'),
+  deny('127.0.0.0/8'),
+  deny('169.254.0.0/16'),
+  deny('172.16.0.0/12'),
+  deny('192.0.0.0/24'),
+  deny('192.0.2.0/24'),
+  deny('192.168.0.0/16'),
+  deny('198.18.0.0/15'),
+  deny('198.51.100.0/24'),
+  deny('203.0.113.0/24'),
+  deny('224.0.0.0/3'),
+  deny('::/127'),
+  deny('fc00::/7'),
+  deny('fe80::/10'),
+  deny('ff00::/8'),
+  deny('2001:db8::/32'),
+  deny('64:ff9b::/96'),
+  deny('64:ff9b:1::/48'),
+]
+
+/**
+ * Private by its bytes, not by its spelling: the normalized form, and for NAT64 / 6to4 the
+ * IPv4 it carries, are checked too — `[2002:7f00:1::1]` is loopback in disguise.
+ */
+export function isPrivateAddr(raw: Addr): boolean {
+  const forms = [raw, normalize(raw), embeddedV4(raw)].filter((a): a is Addr => a !== null)
+  return forms.some((a) => PRIVATE.some((p) => cidrContains(p, a)))
+}
+
+/**
+ * Egress decision for one address: never an always-denied one; a public one yes; a private
+ * one only inside a listed range, and never when the private IPv4 is carried by a translation
+ * (NAT64 / 6to4) form.
+ */
+export function addressAllowed(raw: Addr, cidrs: readonly Cidr[]): boolean {
+  if (alwaysDenied(raw)) return false
+  if (!isPrivateAddr(raw)) return true
+  if (embeddedV4(raw)) return false
+  return inListedRange(raw, cidrs)
+}
+
 export function alwaysDenied(raw: Addr): boolean {
   const forms = [raw, normalize(raw), embeddedV4(raw)].filter((a): a is Addr => a !== null)
   return forms.some((a) => ALWAYS_DENY.some((d) => cidrContains(d, a)))

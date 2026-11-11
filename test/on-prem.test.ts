@@ -10,7 +10,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { createEngine, type Engine } from '../src/app.js'
 import { createConfig } from '../src/config.js'
-import { alwaysDenied, inListedRange, parseAddr, parseCidrList } from '../src/egress/cidr.js'
+import { addressAllowed, alwaysDenied, inListedRange, parseAddr, parseCidrList } from '../src/egress/cidr.js'
 import { EgressClient, hostMatchesAllowlist } from '../src/egress/client.js'
 import { buildModel, renameReasoning } from '../src/providers/factory.js'
 import type { Llm } from '../src/contracts.js'
@@ -79,6 +79,21 @@ describe('private ranges (SPEC §11.4)', () => {
     expect(alwaysDenied(parseAddr('2002:a9fe:a9fe::1')!)).toBe(true)
     expect(alwaysDenied(parseAddr('::')!)).toBe(true)
     expect(alwaysDenied(parseAddr('224.0.0.1')!)).toBe(true)
+  })
+
+  it('private by bytes: 6to4 / NAT64 carrying a private IPv4, expanded spellings', () => {
+    const none = parseCidrList('')
+    const listed = parseCidrList('127.0.0.0/8,10.0.0.0/8')
+    for (const ip of ['2002:7f00:1::1', '2002:0a00:0001::1', '64:ff9b::7f00:1', '0:0:0:0:0:ffff:7f00:1', '0000:0000:0000:0000:0000:0000:0000:0001']) {
+      expect(addressAllowed(parseAddr(ip)!, none)).toBe(false)
+    }
+    // a translated private IPv4 is never opened by a range
+    expect(addressAllowed(parseAddr('2002:7f00:1::1')!, listed)).toBe(false)
+    expect(addressAllowed(parseAddr('::ffff:127.0.0.1')!, listed)).toBe(true)
+    expect(addressAllowed(parseAddr('2002:0808:0808::1')!, none)).toBe(true)
+    expect(addressAllowed(parseAddr('8.8.8.8')!, none)).toBe(true)
+    const egress = new EgressClient(createConfig({ ...baseEnv, EGRESS_ALLOWLIST: '2002:7f00:1::1' }))
+    expect(() => egress.assertAllowed('https://[2002:7f00:1::1]/x', 'tool:t')).toThrow(/private address/)
   })
 
   it('ports in allowlist entries', () => {

@@ -37,8 +37,11 @@ WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev || npm install --omit=dev
 COPY --from=build /app/dist ./dist
-# group 0 can read everything: OpenShift runs the image under an arbitrary uid with gid 0
-RUN chgrp -R 0 /app && chmod -R g=u /app
+# group 0 can read everything: OpenShift runs the image under an arbitrary uid with gid 0.
+# The journal directory exists owned by 1000:0, so a fresh named volume mounted there inherits it
+RUN mkdir -p /var/lib/theloop/journal \
+  && chown -R 1000:0 /var/lib/theloop && chmod -R g=u /var/lib/theloop \
+  && chgrp -R 0 /app && chmod -R g=u /app
 
 ENV NODE_ENV=production
 # Non-root; nothing is written outside LOG_DIR, so a read-only root filesystem works (SPEC §14)

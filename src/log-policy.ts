@@ -19,6 +19,9 @@ export const NO_CLASSES: ClassSet = new Set()
 
 export const OMITTED = '[omitted]'
 
+/** contracts.ts PROVIDER_IDS, repeated here: contracts imports this module. */
+const KNOWN_PROVIDERS = ['anthropic', 'openai', 'deepseek', 'glm', 'gigachat', 'minimax', 'kimi', 'openai-compatible', 'endpoint'] as const
+
 export function isAllClasses(set: ClassSet): boolean {
   return set.size === CONTENT_CLASSES.length
 }
@@ -112,7 +115,15 @@ const FIELDS: Record<string, Rule> = {
   from: 'safe',
   to: 'safe',
   llm_used: 'safe',
-  llm_fallbacks: 'safe',
+  // each entry carries the provider's error message
+  llm_fallbacks: (value, ctx) =>
+    Array.isArray(value)
+      ? value.map((item) =>
+          item && typeof item === 'object' && 'error' in item
+            ? { ...(item as object), error: errorObject((item as { error: unknown }).error, ctx) }
+            : item,
+        )
+      : value,
   status: 'safe',
   http_status: 'safe',
   provider_status: 'safe',
@@ -221,6 +232,7 @@ const FIELDS: Record<string, Rule> = {
   cost: 'safe',
   reasons: 'safe',
   event: 'safe',
+  alert: 'safe',
   params: 'safe',
   public_url: 'safe',
   version: 'safe',
@@ -247,6 +259,13 @@ const EVENT_FIELDS: Record<string, Rule> = {
   'tool_result.error': 'tools',
   'output_check.errors': 'model_names',
   'tool_calls_sealed.reason': 'safe',
+  // meta.locale as the caller sent it
+  'locale_unsupported.requested': 'meta',
+  // names of unknown params come from the request body
+  'llm_params_unknown.params': 'external',
+  // a refused body: the provider may be anything; keep only a known id
+  'run_rejected.provider': (value) =>
+    typeof value === 'string' && (KNOWN_PROVIDERS as readonly string[]).includes(value) ? value : OMITTED,
   // `invalid_tool_input: <reason>` quotes model output (an invented name, argument values)
   'tool_call_rejected.reason': (value, ctx) =>
     typeof value === 'string' && !(ctx.classes.has('model_names') && ctx.classes.has('tools'))

@@ -17,7 +17,7 @@ import { EgressClient } from './egress/client.js'
 import { EngineError } from './errors.js'
 import { newRunId, hashBody, timingSafeEqualStr } from './ids.js'
 import { configureAlerts, sendAlert } from './alerts.js'
-import { diskJournal, flushJournal, initLogger, log, logBuffer, logContentClasses, classList, logger, safeUrl, bindRunContext } from './log.js'
+import { diskJournal, flushJournal, initLogger, log, logBuffer, logContentClasses, classList, logger, bindRunContext, accessLogUrl } from './log.js'
 import {
   intersectClasses,
   newLogContext,
@@ -127,7 +127,7 @@ export function createEngine(
     logger().debug(
       {
         method: c.req.method,
-        url: safeUrl(new URL(c.req.url).pathname + new URL(c.req.url).search),
+        url: accessLogUrl(new URL(c.req.url).pathname, new URL(c.req.url).search),
         status: c.res.status,
         duration_ms: Date.now() - started,
       },

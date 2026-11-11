@@ -37,6 +37,9 @@ spec:
       terminationGracePeriodSeconds: 15
       securityContext:
         runAsNonRoot: true
+        # the journal PVC must be writable by the container's group; on OpenShift drop fsGroup,
+        # the restricted SCC assigns one from the namespace range
+        fsGroup: 1000
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: theloop

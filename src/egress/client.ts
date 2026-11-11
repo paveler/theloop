@@ -20,8 +20,8 @@ import type { Config } from '../config.js'
 import type { ProviderId } from '../contracts.js'
 import { EngineError } from '../errors.js'
 import { log, safeUrl } from '../log.js'
-import { isLocalHostname, isPrivateAddress } from './ip.js'
-import { alwaysDenied, inListedRange, parseAddr, type Cidr } from './cidr.js'
+import { isLocalHostname } from './ip.js'
+import { addressAllowed, parseAddr, type Cidr } from './cidr.js'
 import { countEgressDenied } from '../metrics.js'
 
 /** X-* headers the engine never lets out, although the X- prefix is otherwise allowed (SPEC §11.4). */
@@ -188,12 +188,10 @@ export class EgressClient {
    * A resolved or literal address: never an always-denied one; a private one only inside
    * EGRESS_PRIVATE_CIDRS (SPEC §11.4).
    */
-  private addressAllowed(address: string, family?: number): boolean {
+  private addressAllowed(address: string, _family?: number): boolean {
     const addr = parseAddr(address)
     if (!addr) return false
-    if (alwaysDenied(addr)) return false
-    if (!isPrivateAddress(address, family)) return true
-    return inListedRange(addr, this.cidrs)
+    return addressAllowed(addr, this.cidrs)
   }
 
   private notePlaintext(url: URL, what: string): void {
@@ -295,6 +293,9 @@ export class EgressClient {
         text: new TextDecoder().decode(bytes),
         bytes,
       }
+    } catch (err) {
+      if (isPrivateIpRefusal(err)) countEgressDenied(purposeCategory(req.purpose), 'private_ip')
+      throw err
     } finally {
       clearTimeout(timeout)
       req.signal?.removeEventListener('abort', onOuterAbort)
@@ -328,17 +329,31 @@ export class EgressClient {
     return (input, init) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
       this.assertAllowed(url, 'provider')
-      return undiciFetch(url, {
-        ...(init as Record<string, unknown>),
-        redirect: 'error',
-        dispatcher,
-      } as never) as unknown as Promise<Response>
+      return (
+        undiciFetch(url, {
+          ...(init as Record<string, unknown>),
+          redirect: 'error',
+          dispatcher,
+        } as never) as unknown as Promise<Response>
+      ).catch((err: unknown) => {
+        if (isPrivateIpRefusal(err)) countEgressDenied('provider', 'private_ip')
+        throw err
+      })
     }
   }
 
   async close(): Promise<void> {
     await Promise.all([this.agent.close(), ...[...this.proxies.values()].map((p) => p.close())])
   }
+}
+
+/** The DNS filter refused every answer (SPEC §11.4); undici wraps it in `cause`. */
+function isPrivateIpRefusal(err: unknown): boolean {
+  for (let e: unknown = err, depth = 0; e && depth < 4; depth++) {
+    if ((e as { code?: unknown }).code === 'EGRESS_PRIVATE_IP') return true
+    e = (e as { cause?: unknown }).cause
+  }
+  return false
 }
 
 /** Streaming body read with a ceiling: exceeding it is an error, not truncation (SPEC §6.2). */

@@ -55,6 +55,13 @@ Everything is opt-in: with no new env set, the engine behaves as v1.4.x, except 
   and from the error webhook.
 - URL credentials (`user:password@`) are refused in every egress URL and redacted from every log.
 
+### Fixed
+
+- `error_webhook_failed` journal entries were recorded under the name of the alert that failed
+  (`ack_missing`, `run_failed`, …): the alert name went into a field called `event`. It is now `alert`.
+- An egress address is classified by its bytes: a 6to4 or NAT64 address carrying a private IPv4
+  (`[2002:7f00:1::1]`) and expanded IPv6 spellings of loopback are refused like the address they carry.
+
 ## v1.4.1 — 2026-11-07
 
 ### Fixed

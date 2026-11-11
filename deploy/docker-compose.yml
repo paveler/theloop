@@ -38,6 +38,7 @@ services:
       HEALTH_DETAILS: "0"
       METRICS_TOKEN_FILE: /run/secrets/metrics_token
     volumes:
+      # a fresh named volume inherits the image's 1000:0 ownership of this directory
       - journal:/var/lib/theloop/journal
     secrets: [engine_token, metrics_token]
     depends_on: [ollama]

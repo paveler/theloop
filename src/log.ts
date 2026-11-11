@@ -20,6 +20,7 @@ import {
   classList,
   isAllClasses,
   newLogContext,
+  OMITTED,
   requestLogContext,
   sanitizeContent,
   sanitizeFields,
@@ -154,8 +155,8 @@ export function sanitizeAlert(event: string, fields: LogFields): LogFields {
 
 export { classList }
 
-function emit(level: LogLevel, event: string, rawFields: LogFields = {}, rawContent?: LogFields): void {
-  const ctx = contextFor(rawFields)
+function emit(level: LogLevel, event: string, rawFields: LogFields = {}, rawContent?: LogFields, given?: LogContext): void {
+  const ctx = given ?? contextFor(rawFields)
   const strict = !isAllClasses(ctx.classes)
   const fields = strict ? sanitizeFields(event, rawFields, ctx) : rawFields
   const content = rawContent && strict ? sanitizeContent(event, rawContent, ctx) : rawContent
@@ -184,6 +185,29 @@ function emit(level: LogLevel, event: string, rawFields: LogFields = {}, rawCont
     prompt !== null && sha256 !== null ? { sha256, text: clipString(prompt, max) } : undefined
   const entry = buffer.push(level, event, fields, journaled(contentMaxChars), blob(contentMaxChars))
   disk?.append(entry, journaled(diskContentMaxChars), blob(diskContentMaxChars))
+}
+
+/**
+ * Events emitted outside the run's async path (an alert's completion handler) carry the
+ * context captured where the work started (SPEC §12.5).
+ */
+export function logIn(ctx: LogContext) {
+  return {
+    info: (event: string, fields?: LogFields, content?: LogFields) => emit('info', event, fields, content, ctx),
+    warn: (event: string, fields?: LogFields, content?: LogFields) => emit('warn', event, fields, content, ctx),
+  }
+}
+
+/**
+ * The access log's path (SPEC §12.2, §12.5): without the `urls` class only the route shape is
+ * written — a path the caller chose may carry anything.
+ */
+export function accessLogUrl(pathname: string, search: string): string {
+  const classes = envContext.classes
+  if (isAllClasses(classes) || classes.has('urls')) return safeUrl(pathname + search)
+  if (/^\/(runs|health|logs|metrics)?$/.test(pathname)) return pathname
+  const run = /^\/runs\/[^/]+(\/(stream|cancel|tool-result|ack|logs))?$/.exec(pathname)
+  return run ? `/runs/:id${run[1] ?? ''}` : OMITTED
 }
 
 /**

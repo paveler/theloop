@@ -286,3 +286,58 @@ describe('content-free logging: request ceiling (SPEC §12.5)', () => {
     expect(memory).not.toContain(C)
   })
 })
+
+describe('content-free logging: review fixes (SPEC §12.5)', () => {
+  it('a fallback chain: the first entry\'s error text stays out of logs and the webhook', async () => {
+    const s = await sinks()
+    let call = 0
+    const model = mockModel(async () => {
+      call++
+      if (call === 1) throw Object.assign(new Error(`bad request: ${C}-fallbackmsg`), { statusCode: 400 })
+      return streamFrom([START, ...textChunks('ok'), finish('stop')])
+    })
+    const engine = engineWith(s, model, { LOG_CONTENT: 'none' })
+    const res = await engine.app.request('/runs', {
+      method: 'POST',
+      headers: bearer(),
+      body: JSON.stringify(
+        runRequest({
+          llm: [
+            { provider: 'anthropic', model: 'a', api_key: 'k' },
+            { provider: 'anthropic', model: 'b', api_key: 'k' },
+          ] as never,
+          meta: { locale: `${C}-locale` } as never,
+        }),
+      ),
+    })
+    expect(((await res.json()) as { status: string }).status).toBe('completed')
+    await waitFor(() => s.hook.requests.some((r) => (r.body as { event?: string })?.event === 'llm_fallback'), 5000, 20)
+    await engine.app.request(`/${C}-path/x`)
+    await engine.shutdown()
+    flushJournal()
+    const memory = await (await engine.app.request('/logs?limit=10000', { headers: bearer() })).text()
+    const dump = [memory, s.stdout.join(''), JSON.stringify(s.hook.requests.map((r) => r.body))].join('\n')
+    expect(dump).toContain('llm_fallback')
+    expect(dump).toContain('locale_unsupported')
+    expect(dump).toContain('http_request')
+    expect(dump).not.toContain(C)
+    expect(s.misses).toEqual([])
+  })
+
+  it('ack_missing after the run is deleted: the webhook failure is logged under the run\'s ceiling', async () => {
+    const s = await sinks()
+    const model = mockModel(async () => streamFrom([START, ...textChunks('ok'), finish('stop')]))
+    const engine = engineWith(s, model, { ERROR_WEBHOOK_URL: `http://127.0.0.1:9/hook/${C}-hookpath` })
+    const res = await engine.app.request('/runs', {
+      method: 'POST',
+      headers: bearer(),
+      body: JSON.stringify({ ...runRequest({ meta: { session_id: 's-ack' } as never }), logging: { content: 'none' } }),
+    })
+    const { run_id } = (await res.json()) as { run_id: string }
+    engine.deps.registry.delete(run_id, 'retention')
+    await waitFor(() => s.stdout.join('').includes('error_webhook_failed'), 5000, 20)
+    const memory = await (await engine.app.request('/logs?limit=10000', { headers: bearer() })).text()
+    expect(memory).toContain("error_webhook_failed")
+    expect(memory + s.stdout.join('')).not.toContain(C)
+  })
+})
