@@ -24,6 +24,7 @@
     "smoke": "tsx scripts/smoke.ts",
     "sse-check": "tsx scripts/sse-check.ts",
     "example:sqlite": "tsx --env-file-if-exists=.env --disable-warning=ExperimentalWarning examples/sqlite-harness/main.ts",
+    "smoke:local": "tsx scripts/smoke-local.ts",
     "smoke:gigachat": "awk 1 certs/*.crt > certs/russian_bundle.pem && NODE_EXTRA_CA_CERTS=certs/russian_bundle.pem tsx scripts/smoke.ts gigachat",
     "spike:reasoning": "tsx scripts/spike-reasoning.ts"
   },

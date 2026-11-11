@@ -1,13 +1,16 @@
 name: Release
 
-# On a version tag: typecheck and tests, then build the Docker image and publish it to
-# GitHub Container Registry as ghcr.io/<owner>/theloop:<version>, <major>.<minor>, <major>, latest.
+# On a version tag: typecheck and tests, then
+# - the Docker image (linux/amd64 + linux/arm64) to GitHub Container Registry as
+#   ghcr.io/<owner>/theloop:<version>, <major>.<minor>, <major>, latest;
+# - the offline artifacts on the GitHub Release (SPEC §14): image tarballs, a plain Node
+#   bundle, a CycloneDX SBOM, third-party licenses, SHA256SUMS (signed when COSIGN_PRIVATE_KEY is set).
 on:
   push:
     tags: ['v*.*.*']
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
@@ -27,9 +30,10 @@ jobs:
   image:
     needs: check
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -49,6 +53,66 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: .
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  offline:
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - run: npm ci && npm run build
+      - name: Node bundle
+        run: |
+          V="${TAG#v}"
+          STAGE="theloop-$V"
+          mkdir -p "$STAGE" out
+          cp -r dist package.json package-lock.json certs LICENSE NOTICE "$STAGE/"
+          (cd "$STAGE" && npm ci --omit=dev --ignore-scripts --no-audit --no-fund)
+          node scripts/bundle-check.mjs "$STAGE"
+          # the bundle starts and answers /health with nothing but node
+          (cd "$STAGE" && ENGINE_TOKEN=t PORT=18080 node dist/index.js & echo $! > /tmp/pid)
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:18080/health && break; sleep 1; done
+          kill "$(cat /tmp/pid)"
+          node scripts/third-party-licenses.mjs "$STAGE" > out/THIRD_PARTY_LICENSES.txt
+          tar czf "out/theloop-$V-node.tar.gz" "$STAGE"
+          npm sbom --omit dev --sbom-format cyclonedx > "out/theloop-$V-sbom.cdx.json"
+      - name: Image tarballs
+        run: |
+          V="${TAG#v}"
+          for arch in amd64 arm64; do
+            docker buildx build --platform "linux/$arch" -t "ghcr.io/${{ github.repository }}:$V" \
+              -o "type=docker,dest=out/theloop-$V-image-linux-$arch.tar" .
+          done
+      - name: Checksums and signature
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          cd out
+          sha256sum * > SHA256SUMS
+          if [ -n "$COSIGN_PRIVATE_KEY" ]; then
+            curl -fsSL -o /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64
+            chmod +x /usr/local/bin/cosign
+            echo "$COSIGN_PRIVATE_KEY" > /tmp/cosign.key
+            cosign sign-blob --yes --tlog-upload=false --key /tmp/cosign.key --output-signature SHA256SUMS.sig SHA256SUMS
+            rm /tmp/cosign.key
+          else
+            echo "COSIGN_PRIVATE_KEY is not set: SHA256SUMS is not signed"
+          fi
+      - name: Attach to the GitHub Release
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --draft --title "$TAG" --notes "See CHANGELOG.md"
+          gh release upload "$TAG" out/* --clobber

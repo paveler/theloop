@@ -1,0 +1,93 @@
+# theloop on Kubernetes / OpenShift (SPEC §14). An example, not a supported chart: one replica
+# (runs live in process memory, §11.2), secrets as files, the journal on a volume, no content
+# in logs, a non-root read-only container.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: theloop
+type: Opaque
+stringData:
+  engine_token: change-me
+  metrics_token: change-me-too
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: theloop-journal
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: theloop
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: theloop }
+  template:
+    metadata:
+      labels: { app: theloop }
+    spec:
+      terminationGracePeriodSeconds: 15
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: theloop
+          image: ghcr.io/paveler/theloop:1.5.0
+          ports:
+            - containerPort: 8080
+          env:
+            - { name: ENGINE_TOKEN_FILE, value: /run/secrets/theloop/engine_token }
+            - { name: METRICS_TOKEN_FILE, value: /run/secrets/theloop/metrics_token }
+            - { name: PUBLIC_URL, value: "https://theloop.internal" }
+            - { name: LLM_ENDPOINT_VLLM_URL, value: "http://vllm.models.svc:8000/v1" }
+            - { name: LLM_ENDPOINT_VLLM_CONTEXT_WINDOW, value: "100000" }
+            - { name: LLM_ENDPOINT_VLLM_MAX_CONCURRENCY, value: "16" }
+            - { name: LLM_ENDPOINT_VLLM_PARALLEL_TOOLS, value: "1" }
+            - { name: LLM_ENDPOINT_VLLM_USAGE_IN_STREAM, value: "1" }
+            - { name: EGRESS_PRIVATE_CIDRS, value: "10.0.0.0/8" }
+            - { name: EGRESS_HTTP_HOSTS, value: "vllm.models.svc:8000" }
+            - { name: EGRESS_PUBLIC_PROVIDERS, value: "0" }
+            - { name: EGRESS_ALLOWLIST, value: ".svc.cluster.local:8443" }
+            - { name: LOG_CONTENT, value: none }
+            - { name: LOG_DIR, value: /var/lib/theloop/journal }
+            - { name: HEALTH_DETAILS, value: "0" }
+            - { name: SHUTDOWN_GRACE_MS, value: "10000" }
+          readinessProbe:
+            httpGet: { path: /health, port: 8080 }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health, port: 8080 }
+            periodSeconds: 15
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits: { memory: 1Gi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: secrets, mountPath: /run/secrets/theloop, readOnly: true }
+            - { name: journal, mountPath: /var/lib/theloop/journal }
+      volumes:
+        - name: secrets
+          secret: { secretName: theloop }
+        - name: journal
+          persistentVolumeClaim: { claimName: theloop-journal }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: theloop
+spec:
+  selector: { app: theloop }
+  ports:
+    - port: 80
+      targetPort: 8080

@@ -1,0 +1,70 @@
+# theloop in a closed network with a local model (SPEC §9.1, §14). An example, not a supported
+# product: adjust names, volumes and the model to your installation.
+#
+#   docker compose -f deploy/docker-compose.yml up -d
+#   docker compose -f deploy/docker-compose.yml exec ollama ollama pull qwen3:8b   # or load offline, see README
+#
+# Secrets are files (ENGINE_TOKEN_FILE), never plain env. The engine logs no content
+# (LOG_CONTENT=none) and reaches nothing but the model and the hosts you list.
+name: theloop
+
+services:
+  theloop:
+    image: ghcr.io/paveler/theloop:1.5.0
+    read_only: true
+    user: "1000"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    ports:
+      - "8080:8080"
+    environment:
+      ENGINE_TOKEN_FILE: /run/secrets/engine_token
+      PUBLIC_URL: http://localhost:8080
+      # the local model: plain http inside the compose network, a private address
+      LLM_ENDPOINT_LOCAL_URL: http://ollama:11434/v1
+      # keep below the server context (OLLAMA_CONTEXT_LENGTH) with headroom: the engine estimates
+      # tokens by characters, so it must trim history before the server cuts it silently
+      LLM_ENDPOINT_LOCAL_CONTEXT_WINDOW: "26000"
+      LLM_ENDPOINT_LOCAL_MAX_CONCURRENCY: "2"       # = OLLAMA_NUM_PARALLEL
+      LLM_ENDPOINT_LOCAL_PARALLEL_TOOLS: "1"
+      LLM_ENDPOINT_LOCAL_USAGE_IN_STREAM: "1"
+      LLM_ENDPOINT_LOCAL_REASONING_REPLAY: none
+      EGRESS_PRIVATE_CIDRS: 172.28.0.0/16            # the compose subnet below
+      EGRESS_HTTP_HOSTS: ollama:11434
+      EGRESS_PUBLIC_PROVIDERS: "0"                   # no internet: refuse public providers on receipt
+      EGRESS_ALLOWLIST: tools.internal:8443          # your tool / callback hosts, with ports
+      LOG_CONTENT: none
+      LOG_DIR: /var/lib/theloop/journal
+      HEALTH_DETAILS: "0"
+      METRICS_TOKEN_FILE: /run/secrets/metrics_token
+    volumes:
+      - journal:/var/lib/theloop/journal
+    secrets: [engine_token, metrics_token]
+    depends_on: [ollama]
+    networks: [internal]
+
+  ollama:
+    image: ollama/ollama:latest   # pin the version you mirror into the closed network
+    environment:
+      OLLAMA_CONTEXT_LENGTH: "32768"
+      OLLAMA_NUM_PARALLEL: "2"
+    volumes:
+      - models:/root/.ollama
+    networks: [internal]
+    # no published port: only the engine talks to it
+
+secrets:
+  engine_token:
+    file: ./secrets/engine_token
+  metrics_token:
+    file: ./secrets/metrics_token
+
+volumes:
+  journal:
+  models:
+
+networks:
+  internal:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
