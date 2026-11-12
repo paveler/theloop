@@ -67,6 +67,7 @@ export function initLogger(settings: LogSettings): Logger {
   buffer = new LogBuffer(settings.logBufferMaxEntries, settings.logBufferMaxBytes)
   envContext = newLogContext(settings.logContent)
   runContexts.clear()
+  runSecrets.clear()
   contentToStdout = settings.logPrompts
   contentMaxChars = settings.logContentMaxChars
   diskContentMaxChars = settings.logDiskContentMaxChars
@@ -134,6 +135,7 @@ export function bindRunContext(runId: string, ctx: LogContext): void {
 
 export function releaseRunContext(runId: string): void {
   runContexts.delete(runId)
+  runSecrets.delete(runId)
 }
 
 /** The run's context by run_id, else the POST /runs request scope, else env. */
@@ -268,22 +270,37 @@ export function redactHeaders(headers: Record<string, string> | undefined): stri
  * Credential values the engine holds (env keys, endpoint keys, keys from requests): a server
  * may echo an opaque key in an error, and no pattern would recognize it (SPEC §9.1).
  */
+/** Configured credentials: for the life of the process, never evicted. */
 const knownSecrets = new Set<string>()
-const KNOWN_SECRETS_MAX = 2000
+/** Per run: request keys, tool / callback header values, run and call tokens — until the run is gone. */
+const runSecrets = new Map<string, Set<string>>()
+
+const usable = (value: string | undefined | null): value is string => typeof value === 'string' && value.length >= 8
 
 export function registerSecret(value: string | undefined | null): void {
-  if (!value || value.length < 8 || knownSecrets.has(value)) return
-  if (knownSecrets.size >= KNOWN_SECRETS_MAX) {
-    const oldest = knownSecrets.values().next().value
-    if (oldest !== undefined) knownSecrets.delete(oldest)
+  if (usable(value)) knownSecrets.add(value)
+}
+
+/** Secrets of one run, scrubbed until releaseRunContext — the run and its delivery job are gone. */
+export function holdRunSecrets(runId: string, values: Iterable<string | undefined | null>): void {
+  let set = runSecrets.get(runId)
+  if (!set) {
+    set = new Set()
+    runSecrets.set(runId, set)
   }
-  knownSecrets.add(value)
+  for (const v of values) if (usable(v)) set.add(v)
+}
+
+function scrub(text: string, secrets: Iterable<string>): string {
+  let out = text
+  for (const secret of secrets) if (out.includes(secret)) out = out.split(secret).join('<redacted>')
+  return out
 }
 
 /** Secrets never reach error bodies, SSE, the callback or logs (SPEC §9.1, §12.1, §12.2). */
 export function redactSecrets(text: string): string {
-  let out = text
-  for (const secret of knownSecrets) if (out.includes(secret)) out = out.split(secret).join('<redacted>')
+  let out = scrub(text, knownSecrets)
+  for (const set of runSecrets.values()) out = scrub(out, set)
   return out
     .replace(/sk-[A-Za-z0-9_-]{8,}/g, 'sk-<redacted>')
     .replace(/(Bearer\s+)[A-Za-z0-9._-]{8,}/gi, '$1<redacted>')

@@ -621,3 +621,48 @@ describe('review round 2', () => {
     }
   })
 })
+
+describe('review round 3', () => {
+  it('a tool echoing its header credential and result_url: neither reaches the journal', async () => {
+    const toolSecret = 'OPAQUE0TOOL0HEADER0SECRET'
+    const tools = await server((body, req, res) => {
+      json(res, 400, { echo: req.headers['x-tool-key'], url: (body as { result_url?: string }).result_url })
+    })
+    const model = mockModel([
+      streamFrom([START, { type: 'tool-call', toolCallId: 'c1', toolName: 't', input: '{}' }, finish('tool-calls')]),
+      streamFrom([START, ...textChunks('done'), finish('stop')]),
+    ])
+    const engine = track(createEngine(testConfig(), { modelFactory: mockFactory(model) }))
+    const result = await post(
+      engine,
+      runRequest({
+        tools: [{ name: 't', endpoint: `${tools.url}/t`, effect: 'read', headers: { 'X-Tool-Key': toolSecret }, input_schema: { type: 'object' } }] as never,
+      }),
+    )
+    expect(result.status).toBe('completed')
+    const echoed = tools.requests[0]!.body as { result_url: string }
+    const callToken = new URL(echoed.result_url).searchParams.get('token')!
+    const logs = await (await engine.app.request('/logs?limit=10000', { headers: bearer() })).text()
+    expect(logs).toContain('tool_http')
+    expect(logs).not.toContain(toolSecret)
+    expect(logs).not.toContain(callToken)
+  })
+
+  it('many other request keys do not evict a live run\'s key', async () => {
+    const liveKey = 'LIVE0ENDPOINT0KEY0VALUE0X'
+    let release: () => void = () => {}
+    const gate = new Promise<void>((r) => (release = r))
+    const { engine } = await endpointEngine(async (_b, _r, res) => {
+      await gate
+      json(res, 400, { error: `bad key ${liveKey}` })
+    })
+    const pending = post(engine, runRequest({ llm: { ...endpointLlm, api_key: liveKey } as never }))
+    await new Promise((r) => setTimeout(r, 100))
+    const egress = engine.deps.egress
+    for (let i = 0; i < 2500; i++) buildModel(llm({ provider: 'endpoint', endpoint: 'local', api_key: `other-key-${i}-padding` }), engine.deps.config, egress)
+    release()
+    const result = await pending
+    const logs = await (await engine.app.request('/logs?limit=10000', { headers: bearer() })).text()
+    expect(JSON.stringify(result) + logs).not.toContain(liveKey)
+  })
+})

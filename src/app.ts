@@ -17,7 +17,7 @@ import { EgressClient } from './egress/client.js'
 import { EngineError } from './errors.js'
 import { newRunId, hashBody, timingSafeEqualStr } from './ids.js'
 import { configureAlerts, sendAlert } from './alerts.js'
-import { diskJournal, flushJournal, initLogger, log, logBuffer, logContentClasses, classList, logger, bindRunContext, accessLogUrl, registerSecret } from './log.js'
+import { diskJournal, flushJournal, initLogger, log, logBuffer, logContentClasses, classList, logger, bindRunContext, accessLogUrl, registerSecret, holdRunSecrets } from './log.js'
 import {
   intersectClasses,
   newLogContext,
@@ -273,6 +273,13 @@ export function createEngine(
       liveUsage: () => registry.emptyUsage(),
     })
     bindRunContext(record.runId, ctx)
+    // what this run may see echoed back: scrubbed from every log and error body (SPEC §9.1, §12.4)
+    holdRunSecrets(record.runId, [
+      record.token,
+      ...request.llm_chain.map((l) => l.api_key),
+      ...request.tools.flatMap((t) => Object.values(t.headers ?? {})),
+      ...Object.values(request.callback?.headers ?? {}),
+    ])
     countRunStarted()
 
     const running = startRun(record, { request, candidates, limits, outputChecks }, deps).catch((err) => {

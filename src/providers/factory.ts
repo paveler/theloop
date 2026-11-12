@@ -11,7 +11,7 @@ import type { Llm, ProviderId } from '../contracts.js'
 import { EngineError } from '../errors.js'
 import { EgressDeniedError, type EgressClient } from '../egress/client.js'
 import { sha256 } from '../ids.js'
-import { log, registerSecret } from '../log.js'
+import { log } from '../log.js'
 import { contextWindowFor, ENDPOINT_OWNER_PREFIX, providerEntry, type ProviderCapabilities } from './allowlist.js'
 import { GIGACHAT_OAUTH_URL, gigachatTransport, type GigachatTransport } from './gigachat.js'
 import type { ThrottleKey } from './throttle.js'
@@ -177,7 +177,6 @@ export function buildModel(llm: Llm, config: Config, egress: EgressClient): Reso
   // key
   const envKey = entry.envKey ? config.providerKeys[entry.envKey] : undefined
   const apiKey = llm.api_key ?? envKey
-  registerSecret(apiKey)
   if (!apiKey) {
     throw new EngineError(
       'provider_key_missing',
@@ -297,7 +296,6 @@ function buildEndpointModel(llm: Llm, config: Config, egress: EgressClient): Res
     )
   }
   const apiKey = llm.api_key ?? ep.apiKey
-  registerSecret(apiKey)
   const owner = `${ENDPOINT_OWNER_PREFIX}${ep.name}`
   const fetchImpl = endpointFetch(egress.providerFetchFor('endpoint'), ep, !apiKey)
 

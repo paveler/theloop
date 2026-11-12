@@ -10,7 +10,7 @@ import type { RunRequest, RunResult, RunStatus, Usage } from '../contracts.js'
 import { EngineError } from '../errors.js'
 import { hashBody, newToken, timingSafeEqualStr } from '../ids.js'
 import { sendAlert } from '../alerts.js'
-import { log, releaseRunContext } from '../log.js'
+import { holdRunSecrets, log, releaseRunContext } from '../log.js'
 import { SseHub } from '../stream/sse.js'
 import { ToolWaitTimeout, type AsyncToolResult } from '../tools/http.js'
 
@@ -321,6 +321,8 @@ export class RunRegistry {
 
   registerCall(run: RunRecord, callId: string, tool: string): CallRecord {
     const token = newToken()
+    // a tool may echo its result_url: the token is scrubbed from logs (SPEC §12.4)
+    holdRunSecrets(run.runId, [token])
     const call: CallRecord = {
       callId,
       token,
