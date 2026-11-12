@@ -40,6 +40,11 @@ Everything is opt-in: with no new env set, the engine behaves as v1.4.x, except 
   attempts, latency and time to first token, tokens, queues, fallbacks, tools, callbacks, egress
   refusals, journal size; bounded label cardinality.
 - **Secrets from files**: every secret env variable has a `_FILE` twin.
+- **Held credentials are scrubbed by value.** Every credential the engine holds — env and endpoint
+  keys, keys from requests, tool and callback header values, run and call tokens, GigaChat access
+  tokens — is removed from every log field, journal entry, alert and provider / tool error body,
+  raw or JSON-escaped, whatever it looks like: a server echoing an opaque key in an error no longer
+  leaks it.
 - **`HEALTH_DETAILS=0`**: unauthenticated `/health` answers `ok` only.
 - **Air-gapped delivery** (SPEC §14): releases carry image tarballs for amd64 and arm64, a
   platform-independent Node bundle, a CycloneDX SBOM, third-party licenses and `SHA256SUMS`. The image

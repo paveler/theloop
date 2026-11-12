@@ -2250,7 +2250,11 @@ without `LOG_DIR` a restart or deploy means an empty journal.
   `"api_key": "…"` are scrubbed. Access is the same `ENGINE_TOKEN` with which
   `GET /runs/{id}` already returns full `messages` — the circle of access is no wider.
 - **Never in the journal:** `llm.api_key`, env keys, values of tool and callback headers,
-  `CALLBACK_SECRET`, run and call tokens; the query of every URL is scrubbed (§12.2).
+  `CALLBACK_SECRET`, run and call tokens; the query of every URL is scrubbed (§12.2). Besides
+  the patterns (`sk-…`, `Bearer …`), every credential the engine holds is scrubbed **by value**
+  (raw and JSON-escaped, 6 characters and longer) from every field, content, alert and provider /
+  tool error body: configured keys for the life of the process, a run's keys, header values and
+  tokens until the run is gone, GigaChat access tokens until they expire.
 - **Prompts by hash.** `run_start` carries `content.system_sha256` (hex SHA-256 of the
   scrubbed text) instead of `system`; the text is stored once — in memory as a blob shared
   by the entries that reference it, on disk as a `prompt_blob` line (`sha256`,
