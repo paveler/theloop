@@ -274,7 +274,8 @@ const knownSecrets = new Set<string>()
 /** Per run: request keys, tool / callback header values, run and call tokens — until the run is gone. */
 const runSecrets = new Map<string, Set<string>>()
 
-const usable = (value: string | undefined | null): value is string => typeof value === 'string' && value.length >= 8
+// shorter values would scrub ordinary words out of every log line; such keys are not real credentials
+const usable = (value: string | undefined | null): value is string => typeof value === 'string' && value.length >= 6
 
 export function registerSecret(value: string | undefined | null): void {
   if (usable(value)) knownSecrets.add(value)
@@ -313,12 +314,15 @@ function scrub(text: string, secrets: Iterable<string>): string {
 }
 
 /** Every string leaf of a log event's fields (SPEC §12.2): secrets go nowhere, in any mode. */
-function redactFields(value: unknown, depth = 0): unknown {
+function redactFields(value: unknown, seen = new WeakSet<object>()): unknown {
   if (typeof value === 'string') return redactSecrets(value)
-  if (depth > 6 || value === null || typeof value !== 'object') return value
-  if (Array.isArray(value)) return value.map((v) => redactFields(v, depth + 1))
+  if (value === null || typeof value !== 'object') return value
+  // every leaf is inspected, however deep; a cycle is cut, never passed through
+  if (seen.has(value)) return '[circular]'
+  seen.add(value)
+  if (Array.isArray(value)) return value.map((v) => redactFields(v, seen))
   const out: Record<string, unknown> = {}
-  for (const [k, v] of Object.entries(value)) out[k] = redactFields(v, depth + 1)
+  for (const [k, v] of Object.entries(value)) out[redactSecrets(k)] = redactFields(v, seen)
   return out
 }
 

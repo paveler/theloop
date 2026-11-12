@@ -718,3 +718,24 @@ describe('review round 4', () => {
     expect(redactSecrets('Invalid token: GIGA0ACCESS0TOKEN0VALUE')).toBe('Invalid token: <redacted>')
   })
 })
+
+describe('review round 5', () => {
+  it('a credential nested deep in meta is scrubbed from the journal and the webhook', async () => {
+    const hook = await server((_b, _r, res) => json(res, 200, {}))
+    const deepKey = 'DEEP0NESTED0ENDPOINT0KEY'
+    const { engine } = await endpointEngine((_b, _r, res) => json(res, 400, { error: 'nope' }), {
+      LLM_ENDPOINT_LOCAL_API_KEY: deepKey,
+      ERROR_WEBHOOK_URL: `${hook.url.replace('127.0.0.1', 'localhost')}/alerts`,
+      EGRESS_HTTP_HOSTS: 'localhost',
+      EGRESS_ALLOWLIST: 'localhost',
+    })
+    let nested: Record<string, unknown> = { leaf: deepKey }
+    for (let i = 0; i < 12; i++) nested = { n: nested }
+    const result = await post(engine, runRequest({ llm: endpointLlm as never, meta: { deep: nested } as never }))
+    expect(result.status).toBe('failed')
+    const logs = await (await engine.app.request('/logs?limit=10000', { headers: bearer() })).text()
+    await new Promise((r) => setTimeout(r, 300))
+    expect(hook.requests.length).toBeGreaterThan(0)
+    expect(logs + JSON.stringify(hook.requests.map((r) => r.body))).not.toContain(deepKey)
+  })
+})
