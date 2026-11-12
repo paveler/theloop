@@ -4,8 +4,9 @@
  *
  * An event = metadata + optional content (prompt, model texts, tool args /
  * results). Metadata goes to stdout and the journal, with run_id on every line that has one.
- * content goes only to the journal (LOG_BUFFER_CONTENT, on by default), to stdout only
- * with LOG_PROMPTS=1 (local). Every content field is clipped to LOG_CONTENT_MAX_CHARS in
+ * content goes only to the journal, to stdout only with LOG_PROMPTS=1 (local). LOG_CONTENT and a
+ * request's `logging` narrow what is written: with a class excluded, every field goes through
+ * the field registry (log-policy.ts, SPEC §12.5). Every content field is clipped to LOG_CONTENT_MAX_CHARS in
  * memory and stdout, to LOG_DISK_CONTENT_MAX_CHARS on disk. `content.system` is journaled
  * once by hash as `system_sha256`. Keys and header values are never written anywhere.
  */
@@ -14,6 +15,18 @@ import pino from 'pino'
 import type { Config } from './config.js'
 import { LogBuffer, type LogLevel, type PromptBlob } from './log-buffer.js'
 import { DiskJournal, type PruneReport } from './log-disk.js'
+import {
+  ALL_CLASSES,
+  classList,
+  isAllClasses,
+  newLogContext,
+  OMITTED,
+  requestLogContext,
+  sanitizeContent,
+  sanitizeFields,
+  type ClassSet,
+  type LogContext,
+} from './log-policy.js'
 
 export type Logger = pino.Logger
 export type LogFields = Record<string, unknown>
@@ -24,7 +37,7 @@ type LogSettings = Pick<
   | 'logPrompts'
   | 'logBufferMaxEntries'
   | 'logBufferMaxBytes'
-  | 'logBufferContent'
+  | 'logContent'
   | 'logContentMaxChars'
   | 'logDir'
   | 'logRetentionDays'
@@ -33,8 +46,16 @@ type LogSettings = Pick<
 >
 
 let root: Logger = pino({ level: process.env.LOG_LEVEL ?? 'info' })
+/** Tests capture stdout here; null — process stdout. */
+let stdoutSink: pino.DestinationStream | null = null
+
+export function setStdoutSink(sink: pino.DestinationStream | null): void {
+  stdoutSink = sink
+}
 let buffer = new LogBuffer(20_000, 33_554_432)
-let contentToBuffer = true
+let envContext: LogContext = newLogContext(ALL_CLASSES)
+/** run_id → the run's context, until the run and its delivery job are gone (SPEC §12.5). */
+const runContexts = new Map<string, LogContext>()
 let contentToStdout = false
 let contentMaxChars = 4000
 let disk: DiskJournal | null = null
@@ -42,9 +63,11 @@ let diskContentMaxChars = 200_000
 let exitHook = false
 
 export function initLogger(settings: LogSettings): Logger {
-  root = pino({ level: settings.logLevel })
+  root = stdoutSink ? pino({ level: settings.logLevel }, stdoutSink) : pino({ level: settings.logLevel })
   buffer = new LogBuffer(settings.logBufferMaxEntries, settings.logBufferMaxBytes)
-  contentToBuffer = settings.logBufferContent
+  envContext = newLogContext(settings.logContent)
+  runContexts.clear()
+  runSecrets.clear()
   contentToStdout = settings.logPrompts
   contentMaxChars = settings.logContentMaxChars
   diskContentMaxChars = settings.logDiskContentMaxChars
@@ -97,15 +120,52 @@ export function logBuffer(): LogBuffer {
   return buffer
 }
 
-export function logContentEnabled(): boolean {
-  return contentToBuffer
+/** The env content classes (GET /logs `buffer.content_classes`). */
+export function logContentClasses(): ClassSet {
+  return envContext.classes
 }
 
-function emit(level: LogLevel, event: string, fields: LogFields = {}, content?: LogFields): void {
+export function envLogContext(): LogContext {
+  return envContext
+}
+
+export function bindRunContext(runId: string, ctx: LogContext): void {
+  runContexts.set(runId, ctx)
+}
+
+export function releaseRunContext(runId: string): void {
+  runContexts.delete(runId)
+  runSecrets.delete(runId)
+}
+
+/** The run's context by run_id, else the POST /runs request scope, else env. */
+export function contextFor(fields: LogFields): LogContext {
+  const runId = fields.run_id
+  if (typeof runId === 'string') {
+    const ctx = runContexts.get(runId)
+    if (ctx) return ctx
+  }
+  return requestLogContext.getStore() ?? envContext
+}
+
+/** Fields of an error-webhook body, under the same rules as log events (SPEC §12.3). */
+export function sanitizeAlert(event: string, fields: LogFields): LogFields {
+  const ctx = contextFor(fields)
+  return redactFields(isAllClasses(ctx.classes) ? fields : sanitizeFields(`alert:${event}`, fields, ctx)) as LogFields
+}
+
+export { classList }
+
+function emit(level: LogLevel, event: string, rawFields: LogFields = {}, rawContent?: LogFields, given?: LogContext): void {
+  const ctx = given ?? contextFor(rawFields)
+  const strict = !isAllClasses(ctx.classes)
+  const fields = redactFields(strict ? sanitizeFields(event, rawFields, ctx) : rawFields) as LogFields
+  const content = rawContent && strict ? sanitizeContent(event, rawContent, ctx) : rawContent
+
   if (content && contentToStdout) root[level]({ ...fields, content: clipContent(content, contentMaxChars) }, event)
   else root[level](fields, event)
 
-  if (!content || !contentToBuffer) {
+  if (!content) {
     const entry = buffer.push(level, event, fields, undefined)
     disk?.append(entry, undefined, undefined)
     return
@@ -126,6 +186,29 @@ function emit(level: LogLevel, event: string, fields: LogFields = {}, content?: 
     prompt !== null && sha256 !== null ? { sha256, text: clipString(prompt, max) } : undefined
   const entry = buffer.push(level, event, fields, journaled(contentMaxChars), blob(contentMaxChars))
   disk?.append(entry, journaled(diskContentMaxChars), blob(diskContentMaxChars))
+}
+
+/**
+ * Events emitted outside the run's async path (an alert's completion handler) carry the
+ * context captured where the work started (SPEC §12.5).
+ */
+export function logIn(ctx: LogContext) {
+  return {
+    info: (event: string, fields?: LogFields, content?: LogFields) => emit('info', event, fields, content, ctx),
+    warn: (event: string, fields?: LogFields, content?: LogFields) => emit('warn', event, fields, content, ctx),
+  }
+}
+
+/**
+ * The access log's path (SPEC §12.2, §12.5): without the `urls` class only the route shape is
+ * written — a path the caller chose may carry anything.
+ */
+export function accessLogUrl(pathname: string, search: string): string {
+  const classes = envContext.classes
+  if (isAllClasses(classes) || classes.has('urls')) return safeUrl(pathname + search)
+  if (/^\/(runs|health|logs|metrics)?$/.test(pathname)) return pathname
+  const run = /^\/runs\/[^/]+(\/(stream|cancel|tool-result|ack|logs))?$/.exec(pathname)
+  return run ? `/runs/:id${run[1] ?? ''}` : OMITTED
 }
 
 /**
@@ -182,9 +265,73 @@ export function redactHeaders(headers: Record<string, string> | undefined): stri
   return Object.keys(headers).map((k) => (SECRET_KEYS.test(k) ? `${k}=<redacted>` : k))
 }
 
+/**
+ * Credential values the engine holds (env keys, endpoint keys, keys from requests): a server
+ * may echo an opaque key in an error, and no pattern would recognize it (SPEC §9.1).
+ */
+/** Configured credentials: for the life of the process, never evicted. */
+const knownSecrets = new Set<string>()
+/** Per run: request keys, tool / callback header values, run and call tokens — until the run is gone. */
+const runSecrets = new Map<string, Set<string>>()
+
+// shorter values would scrub ordinary words out of every log line; such keys are not real credentials
+const usable = (value: string | undefined | null): value is string => typeof value === 'string' && value.length >= 6
+
+export function registerSecret(value: string | undefined | null): void {
+  if (usable(value)) knownSecrets.add(value)
+}
+
+/** Secrets of one run, scrubbed until releaseRunContext — the run and its delivery job are gone. */
+export function holdRunSecrets(runId: string, values: Iterable<string | undefined | null>): void {
+  let set = runSecrets.get(runId)
+  if (!set) {
+    set = new Set()
+    runSecrets.set(runId, set)
+  }
+  for (const v of values) if (usable(v)) set.add(v)
+}
+
+/** Issued short-lived credentials (GigaChat access tokens): until they expire, plus a margin. */
+const transientSecrets = new Map<string, number>()
+const TRANSIENT_MARGIN_MS = 3_600_000
+
+export function registerTransientSecret(value: string | undefined | null, expiresAtMs: number): void {
+  if (!usable(value)) return
+  const now = Date.now()
+  for (const [v, until] of transientSecrets) if (until < now) transientSecrets.delete(v)
+  transientSecrets.set(value, Math.max(expiresAtMs, now) + TRANSIENT_MARGIN_MS)
+}
+
+/** The raw value and its JSON-escaped form: a body quoting a key with `"` or `\` escapes it. */
+function scrub(text: string, secrets: Iterable<string>): string {
+  let out = text
+  for (const secret of secrets) {
+    if (out.includes(secret)) out = out.split(secret).join('<redacted>')
+    const escaped = JSON.stringify(secret).slice(1, -1)
+    if (escaped !== secret && out.includes(escaped)) out = out.split(escaped).join('<redacted>')
+  }
+  return out
+}
+
+/** Every string leaf of a log event's fields (SPEC §12.2): secrets go nowhere, in any mode. */
+function redactFields(value: unknown, seen = new WeakSet<object>()): unknown {
+  if (typeof value === 'string') return redactSecrets(value)
+  if (value === null || typeof value !== 'object') return value
+  // every leaf is inspected, however deep; a cycle is cut, never passed through
+  if (seen.has(value)) return '[circular]'
+  seen.add(value)
+  if (Array.isArray(value)) return value.map((v) => redactFields(v, seen))
+  const out: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(value)) out[redactSecrets(k)] = redactFields(v, seen)
+  return out
+}
+
 /** Secrets never reach error bodies, SSE, the callback or logs (SPEC §9.1, §12.1, §12.2). */
 export function redactSecrets(text: string): string {
-  return text
+  let out = scrub(text, knownSecrets)
+  for (const set of runSecrets.values()) out = scrub(out, set)
+  if (transientSecrets.size > 0) out = scrub(out, transientSecrets.keys())
+  return out
     .replace(/sk-[A-Za-z0-9_-]{8,}/g, 'sk-<redacted>')
     .replace(/(Bearer\s+)[A-Za-z0-9._-]{8,}/gi, '$1<redacted>')
     .replace(/("(?:api_?key|authorization|access_token|token)"\s*:\s*")[^"]*(")/gi, '$1<redacted>$2')
@@ -199,6 +346,9 @@ export function safeUrl(url: string): string {
   try {
     const relative = !/^[a-z][a-z0-9+.-]*:/i.test(url)
     const u = new URL(url, relative ? 'http://engine.local' : undefined)
+    // credentials in a URL are secrets in every mode (SPEC §11.4)
+    u.username = ''
+    u.password = ''
     for (const key of [...new Set(u.searchParams.keys())]) u.searchParams.set(key, '<redacted>')
     return relative ? u.pathname + u.search : u.toString()
   } catch {

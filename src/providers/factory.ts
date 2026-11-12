@@ -6,18 +6,27 @@
 import { createAnthropic } from '@ai-sdk/anthropic'
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible'
 import type { LanguageModel } from 'ai'
-import type { Config } from '../config.js'
+import type { Config, EndpointConfig } from '../config.js'
 import type { Llm, ProviderId } from '../contracts.js'
 import { EngineError } from '../errors.js'
-import type { EgressClient } from '../egress/client.js'
+import { EgressDeniedError, type EgressClient } from '../egress/client.js'
 import { sha256 } from '../ids.js'
 import { log } from '../log.js'
-import { contextWindowFor, providerEntry, type ProviderCapabilities } from './allowlist.js'
-import { gigachatTransport, type GigachatTransport } from './gigachat.js'
+import { contextWindowFor, ENDPOINT_OWNER_PREFIX, providerEntry, type ProviderCapabilities } from './allowlist.js'
+import { GIGACHAT_OAUTH_URL, gigachatTransport, type GigachatTransport } from './gigachat.js'
 import type { ThrottleKey } from './throttle.js'
 
 export interface ResolvedModel {
   providerId: ProviderId
+  /** With provider "endpoint": its name; the public reference carries it (SPEC §9.1). */
+  endpoint?: string
+  /**
+   * Whose reasoning this is (SPEC §5.2): the provider id, or `endpoint:<name>`, so a signature
+   * is replayed only to where it came from. Absent — providerId.
+   */
+  reasoningOwner?: string
+  /** false — stored reasoning is not sent back to the model (endpoint _REASONING_REPLAY=none). */
+  replayReasoning?: boolean
   model: LanguageModel
   capabilities: ProviderCapabilities
   contextWindow: number
@@ -133,11 +142,20 @@ function glmThinking(model: string, thinking: { budget_tokens: number } | undefi
   return { thinking: { type: 'enabled' }, ...(GLM_EFFORT.test(model) ? { reasoningEffort: effort } : {}) }
 }
 
+/** The reasoning owner of a resolved model (SPEC §5.2). */
+export function ownerOf(resolved: Pick<ResolvedModel, 'providerId' | 'reasoningOwner'>): string {
+  return resolved.reasoningOwner ?? resolved.providerId
+}
+
 export function buildModel(llm: Llm, config: Config, egress: EgressClient): ResolvedModel {
+  if (llm.provider === 'endpoint') return buildEndpointModel(llm, config, egress)
+  if (llm.endpoint) throw new EngineError('bad_request', 'llm.endpoint is only for provider "endpoint"')
   const entry = providerEntry(llm.provider)
 
-  // base_url: built in for a named provider, from the request for openai-compatible
+  // base_url: built in for a named provider (or the operator's <PROVIDER>_BASE_URL), from the
+  // request for openai-compatible
   let baseUrl = entry.baseUrl
+  const override = config.providerBaseUrls[llm.provider]
   if (llm.provider === 'openai-compatible') {
     if (!llm.base_url) {
       throw new EngineError('bad_request', 'openai-compatible requires llm.base_url')
@@ -146,6 +164,14 @@ export function buildModel(llm: Llm, config: Config, egress: EgressClient): Reso
     baseUrl = llm.base_url
   } else if (llm.base_url) {
     throw new EngineError('bad_request', `llm.base_url is not allowed for provider ${llm.provider}`)
+  } else if (override) {
+    baseUrl = override
+  } else if (!config.egressPublicProviders && entry.baseUrl) {
+    // a closed network: fail on receipt instead of hanging on DNS until the run times out (SPEC §11.4)
+    throw new EgressDeniedError(
+      `provider ${llm.provider}: public provider hosts are off (EGRESS_PUBLIC_PROVIDERS=0); set ${llm.provider.toUpperCase()}_BASE_URL or use an endpoint`,
+      { target: 'llm', host: new URL(entry.baseUrl).hostname },
+    )
   }
 
   // key
@@ -224,7 +250,7 @@ export function buildModel(llm: Llm, config: Config, egress: EgressClient): Reso
     })(llm.model)
   } else {
     if (llm.provider === 'gigachat') {
-      gigachat = gigachatTransport(apiKey, scope, providerFetch)
+      gigachat = gigachatTransport(apiKey, scope, providerFetch, config.gigachatOAuthUrl ?? GIGACHAT_OAUTH_URL)
     }
     model = createOpenAICompatible({
       name: llm.provider,
@@ -252,4 +278,125 @@ export function buildModel(llm: Llm, config: Config, egress: EgressClient): Reso
     throttleKey,
     ...(gigachat ? { release: gigachat.release } : {}),
   }
+}
+
+/**
+ * An operator-defined model server (SPEC §9.1): URL, dialect, key, window, caps and
+ * concurrency from LLM_ENDPOINT_<NAME>_*. The request names it and may bring its own key.
+ */
+function buildEndpointModel(llm: Llm, config: Config, egress: EgressClient): ResolvedModel {
+  if (!llm.endpoint) throw new EngineError('bad_request', 'provider "endpoint" requires llm.endpoint')
+  if (llm.base_url) throw new EngineError('bad_request', 'llm.base_url is not allowed with provider "endpoint"')
+  const ep = Object.hasOwn(config.endpoints, llm.endpoint) ? config.endpoints[llm.endpoint] : undefined
+  if (!ep) {
+    const known = Object.keys(config.endpoints)
+    throw new EngineError(
+      'bad_request',
+      `llm.endpoint: unknown endpoint "${llm.endpoint}"${known.length > 0 ? `; known: ${known.join(', ')}` : '; none is defined (LLM_ENDPOINT_<NAME>_URL)'}`,
+    )
+  }
+  const apiKey = llm.api_key ?? ep.apiKey
+  const owner = `${ENDPOINT_OWNER_PREFIX}${ep.name}`
+  const fetchImpl = endpointFetch(egress.providerFetchFor('endpoint'), ep, !apiKey)
+
+  const capabilities: ProviderCapabilities = {
+    parallel_tools: llm.capabilities?.parallel_tools ?? ep.parallelTools,
+    usage_in_stream: llm.capabilities?.usage_in_stream ?? ep.usageInStream,
+  }
+  const contextWindow = llm.context_window_tokens ?? ep.contextWindow ?? config.maxContextFallback
+
+  const providerOptions: Record<string, Record<string, unknown>> = {}
+  const thinking = llm.params.thinking
+  if (thinking) {
+    const budget = thinking.budget_tokens
+    if (ep.kind === 'openai' && ep.thinking === 'effort') {
+      providerOptions[ep.name] = { reasoningEffort: budget >= 8000 ? 'high' : 'medium' }
+    } else if (ep.kind === 'anthropic' && ep.thinking === 'budget') {
+      providerOptions.anthropic = { thinking: { type: 'enabled', budgetTokens: budget } }
+    } else if (ep.kind === 'anthropic' && ep.thinking === 'adaptive') {
+      providerOptions.anthropic = { thinking: { type: 'adaptive' }, effort: claudeEffort(budget) }
+    } else {
+      log.warn('llm_param_unsupported', { param: 'thinking', provider: 'endpoint', endpoint: ep.name, model: llm.model })
+    }
+  }
+
+  // one queue per server by default: a local server's capacity does not depend on the key (SPEC §11.6)
+  const throttleKey: ThrottleKey = {
+    provider: owner,
+    hash: sha256(ep.concurrencyScope === 'key' ? `${owner}|${ep.url}|${apiKey ?? ''}` : `${owner}|${ep.url}`),
+    max: ep.maxConcurrency,
+  }
+
+  let model: LanguageModel
+  if (ep.kind === 'anthropic') {
+    // an explicit key always: the SDK would otherwise read ANTHROPIC_API_KEY from env (SPEC §9.1);
+    // the fetch wrapper strips it for a keyless endpoint
+    model = createAnthropic({ apiKey: apiKey ?? 'keyless', baseURL: ep.url, fetch: fetchImpl })(llm.model)
+  } else {
+    model = createOpenAICompatible({
+      name: ep.name,
+      baseURL: ep.url,
+      ...(apiKey ? { apiKey } : {}),
+      includeUsage: true,
+      fetch: fetchImpl,
+    })(llm.model)
+  }
+
+  return {
+    providerId: 'endpoint',
+    endpoint: ep.name,
+    reasoningOwner: owner,
+    replayReasoning: ep.kind === 'anthropic' || ep.reasoningReplay !== 'none',
+    model,
+    capabilities,
+    contextWindow,
+    maxTokensCap: ep.maxTokens,
+    supportsCacheControl: ep.kind === 'anthropic',
+    honorsToolChoiceNone: ep.toolChoiceNone,
+    acceptsSampling: true,
+    toolReferences: false,
+    ...(ep.prefixBinding ? { thinkingPrefixBinding: true } : {}),
+    providerOptions,
+    throttleKey,
+  }
+}
+
+const AUTH_HEADERS = ['authorization', 'x-api-key', 'api-key']
+
+/**
+ * The endpoint's fetch: no credential header at all when keyless (SPEC §9.1), and stored
+ * reasoning renamed to the field the server reads (`reasoning`; the SDK writes `reasoning_content`).
+ */
+function endpointFetch(base: typeof fetch, ep: EndpointConfig, keyless: boolean): typeof fetch {
+  return (input, init) => {
+    let next = init
+    if (keyless && init?.headers) {
+      const headers = new Headers(init.headers)
+      for (const h of AUTH_HEADERS) headers.delete(h)
+      next = { ...init, headers }
+    }
+    if (ep.kind === 'openai' && ep.reasoningReplay === 'reasoning' && typeof next?.body === 'string') {
+      next = { ...next, body: renameReasoning(next.body) }
+    }
+    return base(input, next)
+  }
+}
+
+export function renameReasoning(body: string): string {
+  let parsed: { messages?: Array<Record<string, unknown>> }
+  try {
+    parsed = JSON.parse(body) as typeof parsed
+  } catch {
+    return body
+  }
+  if (!Array.isArray(parsed.messages)) return body
+  let changed = false
+  for (const m of parsed.messages) {
+    if (m && typeof m === 'object' && 'reasoning_content' in m) {
+      m.reasoning = m.reasoning_content
+      delete m.reasoning_content
+      changed = true
+    }
+  }
+  return changed ? JSON.stringify(parsed) : body
 }

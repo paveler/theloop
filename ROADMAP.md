@@ -62,9 +62,9 @@ Goal: works with whatever models and tools a team already has.
 
 **1.1 Providers.** OpenRouter as a named provider (one key, hundreds of models, provider-side
 cost in usage). Google Gemini native (thought signatures fit the existing `reasoning` part).
-Mistral, Qwen, YandexGPT (Kimi shipped in v1.3.0). **Local models** (Ollama, vLLM, llama.cpp, LM Studio) through
-`openai-compatible` with an explicit `EGRESS_PRIVATE_ALLOWLIST` — today private addresses are
-refused unconditionally. — **M**
+Mistral, Qwen, YandexGPT (Kimi shipped in v1.3.0). **Local models** (Ollama, vLLM, llama.cpp, LM
+Studio) — **done in v1.5.0** as model endpoints (`LLM_ENDPOINT_<NAME>_*`, SPEC §9.6) with
+private-range egress (`EGRESS_PRIVATE_CIDRS`, §11.4). — **M**
 
 **1.2 Model fallbacks** — **done in v1.4.0** as `llm` given as an array (SPEC §9.5): any
 provider failure before the first content event moves the run to the next model.

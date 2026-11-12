@@ -17,10 +17,19 @@ import { EgressClient } from './egress/client.js'
 import { EngineError } from './errors.js'
 import { newRunId, hashBody, timingSafeEqualStr } from './ids.js'
 import { configureAlerts, sendAlert } from './alerts.js'
-import { diskJournal, flushJournal, initLogger, log, logBuffer, logContentEnabled, logger, safeUrl } from './log.js'
+import { diskJournal, flushJournal, initLogger, log, logBuffer, logContentClasses, classList, logger, bindRunContext, accessLogUrl, registerSecret, holdRunSecrets } from './log.js'
+import {
+  intersectClasses,
+  newLogContext,
+  parseClasses,
+  requestLogContext,
+  NO_CLASSES,
+  type LogContext,
+} from './log-policy.js'
 import { formatLogText, LOG_LEVELS, type LogEntry, type LogLevel, type LogQuery } from './log-buffer.js'
 import { buildModel, type ModelFactory } from './providers/factory.js'
-import { pinnedProviderHosts } from './providers/allowlist.js'
+import { pinnedProviderHosts, registerEndpoints } from './providers/allowlist.js'
+import { configureMetrics, countRunStarted, renderMetrics } from './metrics.js'
 import { ProviderThrottle } from './providers/throttle.js'
 import { RunRegistry, isTerminal, type RunRecord } from './runs/registry.js'
 import { startRun } from './runs/runner.js'
@@ -55,8 +64,26 @@ export function createEngine(
   version = '0.1.0',
 ): Engine {
   initLogger(config)
+  // every credential the engine holds is scrubbed from text it logs or returns (SPEC §9.1)
+  for (const value of [
+    ...config.engineTokens,
+    config.callbackSecret,
+    config.metricsToken,
+    ...Object.values(config.providerKeys),
+    ...Object.values(config.endpoints).map((e) => e.apiKey),
+  ]) {
+    registerSecret(value)
+  }
   const egress = overrides.egress ?? new EgressClient(config)
-  for (const host of pinnedProviderHosts()) egress.allowHost(host)
+  // a closed network turns the built-in public hosts off (SPEC §11.4)
+  if (config.egressPublicProviders) for (const host of pinnedProviderHosts()) egress.allowHost(host)
+  // overrides and endpoints: their exact origin, for the provider purpose only
+  for (const url of Object.values(config.providerBaseUrls)) egress.allowProviderOrigin(url)
+  if (config.gigachatOAuthUrl) egress.allowProviderOrigin(config.gigachatOAuthUrl)
+  for (const ep of Object.values(config.endpoints)) egress.allowProviderOrigin(ep.url)
+  registerEndpoints(
+    Object.values(config.endpoints).map((e) => ({ name: e.name, kind: e.kind, unsigned: e.reasoning === 'unsigned' })),
+  )
   const registry = overrides.registry ?? new RunRegistry(config)
   registry.startSweeper()
   configureAlerts(
@@ -77,6 +104,18 @@ export function createEngine(
 
   let shuttingDown = false
   const startedAt = Date.now()
+  configureMetrics({
+    maxModels: config.metricsMaxModels,
+    gauges: {
+      runsActive: () => registry.activeCount,
+      runsRetained: () => registry.retainedCount,
+      queues: () => deps.throttle.snapshot().limiters.map((l) => ({ provider: l.provider, active: l.active, queued: l.queued })),
+      journal: () => {
+        const stats = logBuffer().stats()
+        return { memoryBytes: stats.bytes, memoryDropped: stats.dropped, diskBytes: diskJournal()?.sizeBytes() ?? null }
+      },
+    },
+  })
   const app = new Hono()
 
   if (config.allowedOrigins.length > 0) {
@@ -98,7 +137,7 @@ export function createEngine(
     logger().debug(
       {
         method: c.req.method,
-        url: safeUrl(new URL(c.req.url).pathname + new URL(c.req.url).search),
+        url: accessLogUrl(new URL(c.req.url).pathname, new URL(c.req.url).search),
         status: c.res.status,
         duration_ms: Date.now() - started,
       },
@@ -110,13 +149,19 @@ export function createEngine(
     if (err instanceof EngineError) {
       return c.json(err.toBody(), err.status as never)
     }
-    log.error('unhandled_error', {
-      method: c.req.method,
-      path: c.req.path,
-      err: String(err),
-      stack: err instanceof Error ? err.stack : undefined,
-    })
-    sendAlert('unhandled_error', { path: c.req.path, error: { message: String(err).slice(0, 512) } })
+    // the request's logging ceiling survives into error handling (SPEC §12.5)
+    const report = () => {
+      log.error('unhandled_error', {
+        method: c.req.method,
+        path: accessLogUrl(c.req.path, ''),
+        err: String(err),
+        stack: err instanceof Error ? err.stack : undefined,
+      })
+      sendAlert('unhandled_error', { path: accessLogUrl(c.req.path, ''), error: { message: String(err).slice(0, 512) } })
+    }
+    const requestCtx = requestContexts.get(c.req.raw)
+    if (requestCtx) requestLogContext.run(requestCtx, report)
+    else report()
     return c.json(
       { error: { code: 'internal_error', message: 'internal error', retriable: false } },
       500,
@@ -125,8 +170,12 @@ export function createEngine(
 
   /* --------------------------------------------------------------- health */
 
-  app.get('/health', (c) =>
-    c.json({
+  app.get('/health', (c) => {
+    // HEALTH_DETAILS=0: ok / shutting_down only, unless the caller holds ENGINE_TOKEN (SPEC §4.7)
+    if (!config.healthDetails && !matchesEngineToken(c.req.header('authorization'), config)) {
+      return c.json({ ok: true, shutting_down: shuttingDown })
+    }
+    return c.json({
       ok: true,
       version,
       uptime_s: Math.round((Date.now() - startedAt) / 1000),
@@ -135,29 +184,49 @@ export function createEngine(
       shutting_down: shuttingDown,
       // provider queue: AIMD ceiling, busy slots, waiters (SPEC §4.7, §11.6)
       provider_throttle: deps.throttle.snapshot(),
-    }),
-  )
+    })
+  })
+
+  /* -------------------------------------------------------------- metrics */
+
+  // Prometheus text; its own token, never ENGINE_TOKEN; unset — off (SPEC §4.10)
+  app.get('/metrics', (c) => {
+    if (!config.metricsToken) throw new EngineError('not_found', 'metrics are off: set METRICS_TOKEN')
+    const header = c.req.header('authorization') ?? ''
+    const match = /^Bearer\s+(.+)$/i.exec(header.trim())
+    if (!match?.[1] || !timingSafeEqualStr(config.metricsToken, match[1])) {
+      throw new EngineError('unauthorized', 'requires Authorization: Bearer <METRICS_TOKEN>')
+    }
+    return c.text(renderMetrics(), 200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8', 'Cache-Control': 'no-store' })
+  })
 
   /* ---------------------------------------------------------- POST /runs */
 
   app.post('/runs', async (c) => {
     let raw: unknown
+    let ctx = newLogContext(logContentClasses())
     try {
       if (shuttingDown) throw new EngineError('shutting_down', 'engine is shutting down')
       requireEngineToken(c.req.header('authorization'), config)
       raw = await readJsonBody(c.req.raw, config.maxRequestBytes)
-      return await acceptRun(c, raw)
+      ctx = requestContextFor(raw)
+      requestContexts.set(c.req.raw, ctx)
+      return await requestLogContext.run(ctx, () => acceptRun(c, raw, ctx))
     } catch (err) {
       // the caller gets the refusal, but the journal needs it too — otherwise "the harness
       // sends, but there is no run" cannot be diagnosed (SPEC §12.4)
-      if (err instanceof EngineError) logRunRejected(err, raw)
+      if (err instanceof EngineError) requestLogContext.run(ctx, () => logRunRejected(err, raw))
       throw err
     }
   })
 
-  async function acceptRun(c: Context, raw: unknown): Promise<Response> {
+  async function acceptRun(c: Context, raw: unknown, ctx: LogContext): Promise<Response> {
     const validated = validateRunRequest(raw, deps)
     const { request, candidates, limits, sessionId, outputChecks } = validated
+    // declared names are identifiers: safe in every logging mode (SPEC §12.5)
+    for (const t of request.tools) ctx.declared.add(t.name)
+    for (const s of request.skills) ctx.declared.add(s.name)
+    for (const o of request.output_checks ?? []) ctx.declared.add(o.fence)
 
     // idempotency is checked BEFORE the session lock (SPEC §11.2)
     const requestHash = hashBody(raw)
@@ -203,6 +272,15 @@ export function createEngine(
       sessionId,
       liveUsage: () => registry.emptyUsage(),
     })
+    bindRunContext(record.runId, ctx)
+    // what this run may see echoed back: scrubbed from every log and error body (SPEC §9.1, §12.4)
+    holdRunSecrets(record.runId, [
+      record.token,
+      ...request.llm_chain.map((l) => l.api_key),
+      ...request.tools.flatMap((t) => Object.values(t.headers ?? {})),
+      ...Object.values(request.callback?.headers ?? {}),
+    ])
+    countRunStarted()
 
     const running = startRun(record, { request, candidates, limits, outputChecks }, deps).catch((err) => {
       log.error('run_crashed', {
@@ -269,7 +347,11 @@ export function createEngine(
     const lastEventHeader = c.req.header('last-event-id') ?? c.req.query('last_event_id')
     const lastEventId = lastEventHeader != null && lastEventHeader !== '' ? Number(lastEventHeader) : null
     const stream = run.sse.subscribe(Number.isFinite(lastEventId) ? (lastEventId as number) : null)
-    log.debug('sse_subscribe', { run_id: run.runId, status: run.status, last_event_id: lastEventHeader || undefined })
+    log.debug('sse_subscribe', {
+      run_id: run.runId,
+      status: run.status,
+      last_event_id: Number.isFinite(lastEventId) ? lastEventId : undefined,
+    })
 
     return new Response(stream, {
       headers: {
@@ -426,6 +508,27 @@ export function createEngine(
 
 /* ------------------------------------------------------------- helpers */
 
+/**
+ * The request's log context (SPEC §12.5): env classes narrowed by `logging.content`. A
+ * `logging` that is present but invalid means `none` for the refusal that follows.
+ */
+function requestContextFor(raw: unknown): LogContext {
+  const env = logContentClasses()
+  const logging = (raw as { logging?: { content?: unknown } } | null)?.logging
+  if (logging == null) return newLogContext(env)
+  const content = typeof logging === 'object' ? logging.content : undefined
+  try {
+    if (typeof content !== 'string' && !Array.isArray(content)) throw new Error('logging.content')
+    if (Array.isArray(content) && content.some((c) => typeof c !== 'string')) throw new Error('logging.content')
+    return newLogContext(intersectClasses(env, parseClasses(content as string | string[])))
+  } catch {
+    return newLogContext(NO_CLASSES)
+  }
+}
+
+/** POST /runs request → its log context, for Hono's onError after the request scope ended. */
+const requestContexts = new WeakMap<Request, LogContext>()
+
 function logRunRejected(err: EngineError, raw: unknown): void {
   const body = (raw ?? {}) as {
     llm?: { provider?: unknown; model?: unknown }
@@ -573,7 +676,7 @@ async function logsResponse(c: Context, query: LogQuery, format: 'json' | 'text'
       truncated,
       next_since: nextSince,
       source,
-      buffer: { ...stats, content: logContentEnabled(), disk: diskJournal() !== null },
+      buffer: { ...stats, content: logContentClasses().size > 0, content_classes: classList(logContentClasses()), disk: diskJournal() !== null },
     }),
   )
 }

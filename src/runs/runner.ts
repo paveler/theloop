@@ -38,8 +38,18 @@ import { EngineError, type ErrorCode } from '../errors.js'
 import { resolveLocale, texts, type Texts } from '../i18n.js'
 import { sendAlert } from '../alerts.js'
 import { sha256 } from '../ids.js'
-import { log, safeUrl } from '../log.js'
-import type { ResolvedModel } from '../providers/factory.js'
+import { contextFor, log, safeUrl } from '../log.js'
+import { classList, describeView, isAllClasses } from '../log-policy.js'
+import {
+  countLlmFallback,
+  countProviderAttempt,
+  countRunFinished,
+  countTokens,
+  countToolCall,
+  observeQueueWait,
+  statusClass,
+} from '../metrics.js'
+import { ownerOf, type ResolvedModel } from '../providers/factory.js'
 import type { LlmCandidate } from './validate.js'
 import {
   rateLimitBackoff,
@@ -289,6 +299,7 @@ class RunExecution {
     this.llmIndex++
     this.applyLlm()
     const to = this.llmRef()
+    countLlmFallback(from.endpoint ? `endpoint:${from.endpoint}` : from.provider, to.endpoint ? `endpoint:${to.endpoint}` : to.provider)
     log.warn('llm_fallback', {
       run_id: this.record.runId,
       step,
@@ -302,7 +313,12 @@ class RunExecution {
   }
 
   private llmRef(): LlmRef {
-    return { index: this.llmIndex, provider: this.resolved.providerId, model: this.llm.model }
+    return {
+      index: this.llmIndex,
+      provider: this.resolved.providerId,
+      ...(this.resolved.endpoint ? { endpoint: this.resolved.endpoint } : {}),
+      model: this.llm.model,
+    }
   }
 
   private readonly timezone: string
@@ -376,12 +392,15 @@ class RunExecution {
     const { request } = plan
     const roles = { user: 0, assistant: 0, tool: 0 }
     for (const message of request.messages) roles[message.role]++
+    const logContext = contextFor({ run_id: record.runId })
+    const view = describeView(logContext)
     log.info(
       'run_start',
       {
         run_id: record.runId,
         session_id: record.sessionId,
         provider: this.resolved.providerId,
+        ...(this.resolved.endpoint ? { endpoint: this.resolved.endpoint } : {}),
         model: this.llm.model,
         ...(plan.candidates.length > 1
           ? { llm_chain: plan.candidates.map((c) => `${c.resolved.providerId}:${c.llm.model}`) }
@@ -402,10 +421,11 @@ class RunExecution {
         ...(plan.outputChecks.length > 0
           ? { output_checks: plan.outputChecks.map((c) => `${c.fence}:${c.maxRepairs}`) }
           : {}),
+        ...(isAllClasses(logContext.classes) ? {} : { content_classes: classList(logContext.classes) }),
       },
       {
         system: this.systemText,
-        history_tail: request.messages.slice(-HISTORY_TAIL_IN_LOG).map(describeMessage),
+        history_tail: request.messages.slice(-HISTORY_TAIL_IN_LOG).map((m) => describeMessage(m, view)),
       },
     )
 
@@ -419,6 +439,7 @@ class RunExecution {
     record.sse.emit('start', {
       run_id: record.runId,
       provider: this.resolved.providerId,
+      ...(this.resolved.endpoint ? { endpoint: this.resolved.endpoint } : {}),
       model: this.llm.model,
     })
 
@@ -668,7 +689,8 @@ class RunExecution {
     // trimming may have dropped the last user message — then the date goes into system
     const anchor = this.dateAnchor && trim.messages.includes(this.dateAnchor) ? this.dateAnchor : null
     const converted = await toModelMessages(trim.messages, {
-      provider: this.resolved.providerId,
+      provider: ownerOf(this.resolved),
+      replayReasoning: this.resolved.replayReasoning,
       resolveImage: this.resolveImage,
       dates: { timezone: this.timezone, anchor, now: this.dateLine },
       cacheBreakpoints: this.cacheEnabled,
@@ -699,7 +721,7 @@ class RunExecution {
     // the engine's own edit of a signed prefix: stale thinking blocks are dropped, not a 400 (SPEC §9.3)
     const dropStaleThinking =
       this.resolved.thinkingPrefixBinding === true &&
-      editsSignedPrefix(trim.messages, { provider: this.resolved.providerId, trimmed: trim.trimmed, anchor })
+      editsSignedPrefix(trim.messages, { provider: ownerOf(this.resolved), trimmed: trim.trimmed, anchor })
     return { messages: [...system, ...converted], historyTokens, dropStaleThinking }
   }
 
@@ -809,7 +831,7 @@ class RunExecution {
         outcome = await streamStep({
           texts: this.texts,
           model: this.resolved.model,
-          provider: this.resolved.providerId,
+          provider: ownerOf(this.resolved),
           messages: prompt.messages,
           // a provider that calls tools even with none simply does not get them on such steps (SPEC §9.2)
           tools: noTools && !this.resolved.honorsToolChoiceNone ? {} : this.toolSet,
@@ -979,6 +1001,7 @@ class RunExecution {
     if (ticket.queueDepth > 0) {
       const outcome =
         ticket.kind === 'granted' ? 'granted' : isQueueTimeout(ticket, record.abortReason) ? 'timeout' : 'aborted'
+      observeQueueWait(this.resolved.endpoint ? `endpoint:${this.resolved.endpoint}` : this.resolved.providerId, ticket.waitedMs)
       log[outcome === 'timeout' ? 'warn' : 'info']('provider_queue_wait', {
         run_id: record.runId,
         step,
@@ -1022,6 +1045,25 @@ class RunExecution {
     const { plan } = this
     const logAttempt = () => {
       const last = this.usage.calls[this.usage.calls.length - 1]
+      const metricsProvider = this.resolved.endpoint ? `endpoint:${this.resolved.endpoint}` : this.resolved.providerId
+      countProviderAttempt({
+        provider: metricsProvider,
+        model: this.llm.model,
+        outcome: last?.status ?? kind,
+        statusClass: outcome.failure
+          ? statusClass(outcome.failure.providerStatus, outcome.failure.providerStatus == null)
+          : '2xx',
+        durationMs: outcome.durationMs,
+        ttftMs: outcome.firstContentMs ?? null,
+      })
+      if (last) {
+        countTokens(metricsProvider, this.llm.model, {
+          input: last.input_tokens,
+          output: last.output_tokens,
+          cache_read: last.cache_read_tokens,
+          cache_write: last.cache_write_tokens,
+        })
+      }
       log.info('provider_attempt', {
         run_id: this.record.runId,
         step: this.steps,
@@ -1047,6 +1089,7 @@ class RunExecution {
       this.usage.record({
         status: 'failed',
         provider: this.resolved.providerId,
+        endpoint: this.resolved.endpoint,
         model: this.llm.model,
         pricing: this.llm.pricing,
         tokens: {
@@ -1073,6 +1116,7 @@ class RunExecution {
       const call = this.usage.record({
         status: 'ok',
         provider: this.resolved.providerId,
+        endpoint: this.resolved.endpoint,
         model: this.llm.model,
         pricing: this.llm.pricing,
         tokens: reported,
@@ -1101,6 +1145,7 @@ class RunExecution {
     const call = this.usage.record({
       status: kind === 'ok' ? 'ok' : 'unknown',
       provider: this.resolved.providerId,
+      endpoint: this.resolved.endpoint,
       model: this.llm.model,
       pricing: this.llm.pricing,
       tokens,
@@ -1554,6 +1599,7 @@ class RunExecution {
 
     deps.registry.closeCall(callRecord)
     const durationMs = Date.now() - started
+    countToolCall(outcome.kind, durationMs)
     log.info(
       'tool_result',
       {
@@ -2044,6 +2090,7 @@ class RunExecution {
       ...(error ? { error: publicError(error) } : {}),
     })
 
+    countRunFinished(status, String(finishReason))
     log[status === 'failed' ? 'error' : 'info'](
       'run_done',
       {

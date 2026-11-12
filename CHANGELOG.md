@@ -4,6 +4,69 @@ All notable changes to theloop. The contract is versioned separately (`contract_
 [SPEC.md](SPEC.md)); every change below is additive to it. Releases follow semver: no breaking
 changes within 1.x.
 
+## v1.5.0 — 2026-11-12
+
+**The on-prem release.** theloop now installs and runs inside a closed network: local and
+self-hosted models, internal tools on private addresses, no content in any log, delivery from files.
+Everything is opt-in: with no new env set, the engine behaves as v1.4.x, except that
+`LOG_BUFFER_CONTENT=0` now removes strictly more (see Changed). Design: [RFC 0004](docs/rfcs/0004-on-prem.md).
+
+### Added
+
+- **Local models and model endpoints** (SPEC §9.6). `LLM_ENDPOINT_<NAME>_*` defines a model server
+  — Ollama, vLLM, TGI, llama.cpp, LM Studio, an internal gateway — with its dialect (`openai` /
+  `anthropic`), key, context window, caps, thinking mapping, reasoning policy and concurrency; a
+  request uses it as `{ "provider": "endpoint", "endpoint": "<name>" }`. Keyless endpoints send no
+  credential header at all, and the SDK never falls back to `ANTHROPIC_API_KEY`. Reasoning is owned by
+  `endpoint:<name>` and replayed per `_REASONING_REPLAY` (`none` by default, or the `reasoning` field
+  current Ollama and vLLM read). One queue per server by default (`_CONCURRENCY_SCOPE`). Usage,
+  `llm_used`, `llm_fallbacks` and SSE carry `endpoint`. `npm run smoke:local` checks a live server.
+- **Base URL overrides** (SPEC §9.1). `<PROVIDER>_BASE_URL` points a named provider at an on-prem
+  installation or a corporate gateway, with the env key; `GIGACHAT_BASE_URL` + `GIGACHAT_OAUTH_URL`
+  for an on-prem GigaChat (the token cache is keyed by the OAuth URL too).
+- **Private-network egress** (SPEC §11.4). `EGRESS_PRIVATE_CIDRS` opens listed private ranges, with
+  DNS pinning kept and IPv4-mapped / NAT64 / 6to4 forms normalized; link-local (incl. cloud metadata),
+  unspecified and multicast are refused whatever the env says. Ports in `EGRESS_ALLOWLIST` entries
+  (`host:port`). `EGRESS_HTTP_HOSTS` allows plain http for listed hosts (`egress_plaintext` on first
+  use). `EGRESS_PUBLIC_PROVIDERS=0` refuses built-in public providers on receipt. Override and
+  endpoint origins are allowed for the provider purpose only.
+- **Content-free logging** (SPEC §12.5). `LOG_CONTENT` = `all` | `none` | a list of content classes
+  (`prompt`, `messages`, `tools`, `model_names`, `external`, `meta`, `urls`); a request narrows it with
+  `logging.content`. In strict mode every field of stdout, the memory and disk journals and the error
+  webhook goes through a field registry: provider and network error text, callback receiver
+  responses, exception messages and stacks, URL paths, invented tool names, `meta` values and
+  provider call ids stay out. A canary test covers every sink.
+- **`GET /metrics`** (SPEC §4.10): Prometheus text behind its own `METRICS_TOKEN` — runs, provider
+  attempts, latency and time to first token, tokens, queues, fallbacks, tools, callbacks, egress
+  refusals, journal size; bounded label cardinality.
+- **Secrets from files**: every secret env variable has a `_FILE` twin.
+- **Held credentials are scrubbed by value.** Every credential the engine holds — env and endpoint
+  keys, keys from requests, tool and callback header values, run and call tokens, GigaChat access
+  tokens — is removed from every log field, journal entry, alert and provider / tool error body,
+  raw or JSON-escaped, whatever it looks like: a server echoing an opaque key in an error no longer
+  leaks it.
+- **`HEALTH_DETAILS=0`**: unauthenticated `/health` answers `ok` only.
+- **Air-gapped delivery** (SPEC §14): releases carry image tarballs for amd64 and arm64, a
+  platform-independent Node bundle, a CycloneDX SBOM, third-party licenses and `SHA256SUMS`. The image
+  runs as non-root, under an arbitrary uid (OpenShift), on a read-only root filesystem, takes a
+  `BASE_IMAGE` build arg and has a `HEALTHCHECK`; the registry image is multi-arch. `deploy/` has a
+  compose file with Ollama and a Kubernetes example. A test proves the engine opens no connection
+  on its own.
+
+### Changed
+
+- `LOG_BUFFER_CONTENT=0` is now an alias of `LOG_CONTENT=none`: besides event content it removes
+  provider and network error text, exception messages, URL paths and `meta` values from every log,
+  and from the error webhook.
+- URL credentials (`user:password@`) are refused in every egress URL and redacted from every log.
+
+### Fixed
+
+- `error_webhook_failed` journal entries were recorded under the name of the alert that failed
+  (`ack_missing`, `run_failed`, …): the alert name went into a field called `event`. It is now `alert`.
+- An egress address is classified by its bytes: a 6to4 or NAT64 address carrying a private IPv4
+  (`[2002:7f00:1::1]`) and expanded IPv6 spellings of loopback are refused like the address they carry.
+
 ## v1.4.1 — 2026-11-07
 
 ### Fixed

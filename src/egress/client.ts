@@ -20,7 +20,9 @@ import type { Config } from '../config.js'
 import type { ProviderId } from '../contracts.js'
 import { EngineError } from '../errors.js'
 import { log, safeUrl } from '../log.js'
-import { isLocalHostname, isPrivateAddress } from './ip.js'
+import { isLocalHostname } from './ip.js'
+import { addressAllowed, parseAddr, type Cidr } from './cidr.js'
+import { countEgressDenied } from '../metrics.js'
 
 /** X-* headers the engine never lets out, although the X- prefix is otherwise allowed (SPEC §11.4). */
 const HEADER_DENY = [/^x-forwarded-/i, /^x-original-/i, /^x-real-ip$/i, /^x-http-method-override$/i]
@@ -45,20 +47,53 @@ export function filterEgressHeaders(
   return out
 }
 
-/** `host` is an exact match, `.suffix` matches subdomains (SPEC §11.4). */
-export function hostMatchesAllowlist(hostname: string, allowlist: readonly string[]): boolean {
+interface HostEntry {
+  host: string
+  port: number | null
+}
+
+/** `host`, `.suffix`, `host:port`, `[v6]`, `[v6]:port`; a bare IPv6 literal has no port. */
+export function parseHostEntry(raw: string): HostEntry {
+  const entry = raw.trim().toLowerCase()
+  const bracket = /^\[([^\]]+)\](?::(\d+))?$/.exec(entry)
+  if (bracket) return { host: bracket[1]!, port: bracket[2] ? Number(bracket[2]) : null }
+  const colons = entry.split(':').length - 1
+  if (colons === 1) {
+    const [host = '', port = ''] = entry.split(':')
+    if (/^\d+$/.test(port)) return { host, port: Number(port) }
+  }
+  return { host: entry, port: null }
+}
+
+/**
+ * `host` is an exact match, `.suffix` matches subdomains (SPEC §11.4); with `:port` only that
+ * port matches. A caller that passes no port matches only entries without one.
+ */
+export function hostMatchesAllowlist(hostname: string, allowlist: readonly string[], port?: number): boolean {
   const host = hostname.toLowerCase().replace(/^\[|\]$/g, '')
   for (const raw of allowlist) {
-    const entry = raw.trim().toLowerCase()
-    if (!entry) continue
-    if (entry.startsWith('.')) {
-      if (host.endsWith(entry)) return true
-      if (host === entry.slice(1)) return true
-    } else if (host === entry) {
+    if (!raw.trim()) continue
+    const entry = parseHostEntry(raw)
+    if (entry.port != null && entry.port !== port) continue
+    if (entry.host.startsWith('.')) {
+      if (host.endsWith(entry.host)) return true
+      if (host === entry.host.slice(1)) return true
+    } else if (host === entry.host) {
       return true
     }
   }
   return false
+}
+
+export function effectivePort(url: URL): number {
+  return url.port ? Number(url.port) : url.protocol === 'https:' ? 443 : 80
+}
+
+/** `tool:<name>` and the like → the finite set metrics see (SPEC §4.10). */
+export function purposeCategory(what: string): string {
+  const head = what.split(':')[0]!.split('.')[0]!
+  if (head === 'tool' || head === 'callback' || head === 'image' || head === 'error_webhook') return head
+  return 'provider'
 }
 
 export interface EgressRequest {
@@ -81,9 +116,12 @@ export interface EgressResponse {
   bytes: Uint8Array
 }
 
+export type EgressDenyReason = 'not_allowlisted' | 'private_ip' | 'scheme' | 'userinfo' | 'invalid_url'
+
 export class EgressDeniedError extends EngineError {
-  constructor(message: string, details: Record<string, unknown> = {}) {
+  constructor(message: string, details: Record<string, unknown> = {}, reason: EgressDenyReason = 'not_allowlisted') {
     super('egress_denied', message, details)
+    countEgressDenied(purposeCategory(String(details.target ?? 'provider')), reason)
   }
 }
 
@@ -92,9 +130,16 @@ export class EgressClient {
   private readonly proxies = new Map<ProviderId, Dispatcher>()
   private readonly allowlist: string[]
   private readonly extraHosts = new Set<string>()
+  /** Origins of base URL overrides and endpoints: allowed for the provider purpose only (SPEC §11.4). */
+  private readonly providerOrigins = new Set<string>()
+  private readonly plaintextSeen = new Set<string>()
+  private readonly cidrs: readonly Cidr[]
+  private readonly httpHosts: readonly string[]
 
   constructor(private readonly config: Config) {
     this.allowlist = config.egressAllowlist
+    this.cidrs = config.egressPrivateCidrs ?? []
+    this.httpHosts = config.egressHttpHosts ?? []
     for (const [provider, uri] of Object.entries(config.providerProxies) as Array<[ProviderId, string]>) {
       this.proxies.set(provider, new ProxyAgent({ uri, headersTimeout: 60_000, bodyTimeout: 300_000 }))
     }
@@ -110,9 +155,7 @@ export class EgressClient {
             if (err) return cb(err)
             const list = addresses as Array<{ address: string; family: number }>
             const allowLocal = this.config.allowInsecureEgress && isLocalHostname(hostname)
-            const safe = allowLocal
-              ? list
-              : list.filter((a) => !isPrivateAddress(a.address, a.family))
+            const safe = allowLocal ? list : list.filter((a) => this.addressAllowed(a.address, a.family))
             if (safe.length === 0) {
               return cb(
                 Object.assign(new Error(`egress: private address for ${hostname}`), {
@@ -136,6 +179,27 @@ export class EgressClient {
     this.extraHosts.add(hostname.toLowerCase())
   }
 
+  /** An override / endpoint origin (scheme, host, port): the provider purpose only (SPEC §11.4). */
+  allowProviderOrigin(rawUrl: string): void {
+    this.providerOrigins.add(new URL(rawUrl).origin)
+  }
+
+  /**
+   * A resolved or literal address: never an always-denied one; a private one only inside
+   * EGRESS_PRIVATE_CIDRS (SPEC §11.4).
+   */
+  private addressAllowed(address: string, _family?: number): boolean {
+    const addr = parseAddr(address)
+    if (!addr) return false
+    return addressAllowed(addr, this.cidrs)
+  }
+
+  private notePlaintext(url: URL, what: string): void {
+    if (url.protocol !== 'http:' || this.plaintextSeen.has(url.host)) return
+    this.plaintextSeen.add(url.host)
+    log.warn('egress_plaintext', { host: url.host, purpose: purposeCategory(what) })
+  }
+
   /**
    * URL check before any network access: used at request validation to
    * answer 400 egress_denied instead of failing mid-run.
@@ -145,28 +209,42 @@ export class EgressClient {
     try {
       url = new URL(rawUrl)
     } catch {
-      throw new EgressDeniedError(`${what}: invalid URL`, { target: what })
+      throw new EgressDeniedError(`${what}: invalid URL`, { target: what }, 'invalid_url')
     }
+    // credentials in a URL are secrets: refused, never logged (SPEC §11.4)
+    if (url.username || url.password) {
+      log.warn('egress_denied', { target: what, host: url.hostname, reason: 'userinfo' })
+      throw new EgressDeniedError(`${what}: credentials in the URL are not allowed`, { target: what }, 'userinfo')
+    }
+    const port = effectivePort(url)
     const localDev = this.config.allowInsecureEgress && isLocalHostname(url.hostname)
-    if (url.protocol !== 'https:' && !(localDev && url.protocol === 'http:')) {
-      throw new EgressDeniedError(`${what}: only https is allowed`, { target: what })
+    const providerOrigin = what === 'provider' && this.providerOrigins.has(url.origin)
+    const plainOk =
+      url.protocol === 'http:' && (localDev || providerOrigin || hostMatchesAllowlist(url.hostname, this.httpHosts, port))
+    if (url.protocol !== 'https:' && !plainOk) {
+      log.warn('egress_denied', { target: what, host: url.hostname, reason: 'scheme' })
+      throw new EgressDeniedError(`${what}: only https is allowed`, { target: what }, 'scheme')
     }
     if (localDev) return url
     // an IP literal never reaches lookup, so privacy is checked here; otherwise
     // an entry like 127.0.0.1 in the allowlist would open the internal network (SPEC §11.4)
     const literal = url.hostname.replace(/^\[|\]$/g, '')
-    if (isIP(literal) && isPrivateAddress(literal, isIP(literal))) {
+    if (isIP(literal) && !this.addressAllowed(literal, isIP(literal))) {
       log.warn('egress_denied', { target: what, host: url.hostname, reason: 'private_ip' })
-      throw new EgressDeniedError(`${what}: private address`, { target: what, host: url.hostname })
+      throw new EgressDeniedError(`${what}: private address`, { target: what, host: url.hostname }, 'private_ip')
     }
-    if (this.extraHosts.has(url.hostname.toLowerCase())) return url
-    if (!hostMatchesAllowlist(url.hostname, this.allowlist)) {
-      log.warn('egress_denied', { target: what, host: url.hostname })
+    if (providerOrigin || this.extraHosts.has(url.hostname.toLowerCase())) {
+      this.notePlaintext(url, what)
+      return url
+    }
+    if (!hostMatchesAllowlist(url.hostname, this.allowlist, port)) {
+      log.warn('egress_denied', { target: what, host: url.hostname, reason: 'not_allowlisted' })
       throw new EgressDeniedError(`${what}: host is not in EGRESS_ALLOWLIST`, {
         target: what,
         host: url.hostname,
       })
     }
+    this.notePlaintext(url, what)
     return url
   }
 
@@ -215,6 +293,9 @@ export class EgressClient {
         text: new TextDecoder().decode(bytes),
         bytes,
       }
+    } catch (err) {
+      if (isPrivateIpRefusal(err)) countEgressDenied(purposeCategory(req.purpose), 'private_ip')
+      throw err
     } finally {
       clearTimeout(timeout)
       req.signal?.removeEventListener('abort', onOuterAbort)
@@ -248,17 +329,31 @@ export class EgressClient {
     return (input, init) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
       this.assertAllowed(url, 'provider')
-      return undiciFetch(url, {
-        ...(init as Record<string, unknown>),
-        redirect: 'error',
-        dispatcher,
-      } as never) as unknown as Promise<Response>
+      return (
+        undiciFetch(url, {
+          ...(init as Record<string, unknown>),
+          redirect: 'error',
+          dispatcher,
+        } as never) as unknown as Promise<Response>
+      ).catch((err: unknown) => {
+        if (isPrivateIpRefusal(err)) countEgressDenied('provider', 'private_ip')
+        throw err
+      })
     }
   }
 
   async close(): Promise<void> {
     await Promise.all([this.agent.close(), ...[...this.proxies.values()].map((p) => p.close())])
   }
+}
+
+/** The DNS filter refused every answer (SPEC §11.4); undici wraps it in `cause`. */
+function isPrivateIpRefusal(err: unknown): boolean {
+  for (let e: unknown = err, depth = 0; e && depth < 4; depth++) {
+    if ((e as { code?: unknown }).code === 'EGRESS_PRIVATE_IP') return true
+    e = (e as { cause?: unknown }).cause
+  }
+  return false
 }
 
 /** Streaming body read with a ceiling: exceeding it is an error, not truncation (SPEC §6.2). */

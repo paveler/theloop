@@ -55,6 +55,7 @@ function settings(overrides: Partial<ThrottleSettings> = {}): ThrottleSettings {
       minimax: 16,
       kimi: 16,
       'openai-compatible': 16,
+      endpoint: 16,
     },
     queueTimeoutMs: 60_000,
     cooldownMs: 1000,

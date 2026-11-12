@@ -30,7 +30,10 @@ export interface ThrottleSettings {
 
 /** Limiter key: provider + hash of key / scope / base_url (the key itself never gets here). */
 export interface ThrottleKey {
-  provider: ProviderId
+  /** A provider id, or `endpoint:<name>` (SPEC §11.6). */
+  provider: string
+  /** The ceiling, when it is not per provider id: an endpoint's _MAX_CONCURRENCY. */
+  max?: number
   /** sha256 hex; only the first 8 chars go outside. */
   hash: string
 }
@@ -59,7 +62,7 @@ export type AcquireResult =
   | ({ kind: 'aborted' } & QueueState)
 
 export interface LimiterSnapshot {
-  provider: ProviderId
+  provider: string
   key: string
   limit: number
   max: number
@@ -293,7 +296,7 @@ export class ProviderThrottle {
       const created: Limiter = new Limiter(
         key,
         throttleLabel(key),
-        Math.max(1, Math.floor(this.settings.maxConcurrency[key.provider])),
+        Math.max(1, Math.floor(key.max ?? this.settings.maxConcurrency[key.provider as ProviderId] ?? 16)),
         this.settings,
         () => {
           if (this.limiters.get(id) === created) this.limiters.delete(id)

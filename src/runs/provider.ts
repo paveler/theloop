@@ -61,6 +61,8 @@ export interface StepOutcome {
   providerMetadata: ProviderMetadata | undefined
   providerRequestId: string | null
   durationMs: number
+  /** Time to the first content event, ms; null — none (GET /metrics). */
+  firstContentMs?: number | null
   /** Whether at least one content event occurred: delta / reasoning / tool_call (SPEC §11.3). */
   sawContent: boolean
   aborted: boolean
@@ -159,6 +161,7 @@ export async function streamStep(params: StreamStepParams): Promise<StepOutcome>
           part.text += chunk.text
           outcome.text += chunk.text
           if (chunk.text.length > 0) {
+            outcome.firstContentMs ??= Date.now() - started
             outcome.sawContent = true
             params.onTextDelta(chunk.text)
           }
@@ -195,6 +198,7 @@ export async function streamStep(params: StreamStepParams): Promise<StepOutcome>
           part.provider_metadata = mergeMeta(part.provider_metadata, chunk.providerMetadata, params.provider)
           outcome.reasoningText += chunk.text
           if (chunk.text.length > 0) {
+            outcome.firstContentMs ??= Date.now() - started
             outcome.sawContent = true
             params.onReasoningDelta(chunk.text)
           }
@@ -228,6 +232,7 @@ export async function streamStep(params: StreamStepParams): Promise<StepOutcome>
           }
           toolCalls.push(call)
           parts.push({ type: 'tool_call', call_id: call.callId, tool: call.tool, args: call.args })
+          outcome.firstContentMs ??= Date.now() - started
           outcome.sawContent = true
           params.onToolCall(call)
           break

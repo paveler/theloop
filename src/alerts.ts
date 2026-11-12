@@ -11,7 +11,7 @@
 import { ENGINE_SECRET_HEADER } from './config.js'
 import { CONTRACT_VERSION } from './contracts.js'
 import type { EgressClient } from './egress/client.js'
-import { log, safeUrl } from './log.js'
+import { contextFor, log, logIn, safeUrl, sanitizeAlert } from './log.js'
 
 export type AlertEvent = 'callback_failed' | 'run_failed' | 'llm_fallback' | 'ack_missing' | 'run_crashed' | 'unhandled_error'
 
@@ -56,6 +56,9 @@ export function sendAlert(event: AlertEvent, fields: Record<string, unknown>): v
     return
   }
   sentInWindow++
+  // the run's context, captured now: the completion handlers run after the run may be gone
+  const ctx = contextFor(fields)
+  const runLog = logIn(ctx)
 
   const headers: Record<string, string> = {}
   if (target.secret) headers[ENGINE_SECRET_HEADER] = target.secret
@@ -70,7 +73,8 @@ export function sendAlert(event: AlertEvent, fields: Record<string, unknown>): v
         event,
         at: new Date(now).toISOString(),
         engine_version: target.version,
-        ...fields,
+        // the same content rules as the journal (SPEC §12.3, §12.5)
+        ...sanitizeAlert(event, fields),
       }),
       timeoutMs: ALERT_TIMEOUT_MS,
       maxBytes: ALERT_RESPONSE_MAX_BYTES,
@@ -78,10 +82,10 @@ export function sendAlert(event: AlertEvent, fields: Record<string, unknown>): v
     })
     .then((res) => {
       if (res.status < 200 || res.status >= 300) {
-        log.warn('error_webhook_failed', { event, status: res.status, url: safeUrl(target.url) })
+        runLog.warn('error_webhook_failed', { alert: event, status: res.status, url: safeUrl(target.url) })
       }
     })
     .catch((err) => {
-      log.warn('error_webhook_failed', { event, err: String(err), url: safeUrl(target.url) })
+      runLog.warn('error_webhook_failed', { alert: event, err: String(err), url: safeUrl(target.url) })
     })
 }

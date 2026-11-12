@@ -28,6 +28,7 @@ export type ErrorCode =
   | 'shutting_down'
   // 404
   | 'run_not_found'
+  | 'not_found'
   | 'call_not_found'
   // a run's terminal failures (never sent as an HTTP response code)
   | 'image_fetch_failed'
@@ -62,6 +63,7 @@ const HTTP_STATUS: Record<ErrorCode, number> = {
   overloaded: 429,
   shutting_down: 503,
   run_not_found: 404,
+  not_found: 404,
   call_not_found: 404,
   image_fetch_failed: 500,
   provider_stream_interrupted: 500,

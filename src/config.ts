@@ -5,6 +5,9 @@
 import { PROVIDER_IDS, type ProviderId } from './contracts.js'
 import { DEFAULT_LOCALE, isLocale, LOCALES, type Locale } from './i18n.js'
 import type { ThrottleSettings } from './providers/throttle.js'
+import { NO_CLASSES, parseClasses, type ClassSet } from './log-policy.js'
+import { readFileSync } from 'node:fs'
+import { parseCidrList, type Cidr } from './egress/cidr.js'
 
 /** Header carrying the engine secret from env CALLBACK_SECRET: callback (SPEC §7) and error webhook (§12.3). */
 export const ENGINE_SECRET_HEADER = 'X-Engine-Secret'
@@ -17,6 +20,23 @@ export interface Config {
 
   egressAllowlist: string[]
   allowInsecureEgress: boolean
+  /** Private ranges egress may reach (SPEC §11.4); [] — none, as before. */
+  egressPrivateCidrs: Cidr[]
+  /** Hosts reachable over plain http (allowlist syntax, optional port). */
+  egressHttpHosts: string[]
+  /** Built-in public provider hosts allowed; 0 — closed network (SPEC §11.4). */
+  egressPublicProviders: boolean
+  /** <PROVIDER>_BASE_URL: an on-prem installation or a gateway of a named provider (SPEC §9.1). */
+  providerBaseUrls: Partial<Record<ProviderId, string>>
+  /** GIGACHAT_OAUTH_URL, set together with GIGACHAT_BASE_URL. */
+  gigachatOAuthUrl: string | undefined
+  /** Operator-defined model endpoints by request name (SPEC §9.1). */
+  endpoints: Record<string, EndpointConfig>
+  /** GET /metrics Bearer token; unset — /metrics is off (SPEC §4.10). */
+  metricsToken: string | undefined
+  metricsMaxModels: number
+  /** 0 — unauthenticated /health answers ok / shutting_down only (SPEC §4.7). */
+  healthDetails: boolean
 
   maxConcurrentRuns: number
   maxRequestBytes: number
@@ -45,8 +65,8 @@ export interface Config {
   /** In-memory journal for GET /logs (SPEC §12.4); 0 entries — off. */
   logBufferMaxEntries: number
   logBufferMaxBytes: number
-  /** Event content in the journal; on by default. */
-  logBufferContent: boolean
+  /** Content classes written to logs (SPEC §12.5): all by default; LOG_BUFFER_CONTENT=0 is none. */
+  logContent: ClassSet
   logContentMaxChars: number
   /** The journal on disk (SPEC §12.4); unset — memory only. */
   logDir: string | undefined
@@ -70,6 +90,47 @@ export interface Config {
 }
 
 type Env = Record<string, string | undefined>
+
+/** An operator-defined model server (SPEC §9.1, LLM_ENDPOINT_<NAME>_*). */
+export interface EndpointConfig {
+  /** Request name: lowercased, `_` → `-`. */
+  name: string
+  url: string
+  kind: 'openai' | 'anthropic'
+  apiKey: string | undefined
+  contextWindow: number | undefined
+  maxTokens: number
+  parallelTools: boolean
+  usageInStream: boolean
+  toolChoiceNone: boolean
+  thinking: 'off' | 'effort' | 'budget' | 'adaptive'
+  reasoning: 'signed' | 'unsigned'
+  reasoningReplay: 'none' | 'reasoning' | 'reasoning_content'
+  prefixBinding: boolean
+  maxConcurrency: number
+  concurrencyScope: 'endpoint' | 'key'
+}
+
+/**
+ * A secret from env or from the file its `_FILE` twin names (SPEC §14): both set or an
+ * unreadable / empty file stops the engine; the path may be in the error, the content never.
+ */
+function secret(env: Env, key: string): string | undefined {
+  const fileKey = `${key}_FILE`
+  const direct = env[key]
+  const file = env[fileKey]?.trim()
+  if (file && direct != null && direct !== '') throw new Error(`env ${key} and ${fileKey} are both set: use one`)
+  if (!file) return direct
+  let text: string
+  try {
+    text = readFileSync(file, 'utf8')
+  } catch {
+    throw new Error(`env ${fileKey}: cannot read ${file}`)
+  }
+  const value = text.replace(/\r?\n$/, '')
+  if (value.trim() === '') throw new Error(`env ${fileKey}: ${file} is empty`)
+  return value
+}
 
 function num(env: Env, key: string, def: number): number {
   const raw = env[key]
@@ -137,7 +198,7 @@ const PROXY_PROTOCOLS = new Set(['http:', 'https:', 'socks5:'])
 function providerProxies(env: Env): Partial<Record<ProviderId, string>> {
   const out: Partial<Record<ProviderId, string>> = {}
   for (const [provider, key] of Object.entries(PROXY_ENV) as Array<[ProviderId, string]>) {
-    const raw = env[key]?.trim()
+    const raw = secret(env, key)?.trim()
     if (!raw) continue
     let url: URL
     try {
@@ -149,6 +210,185 @@ function providerProxies(env: Env): Partial<Record<ProviderId, string>> {
       throw new Error(`env ${key}: scheme ${url.protocol} is not supported — use http, https or socks5`)
     }
     out[provider] = raw
+  }
+  return out
+}
+
+/** Base URL env per named provider (SPEC §9.1); openai-compatible takes base_url from the request. */
+const BASE_URL_ENV: Partial<Record<ProviderId, string>> = {
+  anthropic: 'ANTHROPIC_BASE_URL',
+  openai: 'OPENAI_BASE_URL',
+  deepseek: 'DEEPSEEK_BASE_URL',
+  glm: 'GLM_BASE_URL',
+  gigachat: 'GIGACHAT_BASE_URL',
+  minimax: 'MINIMAX_BASE_URL',
+  kimi: 'KIMI_BASE_URL',
+}
+
+/**
+ * An operator-set URL (overrides, endpoints): http / https, no credentials, plain http only for
+ * a host in EGRESS_HTTP_HOSTS (SPEC §11.4). Invalid → the engine does not start.
+ */
+function operatorUrl(key: string, raw: string, httpHosts: readonly string[]): string {
+  let url: URL
+  try {
+    url = new URL(raw)
+  } catch {
+    throw new Error(`env ${key}: invalid URL`)
+  }
+  if (url.username || url.password) throw new Error(`env ${key}: credentials in the URL are not allowed`)
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') throw new Error(`env ${key}: scheme ${url.protocol} — use https or http`)
+  if (url.protocol === 'http:') {
+    const port = url.port ? Number(url.port) : 80
+    if (!hostMatches(url.hostname, httpHosts, port)) {
+      throw new Error(`env ${key}: plain http needs the host in EGRESS_HTTP_HOSTS (${url.host})`)
+    }
+  }
+  return raw.replace(/\/+$/, '')
+}
+
+/** The allowlist matcher without importing the egress client (it imports this module). */
+function hostMatches(hostname: string, entries: readonly string[], port: number): boolean {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, '')
+  return entries.some((raw) => {
+    let entry = raw.trim().toLowerCase()
+    let entryPort: number | null = null
+    const bracket = /^\[([^\]]+)\](?::(\d+))?$/.exec(entry)
+    if (bracket) {
+      entry = bracket[1]!
+      entryPort = bracket[2] ? Number(bracket[2]) : null
+    } else if (entry.split(':').length === 2 && /:\d+$/.test(entry)) {
+      entryPort = Number(entry.split(':')[1])
+      entry = entry.split(':')[0]!
+    }
+    if (entryPort != null && entryPort !== port) return false
+    return entry.startsWith('.') ? host.endsWith(entry) || host === entry.slice(1) : host === entry
+  })
+}
+
+function providerBaseUrls(
+  env: Env,
+  httpHosts: readonly string[],
+  proxies: Partial<Record<ProviderId, string>>,
+): Partial<Record<ProviderId, string>> {
+  const out: Partial<Record<ProviderId, string>> = {}
+  for (const [provider, key] of Object.entries(BASE_URL_ENV) as Array<[ProviderId, string]>) {
+    const raw = env[key]?.trim()
+    if (!raw) continue
+    // a proxy sees no DNS answer, so the private-range rules could not hold (SPEC §11.4)
+    if (proxies[provider]) throw new Error(`env ${key} and ${PROXY_ENV[provider]}: a proxy cannot be combined with a base URL override`)
+    out[provider] = operatorUrl(key, raw, httpHosts)
+  }
+  return out
+}
+
+const ENDPOINT_SUFFIXES = [
+  'URL',
+  'KIND',
+  'API_KEY',
+  'API_KEY_FILE',
+  'CONTEXT_WINDOW',
+  'MAX_TOKENS',
+  'PARALLEL_TOOLS',
+  'USAGE_IN_STREAM',
+  'TOOL_CHOICE_NONE',
+  'THINKING',
+  'REASONING',
+  'REASONING_REPLAY',
+  'PREFIX_BINDING',
+  'MAX_CONCURRENCY',
+  'CONCURRENCY_SCOPE',
+].sort((a, b) => b.length - a.length)
+
+function oneOf<T extends string>(key: string, raw: string | undefined, allowed: readonly T[], def: T): T {
+  const value = raw?.trim()
+  if (!value) return def
+  if (!(allowed as readonly string[]).includes(value)) throw new Error(`env ${key}: one of ${allowed.join(', ')} (${value})`)
+  return value as T
+}
+
+/** LLM_ENDPOINT_<NAME>_* (SPEC §9.1). */
+function endpoints(env: Env, httpHosts: readonly string[]): Record<string, EndpointConfig> {
+  const names = new Set<string>()
+  for (const key of Object.keys(env)) {
+    if (!key.startsWith('LLM_ENDPOINT_') || env[key] == null || env[key] === '') continue
+    const rest = key.slice('LLM_ENDPOINT_'.length)
+    const suffix = ENDPOINT_SUFFIXES.find((s) => rest.endsWith(`_${s}`))
+    if (!suffix) throw new Error(`env ${key}: unknown endpoint setting`)
+    const name = rest.slice(0, -suffix.length - 1)
+    if (!/^[A-Z0-9_]+$/.test(name)) throw new Error(`env ${key}: endpoint name must be [A-Z0-9_]+`)
+    names.add(name)
+  }
+  // no prototype: `constructor` or `__proto__` must be ordinary names, not inherited properties
+  const out: Record<string, EndpointConfig> = Object.create(null)
+  const fallback = int(env, 'PROVIDER_MAX_CONCURRENCY_DEFAULT', 16, 1)
+  for (const envName of names) {
+    const p = `LLM_ENDPOINT_${envName}_`
+    const name = envName.toLowerCase().replace(/_/g, '-')
+    if (Object.hasOwn(out, name)) throw new Error(`env ${p}*: endpoint name "${name}" is defined twice`)
+    const rawUrl = env[`${p}URL`]?.trim()
+    if (!rawUrl) throw new Error(`env ${p}URL is required`)
+    const kind = oneOf(`${p}KIND`, env[`${p}KIND`], ['openai', 'anthropic'] as const, 'openai')
+    const reasoning = oneOf(`${p}REASONING`, env[`${p}REASONING`], ['signed', 'unsigned'] as const, 'signed')
+    const prefixBinding = bool(env, `${p}PREFIX_BINDING`)
+    if (prefixBinding && (kind !== 'anthropic' || reasoning !== 'signed')) {
+      throw new Error(`env ${p}PREFIX_BINDING: only for KIND=anthropic with REASONING=signed`)
+    }
+    const replay = oneOf(
+      `${p}REASONING_REPLAY`,
+      env[`${p}REASONING_REPLAY`],
+      ['none', 'reasoning', 'reasoning_content'] as const,
+      'none',
+    )
+    if (kind !== 'openai' && env[`${p}REASONING_REPLAY`]?.trim()) {
+      throw new Error(`env ${p}REASONING_REPLAY: only for KIND=openai`)
+    }
+    const contextWindow = env[`${p}CONTEXT_WINDOW`]?.trim() ? int(env, `${p}CONTEXT_WINDOW`, 0, 1) : undefined
+    out[name] = {
+      name,
+      url: operatorUrl(`${p}URL`, rawUrl, httpHosts),
+      kind,
+      apiKey: secret(env, `${p}API_KEY`)?.trim() || undefined,
+      contextWindow,
+      maxTokens: int(env, `${p}MAX_TOKENS`, 32_000, 1),
+      parallelTools: bool(env, `${p}PARALLEL_TOOLS`),
+      usageInStream: bool(env, `${p}USAGE_IN_STREAM`),
+      toolChoiceNone: bool(env, `${p}TOOL_CHOICE_NONE`, true),
+      thinking: oneOf(
+        `${p}THINKING`,
+        env[`${p}THINKING`],
+        ['off', 'effort', 'budget', 'adaptive'] as const,
+        kind === 'anthropic' ? 'budget' : 'effort',
+      ),
+      reasoning,
+      reasoningReplay: kind === 'openai' ? replay : 'none',
+      prefixBinding,
+      maxConcurrency: int(env, `${p}MAX_CONCURRENCY`, fallback, 1),
+      concurrencyScope: oneOf(`${p}CONCURRENCY_SCOPE`, env[`${p}CONCURRENCY_SCOPE`], ['endpoint', 'key'] as const, 'endpoint'),
+    }
+  }
+  return out
+}
+
+/** Overrides and endpoints for the log: scheme and host:port, never a key. */
+export function describeOverrides(config: Config): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [provider, raw] of Object.entries(config.providerBaseUrls)) {
+    const url = new URL(raw)
+    out[provider] = `${url.protocol}//${url.host}`
+  }
+  if (config.gigachatOAuthUrl) {
+    const url = new URL(config.gigachatOAuthUrl)
+    out['gigachat-oauth'] = `${url.protocol}//${url.host}`
+  }
+  return out
+}
+
+export function describeEndpoints(config: Config): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const e of Object.values(config.endpoints)) {
+    const url = new URL(e.url)
+    out[e.name] = `${e.kind} ${url.protocol}//${url.host}`
   }
   return out
 }
@@ -185,16 +425,50 @@ function defaultTimezone(env: Env): string {
   return raw
 }
 
+/** LOG_CONTENT, with LOG_BUFFER_CONTENT=0 as an alias of `none` (SPEC §12.5). */
+function logContent(env: Env): ClassSet {
+  const legacyOff = env.LOG_BUFFER_CONTENT != null && env.LOG_BUFFER_CONTENT !== '' && !bool(env, 'LOG_BUFFER_CONTENT')
+  const raw = env.LOG_CONTENT?.trim()
+  let classes: ClassSet
+  try {
+    classes = raw ? parseClasses(raw) : legacyOff ? NO_CLASSES : parseClasses('all')
+  } catch (err) {
+    throw new Error(`env LOG_CONTENT: ${(err as Error).message}`)
+  }
+  if (legacyOff && raw && classes.size > 0) {
+    throw new Error('env LOG_BUFFER_CONTENT=0 is an alias of LOG_CONTENT=none: they conflict')
+  }
+  return classes
+}
+
 /**
  * ENGINE_TOKEN is required, there is no default (SPEC §4.1): the engine does not start without it.
  */
 export function createConfig(env: Env = process.env): Config {
-  const engineTokens = list(env, 'ENGINE_TOKEN')
+  const engineTokens = list({ ENGINE_TOKEN: secret(env, 'ENGINE_TOKEN') }, 'ENGINE_TOKEN')
   if (engineTokens.length === 0) {
     throw new Error('ENGINE_TOKEN is required (SPEC §4.1), there is no default')
   }
 
   const port = num(env, 'PORT', 8080)
+  const egressHttpHosts = list(env, 'EGRESS_HTTP_HOSTS')
+  const proxies = providerProxies(env)
+  const baseUrls = providerBaseUrls(env, egressHttpHosts, proxies)
+  const gigachatOAuthUrl = env.GIGACHAT_OAUTH_URL?.trim()
+    ? operatorUrl('GIGACHAT_OAUTH_URL', env.GIGACHAT_OAUTH_URL.trim(), egressHttpHosts)
+    : undefined
+  if (Boolean(baseUrls.gigachat) !== Boolean(gigachatOAuthUrl)) {
+    throw new Error('env GIGACHAT_BASE_URL and GIGACHAT_OAUTH_URL go together: set both or neither')
+  }
+  const errorWebhookUrl = env.ERROR_WEBHOOK_URL?.trim() || undefined
+  if (errorWebhookUrl) {
+    try {
+      const u = new URL(errorWebhookUrl)
+      if (u.username || u.password) throw new Error('credentials')
+    } catch {
+      throw new Error('env ERROR_WEBHOOK_URL: invalid URL or credentials in it')
+    }
+  }
   const rateLimitMaxDelayMs = int(env, 'PROVIDER_RATE_LIMIT_MAX_DELAY_MS', 16_000, 0)
 
   return {
@@ -205,6 +479,15 @@ export function createConfig(env: Env = process.env): Config {
 
     egressAllowlist: list(env, 'EGRESS_ALLOWLIST'),
     allowInsecureEgress: bool(env, 'ALLOW_INSECURE_EGRESS'),
+    egressPrivateCidrs: parseCidrList(env.EGRESS_PRIVATE_CIDRS),
+    egressHttpHosts,
+    egressPublicProviders: bool(env, 'EGRESS_PUBLIC_PROVIDERS', true),
+    providerBaseUrls: baseUrls,
+    gigachatOAuthUrl,
+    endpoints: endpoints(env, egressHttpHosts),
+    metricsToken: secret(env, 'METRICS_TOKEN')?.trim() || undefined,
+    metricsMaxModels: int(env, 'METRICS_MAX_MODELS', 50, 1),
+    healthDetails: bool(env, 'HEALTH_DETAILS', true),
 
     maxConcurrentRuns: num(env, 'MAX_CONCURRENT_RUNS', 32),
     maxRequestBytes: num(env, 'MAX_REQUEST_BYTES', 1_048_576),
@@ -215,8 +498,8 @@ export function createConfig(env: Env = process.env): Config {
     maxRetainedRuns: num(env, 'MAX_RETAINED_RUNS', 1000),
     maxRetainedBytes: num(env, 'MAX_RETAINED_BYTES', 268_435_456),
     callbackAttemptTimeoutMs: num(env, 'CALLBACK_ATTEMPT_TIMEOUT_MS', 10_000),
-    callbackSecret: env.CALLBACK_SECRET?.trim() || undefined,
-    errorWebhookUrl: env.ERROR_WEBHOOK_URL?.trim() || undefined,
+    callbackSecret: secret(env, 'CALLBACK_SECRET')?.trim() || undefined,
+    errorWebhookUrl,
     imageMaxBytes: num(env, 'IMAGE_MAX_BYTES', 5_242_880),
     shutdownGraceMs: num(env, 'SHUTDOWN_GRACE_MS', 7_000),
     maxContextFallback: num(env, 'MAX_CONTEXT_FALLBACK', 128_000),
@@ -227,7 +510,7 @@ export function createConfig(env: Env = process.env): Config {
     logPrompts: bool(env, 'LOG_PROMPTS'),
     logBufferMaxEntries: num(env, 'LOG_BUFFER_MAX_ENTRIES', 20_000),
     logBufferMaxBytes: num(env, 'LOG_BUFFER_MAX_BYTES', 33_554_432),
-    logBufferContent: bool(env, 'LOG_BUFFER_CONTENT', true),
+    logContent: logContent(env),
     logContentMaxChars: num(env, 'LOG_CONTENT_MAX_CHARS', 4000),
     logDir: env.LOG_DIR?.trim() || undefined,
     logRetentionDays: int(env, 'LOG_RETENTION_DAYS', 7, 0),
@@ -247,15 +530,15 @@ export function createConfig(env: Env = process.env): Config {
     rateLimitMaxDelayMs,
 
     providerKeys: {
-      anthropic: env.ANTHROPIC_API_KEY,
-      openai: env.OPENAI_API_KEY,
-      deepseek: env.DEEPSEEK_API_KEY,
-      glm: env.GLM_API_KEY,
-      gigachat: env.GIGACHAT_AUTH_KEY,
-      minimax: env.MINIMAX_API_KEY,
-      kimi: env.KIMI_API_KEY,
+      anthropic: secret(env, 'ANTHROPIC_API_KEY'),
+      openai: secret(env, 'OPENAI_API_KEY'),
+      deepseek: secret(env, 'DEEPSEEK_API_KEY'),
+      glm: secret(env, 'GLM_API_KEY'),
+      gigachat: secret(env, 'GIGACHAT_AUTH_KEY'),
+      minimax: secret(env, 'MINIMAX_API_KEY'),
+      kimi: secret(env, 'KIMI_API_KEY'),
     },
-    providerProxies: providerProxies(env),
+    providerProxies: proxies,
     gigachatScope: env.GIGACHAT_SCOPE ?? 'GIGACHAT_API_PERS',
   }
 }
