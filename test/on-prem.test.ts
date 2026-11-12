@@ -666,3 +666,55 @@ describe('review round 3', () => {
     expect(JSON.stringify(result) + logs).not.toContain(liveKey)
   })
 })
+
+describe('review round 4', () => {
+  it('a tool error envelope echoing the header credential: scrubbed from the history and the journal', async () => {
+    const toolSecret = 'OPAQUE0TOOL0ENVELOPE0SECRET'
+    const tools = await server((_b, req, res) => json(res, 200, { status: 'error', error: `credential rejected: ${req.headers['x-tool-key']}` }))
+    const model = mockModel([
+      streamFrom([START, { type: 'tool-call', toolCallId: 'c1', toolName: 't', input: '{}' }, finish('tool-calls')]),
+      streamFrom([START, ...textChunks('done'), finish('stop')]),
+    ])
+    const engine = track(createEngine(testConfig({ LOG_CONTENT: 'tools' }), { modelFactory: mockFactory(model) }))
+    const result = await post(
+      engine,
+      runRequest({
+        tools: [{ name: 't', endpoint: `${tools.url}/t`, effect: 'read', headers: { 'X-Tool-Key': toolSecret }, input_schema: { type: 'object' } }] as never,
+      }),
+    )
+    const logs = await (await engine.app.request('/logs?limit=10000', { headers: bearer() })).text()
+    expect(logs).toContain('tool_result')
+    expect(JSON.stringify(result) + logs).not.toContain(toolSecret)
+  })
+
+  it('a key with quotes and backslashes cannot be recovered from a JSON body that escapes it', async () => {
+    const oddKey = 'odd"key\\with0quotes0and0slashes'
+    const { engine } = await endpointEngine(
+      (_b, _r, res) => json(res, 400, { error: { message: `Invalid API key: ${oddKey}` } }),
+      { LLM_ENDPOINT_LOCAL_API_KEY: oddKey },
+    )
+    const result = await post(engine, runRequest({ llm: endpointLlm as never }))
+    const logs = (await (await engine.app.request('/logs?limit=10000', { headers: bearer() })).json()) as { entries: unknown[] }
+    // decode every stored string: the key must not come back out of an escaped body
+    const strings: string[] = []
+    const walk = (v: unknown): void => {
+      if (typeof v === 'string') {
+        strings.push(v)
+        try {
+          walk(JSON.parse(v))
+        } catch {
+          // not JSON
+        }
+      } else if (v && typeof v === 'object') Object.values(v).forEach(walk)
+    }
+    walk(result)
+    walk(logs.entries)
+    expect(strings.some((s) => s.includes(oddKey))).toBe(false)
+  })
+
+  it('issued short-lived tokens are scrubbed until they expire', async () => {
+    const { registerTransientSecret, redactSecrets } = await import('../src/log.js')
+    registerTransientSecret('GIGA0ACCESS0TOKEN0VALUE', Date.now() + 1_800_000)
+    expect(redactSecrets('Invalid token: GIGA0ACCESS0TOKEN0VALUE')).toBe('Invalid token: <redacted>')
+  })
+})

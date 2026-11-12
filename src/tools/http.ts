@@ -9,7 +9,7 @@ import type { ToolCallStatus, ToolDef } from '../contracts.js'
 import { CONTRACT_VERSION, ToolEnvelopeSchema } from '../contracts.js'
 import { BodyTooLargeError, type EgressClient } from '../egress/client.js'
 import { EngineError } from '../errors.js'
-import { log, safeUrl } from '../log.js'
+import { log, safeUrl, redactSecrets } from '../log.js'
 
 export type ToolOutcome =
   | { kind: 'ok'; result: unknown; truncated: boolean }
@@ -184,7 +184,8 @@ async function interpretBody(
       return truncateResult(value.result ?? null, ctx.toolResultMaxBytes)
 
     case 'error':
-      return { kind: 'error', error: value.error ?? 'tool error', status: 'error' }
+      // a tool may echo the credential it received: scrubbed before the model, the history or a log sees it
+      return { kind: 'error', error: redactSecrets(value.error ?? 'tool error'), status: 'error' }
 
     case 'deferred': {
       if (!value.operation_id) {
@@ -205,7 +206,7 @@ async function interpretBody(
       try {
         const async = await ctx.waitForAsyncResult(ctx.callId, timeoutMs, ctx.signal)
         if (async.is_error) {
-          return { kind: 'error', error: async.error ?? 'tool error', status: 'error' }
+          return { kind: 'error', error: redactSecrets(async.error ?? 'tool error'), status: 'error' }
         }
         return truncateResult(async.result ?? null, ctx.toolResultMaxBytes)
       } catch (err) {

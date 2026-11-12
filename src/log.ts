@@ -151,8 +151,7 @@ export function contextFor(fields: LogFields): LogContext {
 /** Fields of an error-webhook body, under the same rules as log events (SPEC §12.3). */
 export function sanitizeAlert(event: string, fields: LogFields): LogFields {
   const ctx = contextFor(fields)
-  if (isAllClasses(ctx.classes)) return fields
-  return sanitizeFields(`alert:${event}`, fields, ctx)
+  return redactFields(isAllClasses(ctx.classes) ? fields : sanitizeFields(`alert:${event}`, fields, ctx)) as LogFields
 }
 
 export { classList }
@@ -160,7 +159,7 @@ export { classList }
 function emit(level: LogLevel, event: string, rawFields: LogFields = {}, rawContent?: LogFields, given?: LogContext): void {
   const ctx = given ?? contextFor(rawFields)
   const strict = !isAllClasses(ctx.classes)
-  const fields = strict ? sanitizeFields(event, rawFields, ctx) : rawFields
+  const fields = redactFields(strict ? sanitizeFields(event, rawFields, ctx) : rawFields) as LogFields
   const content = rawContent && strict ? sanitizeContent(event, rawContent, ctx) : rawContent
 
   if (content && contentToStdout) root[level]({ ...fields, content: clipContent(content, contentMaxChars) }, event)
@@ -291,9 +290,35 @@ export function holdRunSecrets(runId: string, values: Iterable<string | undefine
   for (const v of values) if (usable(v)) set.add(v)
 }
 
+/** Issued short-lived credentials (GigaChat access tokens): until they expire, plus a margin. */
+const transientSecrets = new Map<string, number>()
+const TRANSIENT_MARGIN_MS = 3_600_000
+
+export function registerTransientSecret(value: string | undefined | null, expiresAtMs: number): void {
+  if (!usable(value)) return
+  const now = Date.now()
+  for (const [v, until] of transientSecrets) if (until < now) transientSecrets.delete(v)
+  transientSecrets.set(value, Math.max(expiresAtMs, now) + TRANSIENT_MARGIN_MS)
+}
+
+/** The raw value and its JSON-escaped form: a body quoting a key with `"` or `\` escapes it. */
 function scrub(text: string, secrets: Iterable<string>): string {
   let out = text
-  for (const secret of secrets) if (out.includes(secret)) out = out.split(secret).join('<redacted>')
+  for (const secret of secrets) {
+    if (out.includes(secret)) out = out.split(secret).join('<redacted>')
+    const escaped = JSON.stringify(secret).slice(1, -1)
+    if (escaped !== secret && out.includes(escaped)) out = out.split(escaped).join('<redacted>')
+  }
+  return out
+}
+
+/** Every string leaf of a log event's fields (SPEC §12.2): secrets go nowhere, in any mode. */
+function redactFields(value: unknown, depth = 0): unknown {
+  if (typeof value === 'string') return redactSecrets(value)
+  if (depth > 6 || value === null || typeof value !== 'object') return value
+  if (Array.isArray(value)) return value.map((v) => redactFields(v, depth + 1))
+  const out: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(value)) out[k] = redactFields(v, depth + 1)
   return out
 }
 
@@ -301,6 +326,7 @@ function scrub(text: string, secrets: Iterable<string>): string {
 export function redactSecrets(text: string): string {
   let out = scrub(text, knownSecrets)
   for (const set of runSecrets.values()) out = scrub(out, set)
+  if (transientSecrets.size > 0) out = scrub(out, transientSecrets.keys())
   return out
     .replace(/sk-[A-Za-z0-9_-]{8,}/g, 'sk-<redacted>')
     .replace(/(Bearer\s+)[A-Za-z0-9._-]{8,}/gi, '$1<redacted>')

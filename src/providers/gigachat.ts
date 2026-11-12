@@ -12,7 +12,7 @@
  */
 import { randomUUID } from 'node:crypto'
 import { sha256 } from '../ids.js'
-import { log } from '../log.js'
+import { log, registerTransientSecret } from '../log.js'
 import {
   collectImageUrls,
   fromGigachatPayload,
@@ -57,6 +57,8 @@ export async function gigachatAccessToken(
     pending = requestToken(authKey, scope, fetchImpl, oauthUrl)
       .then((entry) => {
         cache.set(cacheKey, entry)
+        // an API error may quote the token back (SPEC §9.1)
+        registerTransientSecret(entry.accessToken, entry.expiresAtMs)
         return entry
       })
       .finally(() => {
