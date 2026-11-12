@@ -152,6 +152,12 @@ offer this cheaply. — **M**
 **4.4 Deploy templates.** Helm chart; Fly, Railway, Render templates; a hardened default
 `EGRESS_ALLOWLIST` example. — **S**
 
+**4.5 Signed releases.** The release workflow already signs `SHA256SUMS` with cosign when the
+`COSIGN_PRIVATE_KEY` secret is set (SPEC §14); what is missing is the key itself and a
+published `cosign.pub` in the README and on the site, so closed-network installs can verify
+offline with `cosign verify-blob`. A static key rather than keyless signing, because keyless
+verification needs the public Rekor log. Deferred until a deployment asks for it. — **S**
+
 ## Deliberately not planned
 
 - **State in the kernel** — memory, skills storage, sessions, a database. That road leads to a
