@@ -259,6 +259,8 @@ const EVENT_FIELDS: Record<string, Rule> = {
   'tool_result.error': 'tools',
   'output_check.errors': 'model_names',
   'tool_calls_sealed.reason': 'safe',
+  // the provider's own words for why it dropped thinking blocks
+  'thinking_blocks_dropped.reasons': 'external',
   // meta.locale as the caller sent it
   'locale_unsupported.requested': 'meta',
   // names of unknown params come from the request body

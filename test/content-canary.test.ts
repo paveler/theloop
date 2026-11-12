@@ -341,3 +341,27 @@ describe('content-free logging: review fixes (SPEC §12.5)', () => {
     expect(memory + s.stdout.join('')).not.toContain(C)
   })
 })
+
+describe('content-free logging: review round 2 (SPEC §12.5)', () => {
+  it('an unexpected error during validation keeps the request ceiling; Last-Event-ID is logged as a number only', async () => {
+    const s = await sinks()
+    const model = mockModel(async () => streamFrom([START, ...textChunks('ok'), finish('stop')]))
+    const engine = engineWith(s, model, {})
+    const res = await engine.app.request('/runs', {
+      method: 'POST',
+      headers: bearer(),
+      body: JSON.stringify({
+        ...runRequest({
+          messages: [{ role: 'user', content: [{ type: 'image', url: `data:image/png,%E0%A4%A${C}` }] }] as never,
+        }),
+        logging: { content: 'none' },
+      }),
+    })
+    expect(res.status).toBeGreaterThanOrEqual(400)
+    const done = (await (await engine.app.request('/runs', { method: 'POST', headers: bearer(), body: JSON.stringify(runRequest({ wait: false, callback: { url: 'https://tools.example.com/cb' } as never })) })).json()) as { run_id: string }
+    const sse = await engine.app.request(`/runs/${done.run_id}/stream?last_event_id=${C}`, { headers: bearer() })
+    await sse.body?.cancel()
+    const memory = await (await engine.app.request('/logs?limit=10000', { headers: bearer() })).text()
+    expect(memory + s.stdout.join('') + JSON.stringify(s.hook.requests.map((r) => r.body))).not.toContain(C)
+  })
+})

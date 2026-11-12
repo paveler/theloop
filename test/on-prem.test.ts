@@ -588,3 +588,36 @@ describe('/health detail (SPEC §4.7)', () => {
     expect(full).toHaveProperty('provider_throttle')
   })
 })
+
+describe('review round 2', () => {
+  it('an endpoint echoing its opaque key in an error: the key never reaches the result or the journal', async () => {
+    const secretKey = 'OPAQUE0ONPREM0SECRET0CANARY'
+    const { engine } = await endpointEngine(
+      (_b, _r, res) => json(res, 400, { error: { message: `Invalid API key: ${secretKey}` } }),
+      { LLM_ENDPOINT_LOCAL_API_KEY: secretKey },
+    )
+    const result = await post(engine, runRequest({ llm: endpointLlm as never }))
+    expect(result.status).toBe('failed')
+    const logs = await (await engine.app.request('/logs?limit=10000', { headers: bearer() })).text()
+    expect(JSON.stringify(result) + logs).not.toContain(secretKey)
+    expect(JSON.stringify(result)).toContain('<redacted>')
+  })
+
+  it('a request key echoed by an endpoint is scrubbed too', async () => {
+    const requestKey = 'TENANT0OPAQUE0KEY0VALUE'
+    const { engine } = await endpointEngine((_b, _r, res) => json(res, 401, { error: `bad key ${requestKey}` }))
+    const result = await post(engine, runRequest({ llm: { ...endpointLlm, api_key: requestKey } as never }))
+    const logs = await (await engine.app.request('/logs?limit=10000', { headers: bearer() })).text()
+    expect(JSON.stringify(result) + logs).not.toContain(requestKey)
+  })
+
+  it('endpoint names are own properties only', () => {
+    const config = createConfig({ ...baseEnv, LLM_ENDPOINT_CONSTRUCTOR_URL: 'https://llm.corp/v1' })
+    expect(config.endpoints.constructor).toMatchObject({ name: 'constructor' })
+    const plain = createConfig({ ...baseEnv, LLM_ENDPOINT_LOCAL_URL: 'https://llm.corp/v1' })
+    const egress = new EgressClient(plain)
+    for (const name of ['constructor', 'toString', '__proto__']) {
+      expect(() => buildModel(llm({ provider: 'endpoint', endpoint: name }), plain, egress)).toThrow(/unknown endpoint/)
+    }
+  })
+})

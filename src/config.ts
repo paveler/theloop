@@ -319,12 +319,13 @@ function endpoints(env: Env, httpHosts: readonly string[]): Record<string, Endpo
     if (!/^[A-Z0-9_]+$/.test(name)) throw new Error(`env ${key}: endpoint name must be [A-Z0-9_]+`)
     names.add(name)
   }
-  const out: Record<string, EndpointConfig> = {}
+  // no prototype: `constructor` or `__proto__` must be ordinary names, not inherited properties
+  const out: Record<string, EndpointConfig> = Object.create(null)
   const fallback = int(env, 'PROVIDER_MAX_CONCURRENCY_DEFAULT', 16, 1)
   for (const envName of names) {
     const p = `LLM_ENDPOINT_${envName}_`
     const name = envName.toLowerCase().replace(/_/g, '-')
-    if (out[name]) throw new Error(`env ${p}*: endpoint name "${name}" is defined twice`)
+    if (Object.hasOwn(out, name)) throw new Error(`env ${p}*: endpoint name "${name}" is defined twice`)
     const rawUrl = env[`${p}URL`]?.trim()
     if (!rawUrl) throw new Error(`env ${p}URL is required`)
     const kind = oneOf(`${p}KIND`, env[`${p}KIND`], ['openai', 'anthropic'] as const, 'openai')

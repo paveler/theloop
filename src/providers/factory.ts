@@ -11,7 +11,7 @@ import type { Llm, ProviderId } from '../contracts.js'
 import { EngineError } from '../errors.js'
 import { EgressDeniedError, type EgressClient } from '../egress/client.js'
 import { sha256 } from '../ids.js'
-import { log } from '../log.js'
+import { log, registerSecret } from '../log.js'
 import { contextWindowFor, ENDPOINT_OWNER_PREFIX, providerEntry, type ProviderCapabilities } from './allowlist.js'
 import { GIGACHAT_OAUTH_URL, gigachatTransport, type GigachatTransport } from './gigachat.js'
 import type { ThrottleKey } from './throttle.js'
@@ -177,6 +177,7 @@ export function buildModel(llm: Llm, config: Config, egress: EgressClient): Reso
   // key
   const envKey = entry.envKey ? config.providerKeys[entry.envKey] : undefined
   const apiKey = llm.api_key ?? envKey
+  registerSecret(apiKey)
   if (!apiKey) {
     throw new EngineError(
       'provider_key_missing',
@@ -287,7 +288,7 @@ export function buildModel(llm: Llm, config: Config, egress: EgressClient): Reso
 function buildEndpointModel(llm: Llm, config: Config, egress: EgressClient): ResolvedModel {
   if (!llm.endpoint) throw new EngineError('bad_request', 'provider "endpoint" requires llm.endpoint')
   if (llm.base_url) throw new EngineError('bad_request', 'llm.base_url is not allowed with provider "endpoint"')
-  const ep = config.endpoints[llm.endpoint]
+  const ep = Object.hasOwn(config.endpoints, llm.endpoint) ? config.endpoints[llm.endpoint] : undefined
   if (!ep) {
     const known = Object.keys(config.endpoints)
     throw new EngineError(
@@ -296,6 +297,7 @@ function buildEndpointModel(llm: Llm, config: Config, egress: EgressClient): Res
     )
   }
   const apiKey = llm.api_key ?? ep.apiKey
+  registerSecret(apiKey)
   const owner = `${ENDPOINT_OWNER_PREFIX}${ep.name}`
   const fetchImpl = endpointFetch(egress.providerFetchFor('endpoint'), ep, !apiKey)
 

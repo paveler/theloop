@@ -17,7 +17,7 @@ import { EgressClient } from './egress/client.js'
 import { EngineError } from './errors.js'
 import { newRunId, hashBody, timingSafeEqualStr } from './ids.js'
 import { configureAlerts, sendAlert } from './alerts.js'
-import { diskJournal, flushJournal, initLogger, log, logBuffer, logContentClasses, classList, logger, bindRunContext, accessLogUrl } from './log.js'
+import { diskJournal, flushJournal, initLogger, log, logBuffer, logContentClasses, classList, logger, bindRunContext, accessLogUrl, registerSecret } from './log.js'
 import {
   intersectClasses,
   newLogContext,
@@ -64,6 +64,16 @@ export function createEngine(
   version = '0.1.0',
 ): Engine {
   initLogger(config)
+  // every credential the engine holds is scrubbed from text it logs or returns (SPEC §9.1)
+  for (const value of [
+    ...config.engineTokens,
+    config.callbackSecret,
+    config.metricsToken,
+    ...Object.values(config.providerKeys),
+    ...Object.values(config.endpoints).map((e) => e.apiKey),
+  ]) {
+    registerSecret(value)
+  }
   const egress = overrides.egress ?? new EgressClient(config)
   // a closed network turns the built-in public hosts off (SPEC §11.4)
   if (config.egressPublicProviders) for (const host of pinnedProviderHosts()) egress.allowHost(host)
@@ -139,13 +149,19 @@ export function createEngine(
     if (err instanceof EngineError) {
       return c.json(err.toBody(), err.status as never)
     }
-    log.error('unhandled_error', {
-      method: c.req.method,
-      path: c.req.path,
-      err: String(err),
-      stack: err instanceof Error ? err.stack : undefined,
-    })
-    sendAlert('unhandled_error', { path: c.req.path, error: { message: String(err).slice(0, 512) } })
+    // the request's logging ceiling survives into error handling (SPEC §12.5)
+    const report = () => {
+      log.error('unhandled_error', {
+        method: c.req.method,
+        path: accessLogUrl(c.req.path, ''),
+        err: String(err),
+        stack: err instanceof Error ? err.stack : undefined,
+      })
+      sendAlert('unhandled_error', { path: accessLogUrl(c.req.path, ''), error: { message: String(err).slice(0, 512) } })
+    }
+    const requestCtx = requestContexts.get(c.req.raw)
+    if (requestCtx) requestLogContext.run(requestCtx, report)
+    else report()
     return c.json(
       { error: { code: 'internal_error', message: 'internal error', retriable: false } },
       500,
@@ -194,6 +210,7 @@ export function createEngine(
       requireEngineToken(c.req.header('authorization'), config)
       raw = await readJsonBody(c.req.raw, config.maxRequestBytes)
       ctx = requestContextFor(raw)
+      requestContexts.set(c.req.raw, ctx)
       return await requestLogContext.run(ctx, () => acceptRun(c, raw, ctx))
     } catch (err) {
       // the caller gets the refusal, but the journal needs it too — otherwise "the harness
@@ -323,7 +340,11 @@ export function createEngine(
     const lastEventHeader = c.req.header('last-event-id') ?? c.req.query('last_event_id')
     const lastEventId = lastEventHeader != null && lastEventHeader !== '' ? Number(lastEventHeader) : null
     const stream = run.sse.subscribe(Number.isFinite(lastEventId) ? (lastEventId as number) : null)
-    log.debug('sse_subscribe', { run_id: run.runId, status: run.status, last_event_id: lastEventHeader || undefined })
+    log.debug('sse_subscribe', {
+      run_id: run.runId,
+      status: run.status,
+      last_event_id: Number.isFinite(lastEventId) ? lastEventId : undefined,
+    })
 
     return new Response(stream, {
       headers: {
@@ -497,6 +518,9 @@ function requestContextFor(raw: unknown): LogContext {
     return newLogContext(NO_CLASSES)
   }
 }
+
+/** POST /runs request → its log context, for Hono's onError after the request scope ended. */
+const requestContexts = new WeakMap<Request, LogContext>()
 
 function logRunRejected(err: EngineError, raw: unknown): void {
   const body = (raw ?? {}) as {

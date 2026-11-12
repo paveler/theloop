@@ -264,9 +264,27 @@ export function redactHeaders(headers: Record<string, string> | undefined): stri
   return Object.keys(headers).map((k) => (SECRET_KEYS.test(k) ? `${k}=<redacted>` : k))
 }
 
+/**
+ * Credential values the engine holds (env keys, endpoint keys, keys from requests): a server
+ * may echo an opaque key in an error, and no pattern would recognize it (SPEC §9.1).
+ */
+const knownSecrets = new Set<string>()
+const KNOWN_SECRETS_MAX = 2000
+
+export function registerSecret(value: string | undefined | null): void {
+  if (!value || value.length < 8 || knownSecrets.has(value)) return
+  if (knownSecrets.size >= KNOWN_SECRETS_MAX) {
+    const oldest = knownSecrets.values().next().value
+    if (oldest !== undefined) knownSecrets.delete(oldest)
+  }
+  knownSecrets.add(value)
+}
+
 /** Secrets never reach error bodies, SSE, the callback or logs (SPEC §9.1, §12.1, §12.2). */
 export function redactSecrets(text: string): string {
-  return text
+  let out = text
+  for (const secret of knownSecrets) if (out.includes(secret)) out = out.split(secret).join('<redacted>')
+  return out
     .replace(/sk-[A-Za-z0-9_-]{8,}/g, 'sk-<redacted>')
     .replace(/(Bearer\s+)[A-Za-z0-9._-]{8,}/gi, '$1<redacted>')
     .replace(/("(?:api_?key|authorization|access_token|token)"\s*:\s*")[^"]*(")/gi, '$1<redacted>$2')
