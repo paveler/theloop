@@ -320,6 +320,8 @@ npm run build && npm start
   [RFC 0001](docs/rfcs/0001-skills-and-deferred-tools.md), skills and deferred tools.
 - [examples/sqlite-harness](examples/sqlite-harness) — a complete harness: what your backend does
   around the engine, obligation by obligation.
+- [examples/python-client](examples/python-client) — a minimal Python client: one run, SSE, usage;
+  `httpx` is the only dependency.
 - [AGENTS.md](AGENTS.md) — how to work on the code: commands, architecture rules, conventions,
   tests, releases. Written for AI coding agents; a good short version for contributors too.
 
