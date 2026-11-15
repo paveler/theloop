@@ -24,6 +24,22 @@ only). The model defaults to `anthropic` / `claude-sonnet-5` with `ANTHROPIC_API
 engine's env; set `LLM_PROVIDER` / `LLM_MODEL` for another one. Requires Node 22.13+ for
 `node:sqlite`.
 
+**A local model, no API key.** Run Ollama with a model that calls tools, define it as an engine
+endpoint (SPEC §9.6) and point the harness at it, all in the same `.env`:
+
+```bash
+LLM_ENDPOINT_LOCAL_URL=http://localhost:11434/v1
+LLM_ENDPOINT_LOCAL_CONTEXT_WINDOW=26000   # ~20 % below the server context
+EGRESS_PRIVATE_CIDRS=127.0.0.0/8,::1/128
+EGRESS_HTTP_HOSTS=localhost:11434
+LLM_PROVIDER=endpoint                     # the harness side
+LLM_ENDPOINT=local
+LLM_MODEL=qwen3:8b
+```
+
+`LLM_ENDPOINT` names the engine's endpoint; it has no suffix on purpose, because the engine refuses
+unknown `LLM_ENDPOINT_*` variables.
+
 ```
 > Where is my order 1042?
 [getOrder]
