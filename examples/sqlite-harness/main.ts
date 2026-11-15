@@ -2,6 +2,7 @@
  * A chat in the terminal over the example harness.
  *
  *   terminal 1:  npm run dev                 # the engine; .env: ENGINE_TOKEN, ALLOW_INSECURE_EGRESS=1, a provider key
+ *                                            # (or a local model: see README, "A local model, no API key")
  *   terminal 2:  npm run example:sqlite      # this harness, the same .env
  *
  * Try "Where is my order 1042?", then "Please refund it", then /approve.
@@ -22,6 +23,19 @@ if (!ENGINE_TOKEN) {
   process.exit(1)
 }
 
+// a local model: LLM_PROVIDER=endpoint, LLM_ENDPOINT=<name> (default local), LLM_MODEL=<model>.
+// Not LLM_ENDPOINT_*: the engine reads that prefix from the same .env and refuses unknown names.
+const PROVIDER = process.env.LLM_PROVIDER ?? 'anthropic'
+if (PROVIDER === 'endpoint' && !process.env.LLM_MODEL) {
+  console.error('LLM_MODEL is required with LLM_PROVIDER=endpoint — the model the server serves')
+  process.exit(1)
+}
+const LLM = {
+  provider: PROVIDER,
+  model: process.env.LLM_MODEL ?? 'claude-sonnet-5',
+  ...(PROVIDER === 'endpoint' ? { endpoint: process.env.LLM_ENDPOINT ?? 'local' } : {}),
+}
+
 const store = openStore(process.env.DB_PATH ?? 'harness.db')
 store.putOrder({ id: '1042', user_id: USER, status: 'delivered', total: 120, refunded: 0 })
 store.putOrder({ id: '1043', user_id: USER, status: 'shipped', total: 35, refunded: 0 })
@@ -32,7 +46,7 @@ const harness = createHarness({
   engineToken: ENGINE_TOKEN,
   publicUrl: `http://localhost:${PORT}`,
   callbackSecret: process.env.CALLBACK_SECRET || undefined,
-  llm: { provider: process.env.LLM_PROVIDER ?? 'anthropic', model: process.env.LLM_MODEL ?? 'claude-sonnet-5' },
+  llm: LLM,
 })
 
 const server = createServer((req, res) => {

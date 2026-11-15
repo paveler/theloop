@@ -11,7 +11,7 @@ import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, expect, it } from 'vitest'
 import { createEngine, type Engine } from '../src/app.js'
-import { createHarness, type Harness } from '../examples/sqlite-harness/harness.js'
+import { createHarness, type Harness, type HarnessOptions } from '../examples/sqlite-harness/harness.js'
 import { openStore, type Store } from '../examples/sqlite-harness/store.js'
 import { ENGINE_TOKEN, finish, mockFactory, mockModel, START, streamFrom, textChunks, testConfig, toolCall, waitFor } from './helpers.js'
 
@@ -26,8 +26,8 @@ afterEach(async () => {
 
 async function setup(
   model: ReturnType<typeof mockModel>,
-  opts: { engineEnv?: Record<string, string>; callbackSecret?: string } = {},
-): Promise<{ engine: Engine; harness: Harness; store: Store }> {
+  opts: { engineEnv?: Record<string, string>; callbackSecret?: string; llm?: HarnessOptions['llm'] } = {},
+): Promise<{ engine: Engine; harness: Harness; store: Store; runBodies: Array<Record<string, any>> }> {
   const engine = createEngine(testConfig(opts.engineEnv), { modelFactory: mockFactory(model) })
   cleanup.push(() => engine.shutdown())
 
@@ -47,17 +47,22 @@ async function setup(
   )
   const port = (server.address() as AddressInfo).port
 
+  const runBodies: Array<Record<string, any>> = []
   harness = createHarness({
     store,
     engineUrl: ENGINE_URL,
     engineToken: ENGINE_TOKEN,
     publicUrl: `http://127.0.0.1:${port}`,
     ...(opts.callbackSecret ? { callbackSecret: opts.callbackSecret } : {}),
-    llm: { provider: 'anthropic', model: 'claude-sonnet-5' },
+    llm: opts.llm ?? { provider: 'anthropic', model: 'claude-sonnet-5' },
     // the harness talks to the in-process engine; the engine reaches the harness over HTTP
-    fetch: ((input: string, init?: RequestInit) => engine.app.request(String(input).replace(ENGINE_URL, ''), init)) as typeof fetch,
+    fetch: ((input: string, init?: RequestInit) => {
+      const path = String(input).replace(ENGINE_URL, '')
+      if (path === '/runs' && init?.method === 'POST') runBodies.push(JSON.parse(String(init.body)))
+      return engine.app.request(path, init)
+    }) as typeof fetch,
   })
-  return { engine, harness, store }
+  return { engine, harness, store, runBodies }
 }
 
 function roles(store: Store): string[] {
@@ -126,6 +131,25 @@ describe('example harness: the whole path', () => {
 
     expect(store.history(SESSION)).toEqual(before.history)
     expect(store.session(SESSION, USER)).toEqual(before.session)
+  })
+})
+
+describe('example harness: a local model', () => {
+  it('LLM_PROVIDER=endpoint sends llm.endpoint, and the engine runs it', async () => {
+    const model = mockModel([streamFrom([START, ...textChunks('Hello from the local model.'), finish('stop')])])
+    const { harness, store, runBodies } = await setup(model, {
+      engineEnv: {
+        LLM_ENDPOINT_LOCAL_URL: 'http://localhost:11434/v1',
+        EGRESS_HTTP_HOSTS: 'localhost:11434',
+        EGRESS_PRIVATE_CIDRS: '127.0.0.0/8',
+      },
+      llm: { provider: 'endpoint', endpoint: 'local', model: 'qwen3:8b' },
+    })
+
+    const run = await harness.send(SESSION, USER, 'Hi')
+    await waitFor(() => store.run(run.runId)?.status === 'completed')
+    expect(runBodies[0]!.llm).toEqual({ provider: 'endpoint', endpoint: 'local', model: 'qwen3:8b' })
+    expect(roles(store)).toEqual(['user', 'assistant'])
   })
 })
 

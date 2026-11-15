@@ -20,7 +20,8 @@ export interface HarnessOptions {
   publicUrl: string
   /** Must match the engine's CALLBACK_SECRET, if it has one (SPEC §7). */
   callbackSecret?: string
-  llm: { provider: string; model: string }
+  /** `endpoint` names an operator-defined model server when `provider` is `endpoint` (SPEC §9.6). */
+  llm: { provider: string; model: string; endpoint?: string }
   system?: string
   /** Injected in tests; the global fetch otherwise. */
   fetch?: typeof fetch
