@@ -17,6 +17,7 @@ export type SseEventName =
   | 'step'
   | 'output_check'
   | 'llm_fallback'
+  | 'message_injected'
   | 'done'
   | 'gap'
 
@@ -63,6 +64,8 @@ export class SseHub {
   private step = 0
   private toolCalls: SnapshotToolCall[] = []
   private outputChecks: SnapshotOutputCheck[] = []
+  /** Inbox messages and where they fell in the accumulated text (SPEC §4.11, §6.6). */
+  private injected: { id: string; seq: number; text_offset: number }[] = []
 
   constructor(private readonly maxBytes: number) {}
 
@@ -131,6 +134,9 @@ export class SseHub {
       case 'step':
         this.step = Number(data.index ?? this.step)
         break
+      case 'message_injected':
+        this.injected.push({ id: String(data.id), seq: Number(data.seq), text_offset: this.text.length })
+        break
       case 'output_check': {
         const entry = { fence: String(data.fence), attempt: Number(data.attempt ?? 0), status: String(data.status) }
         const existing = this.outputChecks.find((c) => c.fence === entry.fence)
@@ -152,6 +158,7 @@ export class SseHub {
     }
     if (this.reasoning.length > 0) out.reasoning = this.reasoning
     if (this.outputChecks.length > 0) out.output_checks = this.outputChecks.map((c) => ({ ...c }))
+    if (this.injected.length > 0) out.injected = this.injected.map((i) => ({ ...i }))
     return out
   }
 
@@ -281,7 +288,8 @@ export class SseHub {
       Buffer.byteLength(this.text, 'utf8') +
       Buffer.byteLength(this.reasoning, 'utf8') +
       Buffer.byteLength(JSON.stringify(this.toolCalls), 'utf8') +
-      (this.outputChecks.length > 0 ? Buffer.byteLength(JSON.stringify(this.outputChecks), 'utf8') : 0)
+      (this.outputChecks.length > 0 ? Buffer.byteLength(JSON.stringify(this.outputChecks), 'utf8') : 0) +
+      (this.injected.length > 0 ? Buffer.byteLength(JSON.stringify(this.injected), 'utf8') : 0)
     )
   }
 }
