@@ -398,6 +398,101 @@ describe('run inbox (SPEC §4.11)', () => {
     expect((await result(engine, run_id)).history_revision).toBe(13)
   })
 
+  it('a repeat that carries a newer history_revision updates it', async () => {
+    const step1 = gate()
+    const { model, called } = scriptedModel([
+      { parts: [START, ...textChunks('a'), finish('stop')], wait: step1.promise },
+      { parts: [START, ...textChunks('b'), finish('stop')] },
+    ])
+    const engine = track(createEngine(testConfig(), { modelFactory: mockFactory(model) }))
+    const { run_id } = await start(engine, runRequest({ history_revision: 12 }))
+    await called(1)
+    const message = userText('msg_2', 'more', '2026-11-22T10:15:03Z')
+    expect((await inject(engine, run_id, [message])).status).toBe(202)
+    expect((await inject(engine, run_id, [message], { history_revision: 13 })).status).toBe(202)
+    step1.open()
+    expect((await result(engine, run_id)).history_revision).toBe(13)
+  })
+
+  it('a message during the final step of a limit is pending', async () => {
+    const final = gate()
+    const tools = trackServer(await startServer((_b, _r, res) => json(res, 200, { status: 'ok', result: {} })))
+    const { model, called } = scriptedModel([
+      { parts: [START, toolCall('c1', 'getStatus', {}), finish('tool-calls')] },
+      { parts: [START, ...textChunks('final'), finish('stop')], wait: final.promise },
+    ])
+    const engine = track(createEngine(testConfig(), { modelFactory: mockFactory(model) }))
+    const { run_id } = await start(engine, runRequest({ tools: [readTool(tools.url)] as never, limits: { max_steps: 2 } as never }))
+    await called(2)
+    expect((await inject(engine, run_id, [userText('msg_2', 'late')])).status).toBe(202)
+    final.open()
+    const done = await result(engine, run_id)
+    expect(done.limit_reached).toBe('max_steps')
+    expect(done.messages.some((m) => m.role === 'user')).toBe(false)
+    expect(done.pending_messages!.map((m) => m.id)).toEqual(['msg_2'])
+  })
+
+  it('no budget for another step: the answer stands, completed, the message is pending', async () => {
+    const step1 = gate()
+    const { model, called, prompts } = scriptedModel([
+      { parts: [START, ...textChunks('a'), finish('stop', { inputTokens: 100, outputTokens: 10 })], wait: step1.promise },
+      { parts: [START, ...textChunks('b'), finish('stop')] },
+    ])
+    const engine = track(createEngine(testConfig(), { modelFactory: mockFactory(model) }))
+    // the first call fits (≈ 1000 reserved + a short prompt), a second one after 110 spent does not
+    const { run_id } = await start(engine, runRequest({ limits: { max_tokens: 1000, max_total_tokens: 1100 } as never }))
+    await called(1)
+    expect((await inject(engine, run_id, [userText('msg_2', 'more')])).status).toBe(202)
+    step1.open()
+    const done = await result(engine, run_id)
+    expect(done.status).toBe('completed')
+    expect(done.finish_reason).toBe('end_turn')
+    expect(done.pending_messages!.map((m) => m.id)).toEqual(['msg_2'])
+    expect(prompts).toHaveLength(1)
+  })
+
+  it('timeout during the inbox step: the message stays in messages, seq is unique', async () => {
+    const step1 = gate()
+    let calls = 0
+    const model = mockModel(async ({ abortSignal }) => {
+      calls++
+      if (calls === 1) {
+        await step1.promise
+        return streamFrom([START, ...textChunks('a'), finish('stop')])
+      }
+      return hangingStream([START, ...textChunks('b')], abortSignal)
+    })
+    const engine = track(createEngine(testConfig(), { modelFactory: mockFactory(model) }))
+    const { run_id } = await start(engine, runRequest({ limits: { timeout_ms: 400 } as never }))
+    await waitFor(() => calls === 1)
+    expect((await inject(engine, run_id, [userText('msg_2', 'more')])).status).toBe(202)
+    step1.open()
+    const done = await result(engine, run_id)
+    expect(done.status).toBe('failed')
+    expect(done.messages.filter((m) => m.role === 'user').map((m) => (m as { id?: string }).id)).toEqual(['msg_2'])
+    expect(done.pending_messages).toEqual([])
+    const seqs = done.messages.map((m) => m.seq)
+    expect(new Set(seqs).size).toBe(seqs.length)
+  })
+
+  it('an empty answer re-ask after an inbox message keeps seq unique and in order', async () => {
+    const step1 = gate()
+    const { model, called } = scriptedModel([
+      { parts: [START, ...textChunks('a'), finish('stop')], wait: step1.promise },
+      { parts: [START, ...textChunks('   '), finish('stop')] },
+      { parts: [START, ...textChunks('b'), finish('stop')] },
+    ])
+    const engine = track(createEngine(testConfig(), { modelFactory: mockFactory(model) }))
+    const { run_id } = await start(engine, runRequest())
+    await called(1)
+    expect((await inject(engine, run_id, [userText('msg_2', 'more')])).status).toBe(202)
+    step1.open()
+    const done = await result(engine, run_id)
+    expect(done.status).toBe('completed')
+    expect(done.messages.map((m) => m.role)).toEqual(['assistant', 'user', 'assistant'])
+    expect(done.messages.map((m) => m.seq)).toEqual([0, 1, 2])
+  })
+
   it('limits: inbox_full by count and by bytes; a body is accepted whole or not at all', async () => {
     const step1 = gate()
     const { model, called } = scriptedModel([

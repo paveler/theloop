@@ -463,8 +463,9 @@ export function createEngine(
       }
       throw err
     }
+    // a repeat may carry the revision the harness bumped after storing the messages: the last one wins (§4.11)
+    if (body.history_revision != null) run.historyRevision = body.history_revision
     if (outcome.kind === 'accepted') {
-      if (body.history_revision != null) run.historyRevision = body.history_revision
       log.info(
         'inbox_accepted',
         { run_id: run.runId, ids: outcome.ids, count: outcome.added, history_revision: body.history_revision ?? undefined },
