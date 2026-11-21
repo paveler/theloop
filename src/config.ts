@@ -40,6 +40,9 @@ export interface Config {
 
   maxConcurrentRuns: number
   maxRequestBytes: number
+  /** Inbox messages a run accepts in total, and their total size (SPEC §4.11). */
+  maxInboxMessages: number
+  maxInboxBytes: number
   toolResponseMaxBytes: number
   sseBufferMaxBytes: number
   runRetentionMs: number
@@ -491,6 +494,8 @@ export function createConfig(env: Env = process.env): Config {
 
     maxConcurrentRuns: num(env, 'MAX_CONCURRENT_RUNS', 32),
     maxRequestBytes: num(env, 'MAX_REQUEST_BYTES', 1_048_576),
+    maxInboxMessages: int(env, 'MAX_INBOX_MESSAGES', 20, 0),
+    maxInboxBytes: num(env, 'MAX_INBOX_BYTES', 262_144),
     toolResponseMaxBytes: num(env, 'TOOL_RESPONSE_MAX_BYTES', 1_048_576),
     sseBufferMaxBytes: num(env, 'SSE_BUFFER_MAX_BYTES', 2_097_152),
     runRetentionMs: num(env, 'RUN_RETENTION_MS', 600_000),

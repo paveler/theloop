@@ -178,9 +178,10 @@ awaiting_tool ── tool result recorded for every call_id ─► idle ──�
 Rules:
 
 1. **A new run does not start until the previous result is recorded and
-   acknowledged.** A user message during `running` → `cancel` (synchronous, returns
-   the result) → record → `ack` → `POST /runs`. SSE `done` on the client is **not** a
-   signal that history is recorded.
+   acknowledged.** A user message during `running` → the run inbox (§4.11), which starts
+   no run and leaves the lock alone; or `cancel` (synchronous, returns the result) →
+   record → `ack` → `POST /runs`. SSE `done` on the client is **not** a signal that
+   history is recorded.
 2. No callback by the deadline → `GET /runs/{id}` → record → `ack`; `404` → `lost`,
    session back to `idle`.
 3. `awaiting_tool` logically holds the session. A user message in this state: the
@@ -221,6 +222,7 @@ maximum size of any incoming request body is `MAX_REQUEST_BYTES` (env, default 1
 | `POST /runs/{id}/tool-result` | async tool | result of an `accepted` call |
 | `GET /runs/{id}` | harness | status / result |
 | `POST /runs/{id}/ack` | harness | result recorded, release the session lock |
+| `POST /runs/{id}/messages` | harness | add user messages to a running run (§4.11) |
 | `GET /logs`, `GET /runs/{id}/logs` | harness, operator | event journal |
 | `GET /health` | anyone | liveness and load |
 | `GET /metrics` | scraper | Prometheus metrics (§4.10), off unless `METRICS_TOKEN` is set |
@@ -403,6 +405,9 @@ its original `finish_reason` and `cancel` returns that result. `GET` shows
 
 ### 4.6 `GET /runs/{id}` — status
 
+While the run is running and has accepted inbox messages (§4.11), the body also carries
+`inbox_pending` — how many are still queued.
+
 Bearer. A discriminated union on `status`:
 
 - `running` / `cancelling` — `run_id`, `status`, `meta`, `timing.started_at`, `steps`,
@@ -524,6 +529,86 @@ Label cardinality is bounded by construction: `provider` is a provider id or `en
 label, the rest are `other`. Counters reset on restart (one process, §11.2). Per-key queue
 detail stays in `/health`.
 
+The run inbox (§4.11) adds `theloop_inbox_messages_total` (counter, `outcome` — `accepted` /
+`consumed` / `pending` / `rejected`).
+
+### 4.11 `POST /runs/{id}/messages` — the run inbox
+
+Adds user messages to a **running** run. The engine appends them to the run's history at the
+next step boundary (§10.1) and the run goes on: the model sees them on its next call and
+answers in the same run — one history, one result, one callback. The usual use: an event
+from outside (a background job finished, a scheduled trigger) or a user's follow-up while
+the model is still working, without `cancel` + a new run (§6.5).
+
+Auth: `ENGINE_TOKEN` only — the inbox changes the run's history; a run token → `401`.
+
+```json
+{
+  "contract_version": "1",
+  "history_revision": 13,
+  "messages": [
+    { "role": "user", "id": "msg_812", "created_at": "2026-11-22T10:15:03Z",
+      "content": [ { "type": "event", "name": "job_done", "data": { "job_id": "j_1", "status": "done" } } ] }
+  ]
+}
+```
+
+- `messages` — `role: "user"` only, parts `text` and `event` (no images). Every message has
+  an `id`: the harness's own record id of that message. It is the idempotency key of the
+  insert, unique within the run (a duplicate inside one body → `400`), and the
+  `origin_request_id` of tool calls made after it (§6.1, §6.4).
+- `created_at` — optional; missing or invalid → the time the engine received it. The result
+  always carries it, so the §9.4 date line never changes between turns.
+- `history_revision` — optional: a harness that stored the messages and bumped its revision
+  sends the new one; the result and `GET` echo the last one received (§3, §7).
+- A body is accepted whole or not at all.
+
+| Answer | When |
+|---|---|
+| `202 { accepted: [id…], run_status: "running", inbox_pending }` | queued; they come back in the result |
+| `202` (same) | every `id` was already accepted by this run with the same body — a repeat after a lost answer, nothing is added |
+| `409 inbox_id_mismatch` | an `id` was accepted with a different body |
+| `409 run_finished` (+ `known: [id…]` for ids the run accepted) | the run is terminal (`awaiting_tool` included) or no longer accepts messages |
+| `409 run_cancelling` | a cancel or a shutdown is in progress |
+| `404 run_not_found` | no such run |
+| `413 inbox_full` | the run already accepted `MAX_INBOX_MESSAGES` (env, 20) messages or `MAX_INBOX_BYTES` (env, 256 KiB) in total |
+| `400 bad_request` | not `user`, no `id`, a duplicate `id` in the body, a part other than `text` / `event` |
+
+A repeat is recognized before the run's state is checked: after a lost `202` the harness
+learns from `known` that the messages are in the result. On `409 run_finished` /
+`run_cancelling` the harness takes the regular path (§3.1): result, record, `ack`, then
+`POST /runs` with these messages at the end of the history.
+
+**When the model sees them.** The step boundary is the only point of insertion: the current
+model call and the current tool batch are never interrupted.
+
+1. At the start of every step, before the prompt is built, the engine appends everything
+   queued to the run's messages in arrival order. Each gets `run_id`, `seq` (one sequence
+   with the run's other messages), `created_at` and `injected: true`; SSE emits
+   `message_injected` (§6.6). From that moment the message is part of the run's history and
+   is in `messages` whatever happens next.
+2. The model answered with text (`end_turn`) while messages are queued, and another step is
+   allowed — `step < max_steps`, time and the §10.2 budget estimate of the last call left,
+   no cancel — → the run does **not** end: the answer stays in the history (the user has
+   seen it) and the next step answers the queued messages. If the next step is the
+   text-only final step of a limit (§10.1), it takes the messages first.
+3. Every other end of the run — no step left, the final step of a limit or the empty-answer
+   re-ask already answered, `stopped_limit`, `failed`, `awaiting_tool`, `cancelled`, timeout,
+   shutdown — closes the inbox; what is still queued goes to `pending_messages` (§7).
+
+**Invariant:** every accepted message is, in the result, in exactly one place — in
+`messages` with `injected: true`, or in `pending_messages` as it came (plus `created_at`).
+The engine is one process with one event loop: the inbox is closed in the same tick as the
+terminal status, so a message is never accepted after the run's last look at it.
+
+The run goes on as **the same task**: `system`, tools, limits, budgets, `timeout_ms`
+(never extended), the active `llm` entry (§9.5), loaded skills (§6.8) and the repeat
+detector (§6.7) carry over. A request that needs another configuration is a new run.
+
+Messages after tool results need no special handling: the history is never rewritten, and
+the provider adapters pack a `tool` message followed by a `user` one as each API requires
+(Anthropic — `tool_result` blocks first, then the text, in one user turn).
+
 ## 5. Message format — `StoredMessage`
 
 A versioned DTO of its own — **not** the AI SDK `ModelMessage`. The harness stores it
@@ -549,6 +634,9 @@ AssistantPart = TextPart
   appearance within the run) and `created_at`. The recommended harness record id is
   `<run_id>:<seq>`, so a repeated write is an upsert (§3.1). The harness MAY add its own
   `id`; the engine ignores it.
+- `injected: true` on a `user` message of a result — it came through the run inbox (§4.11);
+  it keeps the harness's `id`. The harness already has it: it deduplicates by `id` and
+  places it by `seq`. Ignored on input.
 - `created_at` on a `user` message (ISO 8601) is when the user sent it. The engine
   shows the model the message date from it (§9.4): the line is identical on every turn,
   so provider caches and signed thinking blocks stay valid. Without it, the last user
@@ -855,7 +943,9 @@ POST {tools[].endpoint}
 ```
 
 `origin_request_id` = the request's `idempotency_key` (the user message id): one user
-intent — one id, no matter how many runs process it. For write tools it is the input to
+intent — one id, no matter how many runs process it. After an inbox message (§4.11) it is
+that message's `id`: a call made after it answers the new message, so a write tool must not
+collapse it into the operation of the original request (§6.4). For write tools it is the input to
 the operation's business logic (§6.4). `attempt` is the transport retry number
 (1, 2, 3).
 
@@ -1014,11 +1104,14 @@ no approval logic in the engine and there will not be.
 A read call that already reached its endpoint cannot be recalled — it finishes for
 nothing. Write tools are never synchronous (§6.4), so cancel never "loses" a mutation.
 
-**A new user message during generation** (the "interrupt" UX): the harness calls
-`cancel`, receives the result synchronously, appends its messages to the history, then
-`POST /runs` with the new message. There is deliberately no atomic `preempt`: the
-history snapshot in the new request could not contain the partial answer of the old
-run, and two callbacks could arrive in any order.
+**A new user message during generation**: the preferred path is the run inbox (§4.11) —
+`POST /runs/{id}/messages`; the run picks the message up at the next step boundary and
+answers it in the same run. `cancel` + a new run stays for "Stop" and for harnesses without
+the inbox: the harness calls `cancel`, receives the result synchronously, appends its
+messages to the history, then `POST /runs` with the new message. There is deliberately no
+atomic `preempt`: the history snapshot in the new request could not contain the partial
+answer of the old run, and two callbacks could arrive in any order. A cancel result carries
+`pending_messages` like any other (§7).
 
 The same abort mechanism serves the run timeout (`failed / run_timeout`, partial kept),
 shutdown (§11.1) and limits (§10.1).
@@ -1038,10 +1131,11 @@ data: {"text":"Order 12345 "}
 | `tool_call` | `{ call_id, tool }` (+ `args` with `expose_args`) | yes, without `args` |
 | `tool_result` | `{ call_id, ok, truncated }` (+ `result` with `expose_result`) | yes, without `result` |
 | `reasoning` | `{ text }` | only with `expose_reasoning` |
-| `snapshot` | `{ through_event_id, text, tool_calls: [{ call_id, tool, status }], step }` (+ `reasoning` with `expose_reasoning`, + `output_checks: [{ fence, attempt, status }]` with the §5.4 gate) — accumulated state **up to and including event `through_event_id`** | on connect without `Last-Event-ID`, or with an id outside the buffer window |
+| `snapshot` | `{ through_event_id, text, tool_calls: [{ call_id, tool, status }], step }` (+ `reasoning` with `expose_reasoning`, + `output_checks: [{ fence, attempt, status }]` with the §5.4 gate, + `injected: [{ id, seq, text_offset }]` after inbox messages — `text_offset` is the length of `text` when the message entered, so a client splits the accumulated text into the answers before and after it) — accumulated state **up to and including event `through_event_id`** | on connect without `Last-Event-ID`, or with an id outside the buffer window |
 | `step` | `{ index, finish_reason, usage }` | yes |
 | `output_check` | `{ fence, attempt, status, errors? }` — format gate (§5.4) | yes, if the request has `output_checks` |
 | `llm_fallback` | `{ step, from: { index, provider, model }, to: { index, provider, model }, error: { code, message } }` — the run moved to the next `llm` entry (§9.5) | yes, if `llm` is an array |
+| `message_injected` | `{ id, seq }` — an inbox message entered the history (§4.11), before the next step's deltas | yes, if the run accepted inbox messages |
 | `done` | `{ status, finish_reason, usage, error? }` — `error` without `provider_body` (§7) | yes |
 
 - By default only text and anonymized progress go out: tool results may contain tenant
@@ -1281,8 +1375,15 @@ spoof the engine signature. `callback.headers` still work and are sent alongside
 secret never appears in logs, SSE, the result or `GET`. Env not set — no header. Tool
 endpoints are **not** covered by the signature — they have their own `tools[].headers`.
 
-- `messages` — **only the new** messages of this run, in order. Old ones are never
-  returned.
+- `messages` — **only the new** messages of this run, in order, inbox messages (§4.11)
+  included at their `seq`. Old ones are never returned.
+- `pending_messages` — inbox messages the run accepted but never appended to its history
+  (§4.11), in arrival order, as they came plus `created_at`. The harness puts them at the
+  end of the next run's history — after the `tool` messages when it continues
+  `awaiting_tool`, after the `superseded` synthetics when a user message supersedes it
+  (§3.1). Present only if the run accepted inbox messages (`[]` — all were appended); with
+  `ENGINE_TOKEN` only, like `messages`.
+- `timing.injected` — inbox messages appended to the history; only if the run accepted any.
 - `status` / `finish_reason`:
   `completed / end_turn` ·
   `stopped_limit / max_steps | max_tokens | max_tool_calls | max_total_tokens | max_cost` ·
@@ -1312,9 +1413,12 @@ endpoints are **not** covered by the signature — they have their own `tools[].
   `limits.max_presentations`.
 - `tool_calls[].builtin: true` — a call of an engine tool (§6.8): `effect: "read"`,
   in-process `duration_ms`. Absent on HTTP tool calls.
-- `history_revision` — an echo of the request (§4.2), for ordering late results (§3).
+- `history_revision` — an echo of the request (§4.2), or of the last inbox body that
+  carried one (§4.11), for ordering late results (§3).
 - `output_checks` — the format gate outcome per fence (§5.4). Only if the request had
-  `output_checks`; `[]` — the run never reached a final text. Absent otherwise.
+  `output_checks`; `[]` — the run never reached a final text. Absent otherwise. A run that
+  went on for inbox messages (§4.11) checks every answer; the result is the last answer's,
+  one entry per fence.
 - `timing.queue_wait_ms` — total time the run waited for provider slots across all
   attempts (§11.6); included in `duration_ms`. Always present, `0` — no waiting.
 - `context` — context fill after the run, always present:
@@ -1858,6 +1962,7 @@ and `timeout_ms`; exhausting them during repair does not fail the run — it fin
 
 Ceilings live in code; a request can only tighten them. Process resources (env):
 `MAX_CONCURRENT_RUNS` (32) → `429 overloaded`; `MAX_REQUEST_BYTES` (1 MB);
+`MAX_INBOX_MESSAGES` (20) and `MAX_INBOX_BYTES` (256 KiB) per run (§4.11);
 `TOOL_RESPONSE_MAX_BYTES` (1 MB); `SSE_BUFFER_MAX_BYTES` (2 MB per run). Parallel provider
 calls — a queue per key, `PROVIDER_MAX_CONCURRENCY_*` (§11.6). Per-tenant / per-user /
 daily limits belong to the harness.
@@ -1926,6 +2031,12 @@ A step = one model call + execution of its tool calls. The same rules for read a
    the re-ask → `stopped_limit / max_total_tokens | max_cost` with the same fallback. The
    re-ask is a regular step and counts toward `max_steps`; if it falls on the last allowed
    step, that step is the rule 1 final step instead (its note and fallback win).
+9. **Inbox messages** (§4.11) enter the history only at the start of a step. After a plain
+   `end_turn` with messages queued the run takes one more step only if it is allowed —
+   steps, time and budget left; a final step of a limit takes queued messages before its
+   call. Whatever arrives during a final step, a re-ask or after the last allowed step goes
+   to `pending_messages`. An inbox step is a regular step: it counts toward `max_steps`,
+   `max_tool_calls`, the budgets and `timeout_ms`.
 
 Every boundary MUST be covered by tests (§13).
 
@@ -2165,7 +2276,8 @@ N parallel `wait: true` runs on one key):
 | `unsupported_media_type`, `image_too_large` | 400 | no |
 | `session_busy`, `result_pending` | 409 | yes (after cancel / after `GET` → `ack`) |
 | `idempotency_mismatch`, `result_mismatch`, `not_finished` | 409 | no |
-| `payload_too_large` | 413 | no |
+| `run_finished`, `run_cancelling`, `inbox_id_mismatch` — run inbox (§4.11) | 409 | no |
+| `payload_too_large`, `inbox_full` (§4.11) | 413 | no |
 | `overloaded`, `shutting_down` | 429 / 503 | yes |
 | `run_not_found`, `call_not_found`, `call_closed` | 404 / 409 | no |
 | `image_fetch_failed` | failed | yes |
@@ -2324,6 +2436,11 @@ without `LOG_DIR` a restart or deploy means an empty journal.
 | `callback_attempt_failed` | warn | a callback attempt failed: `error`, `next_in_ms`, `shutdown` (an attempt in shutdown mode, §11.1) | — |
 | `callback_sent`, `callback_failed` | info / error | delivery outcome (§7) | — |
 | `ack` | info | session lock released: `via` — `callback` / `endpoint` / `wait` | — |
+| `inbox_accepted` | info | `POST /runs/{id}/messages` accepted (§4.11): `ids`, `count` (new ones), `duplicate: true` for a repeat, `history_revision` | `messages` |
+| `inbox_rejected` | info | an inbox body refused: `code`, `count` | — |
+| `inbox_consumed` | info | inbox messages entered the history: `step`, `ids`, `seqs` | — |
+| `inbox_continue` | info | the run takes another step after `end_turn` for queued messages: `step`, `count` | — |
+| `inbox_pending` | info | the run ended with queued messages, now `pending_messages`: `ids`, `count` | — |
 | `cancel`, `sse_subscribe`, `run_deleted`, `ack_missing` | info / debug / warn | stop, SSE subscription, run deletion (`retention` / `evicted`) | — |
 | `egress_denied`, `egress_headers_dropped`, `retained_full`, `shutdown`, `engine_listening` | warn / info | egress refusals and dropped headers, retention full, shutdown, startup (`provider_proxies`, `locale`, `default_timezone`) | — |
 | `journal_retention` | info | day files deleted by age on startup or the hourly tick: `deleted` | — |
@@ -2351,7 +2468,7 @@ to a content class:
 
 **Safe metadata** is what the engine produces (ids it issued, codes, statuses, counts, sizes,
 durations, tokens, enums). **Declared identifiers** are values the harness declared — `session_id`,
-`idempotency_key`, `meta` keys, model and endpoint names, names of tools, skills and fences declared
+`idempotency_key`, inbox message `id`s, `meta` keys, model and endpoint names, names of tools, skills and fences declared
 in the request; Appendix A H23 keeps content out of them. **External identifiers** — the provider's
 tool `call_id` and `provider_request_id` — are not trusted: in strict mode `call_id` is replaced
 by an engine-issued ref (`c1`, `c2`, … per run) and `provider_request_id` is dropped;
@@ -2470,6 +2587,17 @@ equivalent of the following suites.
    block), `keep`; `max_repeated_calls` `0` and clamping; `grounded` — history and run
    results, numbers as strings, `*` over arrays and keys, repair with `ungrounded`,
    `failed`, a path matching nothing.
+5b. **Run inbox** (§4.11): a message during a tool batch (next step, after the tool results,
+   later calls carry its `id` as `origin_request_id`); during the model call (the run takes
+   one more step, two answers with the message between them, SSE `message_injected` between
+   the deltas, the snapshot's `text_offset`); a repeat and an `id` mismatch; `run_finished`
+   with `known`; cancel before the boundary (pending, never in `messages`; `run_cancelling`;
+   no `pending_messages` with a run token); `max_steps` (pending) and a limit's final step
+   (takes the message); `awaiting_tool` (pending); `history_revision`; `inbox_full` by count
+   and bytes, a body accepted whole; auth and validation; event parts and `created_at` set
+   on receipt; the gate on every answer, one result per fence; a result with inbox messages
+   is valid history for the next run; real Anthropic, OpenAI-compatible and GigaChat payloads
+   for a message right after tool results; the content canary for inbox events.
 6a. **Journal** (§4.9, §12.4): filters, content off, scrubbing; prompts by hash (one
    `prompt_blob` per day file, `system` read back, `inline_prompts=false`); the disk
    journal — day files, `0600`, flush on shutdown, reads after a restart (`source: disk`)
@@ -2540,6 +2668,8 @@ ENGINE_LOCALE=en                           # en | ru — engine-injected text, A
 DEFAULT_TIMEZONE=UTC                       # when meta.timezone is absent, §9.4
 MAX_CONCURRENT_RUNS=32
 MAX_REQUEST_BYTES=1048576
+MAX_INBOX_MESSAGES=20                      # inbox messages a run accepts in total, §4.11 (0 — inbox off)
+MAX_INBOX_BYTES=262144                     # their total size
 TOOL_RESPONSE_MAX_BYTES=1048576
 SSE_BUFFER_MAX_BYTES=2097152
 RUN_RETENTION_MS=600000
@@ -2643,7 +2773,7 @@ come from skipping one of these.
 | H8 | At the deadline (`timeout_ms + 120 s` without a callback) call `GET /runs/{id}` before declaring the run lost; only `404` is `lost`. | §3 |
 | H9 | Accept a late callback for a `lost` run; place it by `history_revision` (equal → insert, different → audit + `event` part). | §3 |
 | H10 | Never start a run for a session while the previous result is not recorded and acknowledged; on `409 result_pending` fetch → record → ack → retry. | §3.1 |
-| H11 | Interrupt = `cancel` (synchronous) → record → ack → new run. There is no preempt. | §6.5 |
+| H11 | A message during a run: the inbox (`POST /runs/{id}/messages`), or `cancel` (synchronous) → record → ack → new run. There is no preempt. | §4.11, §6.5 |
 | H12 | A user message during `awaiting_tool`: close every pending `call_id` with a synthetic `superseded` tool error; never reuse that `call_id`; deliver the late operation result as an `event` part. | §3.1 |
 | H13 | Continue `awaiting_tool` only when **every** deferred `call_id` has a result, all `tool` messages first. | §3.1 |
 | H14 | Write endpoints only register an intent and **always** answer `deferred` with a durable `operation_id`, following the lookup order (origin → pending comparison → create) with `opref` references. | §6.4 |
@@ -2655,7 +2785,8 @@ come from skipping one of these.
 | H20 | Store the `tool` messages of `load_skill` and `search_tools` verbatim, `result` and `builtin` included: the engine restores loaded skills from them on the next run, and only marked messages count. | §5, §6.8 |
 | H21 | A run that ends other than `awaiting_tool` with a `tool_calls[]` entry carrying `operation_id` and `status: "cancelled"`: cancel that operation, so its approval can no longer execute; the history already closes the call. | §6.5 |
 | H22 | Render the last assistant message of a `stopped_limit` run when it has text — with the final step on it is always there (the model's answer or the `answer_source: "fallback"` text); an error screen is for an empty answer only. | §7, §10.1 |
-| H23 | Keep content out of identifiers — `session_id`, `idempotency_key`, `meta` keys, tool / skill / fence / model / endpoint names: they are logged in every logging mode. | §12.5 |
+| H23 | Keep content out of identifiers — `session_id`, `idempotency_key`, inbox message `id`s (§4.11), `meta` keys, tool / skill / fence / model / endpoint names: they are logged in every logging mode. | §12.5 |
+| H24 | Inbox messages: give each its own record `id`; record the result's `messages` by `seq`, deduplicating inbox messages by `id`; put `pending_messages` at the end of the next run's history (after tool results); on `409 run_finished` / `run_cancelling` take the regular path with those messages; send `history_revision` with the inbox body if storing them bumped it. | §4.11, §7 |
 
 A reference harness, a conformance test kit for harnesses and examples for common platforms
 are on the roadmap.

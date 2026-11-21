@@ -64,6 +64,8 @@ const MessageEnvelope = {
 export const UserMessageSchema = z.object({
   role: z.literal('user'),
   content: z.array(ContentPartSchema).min(1),
+  /** Engine-set on a message that came through the run inbox (SPEC §4.11); ignored on input. */
+  injected: z.literal(true).optional(),
   ...MessageEnvelope,
 })
 
@@ -400,6 +402,29 @@ export const RunRequestSchema = z.object({
 
 export type RunRequest = z.infer<typeof RunRequestSchema>
 
+/* ------------------------------------------------------------- run inbox */
+
+/** A message for a running run (SPEC §4.11): user only, text and event parts, an id is required. */
+export const InboxMessageSchema = z.object({
+  role: z.literal('user'),
+  id: z.string().min(1).max(256),
+  created_at: z.string().optional(),
+  content: z.array(z.discriminatedUnion('type', [TextPartSchema, EventPartSchema])).min(1),
+})
+
+export const InboxRequestSchema = z
+  .object({
+    contract_version: z.literal(CONTRACT_VERSION),
+    history_revision: z.union([z.number(), z.string()]).nullish(),
+    messages: z.array(InboxMessageSchema).min(1),
+  })
+  .refine((body) => new Set(body.messages.map((m) => m.id)).size === body.messages.length, {
+    error: 'message ids must be unique within the body',
+  })
+
+export type InboxMessage = z.infer<typeof InboxMessageSchema>
+export type InboxRequest = z.infer<typeof InboxRequestSchema>
+
 /* -------------------------------------------------------------- tool-result */
 
 export const ToolResultBodySchema = z
@@ -579,6 +604,8 @@ export interface RunResult {
     steps: number
     /** How long the run waited for provider slots, summed over attempts (SPEC §11.6). */
     queue_wait_ms: number
+    /** Inbox messages appended to the history; only if the run accepted any (SPEC §4.11). */
+    injected?: number
   }
   expires_at: string
   context_trimmed: boolean
@@ -595,6 +622,8 @@ export interface RunResult {
   llm_used?: LlmRef
   /** Entries given up on, in order; only when `llm` was an array, [] — no fallback (SPEC §9.5). */
   llm_fallbacks?: LlmFallback[]
+  /** Accepted inbox messages never appended to the history; only if the run accepted any (SPEC §4.11). */
+  pending_messages?: UserMessage[]
   error: RunErrorBody | null
 }
 

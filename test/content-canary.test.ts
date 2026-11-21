@@ -365,3 +365,49 @@ describe('content-free logging: review round 2 (SPEC §12.5)', () => {
     expect(memory + s.stdout.join('') + JSON.stringify(s.hook.requests.map((r) => r.body))).not.toContain(C)
   })
 })
+
+describe('content-free logging: run inbox (SPEC §4.11, §12.5)', () => {
+  it('inbox events keep message text out of every sink, no unregistered field', async () => {
+    const s = await sinks()
+    let release!: () => void
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let calls = 0
+    const model = mockModel(async () => {
+      calls++
+      if (calls === 1) await held
+      return streamFrom([START, ...textChunks(calls === 1 ? 'first' : 'second'), finish('stop')])
+    })
+    const engine = engineWith(s, model, { LOG_CONTENT: 'none' })
+    const started = (await (
+      await engine.app.request('/runs', {
+        method: 'POST',
+        headers: bearer(),
+        body: JSON.stringify(runRequest({ wait: false, callback: { url: `${s.hook.url}/cb` } as never })),
+      })
+    ).json()) as { run_id: string }
+    await waitFor(() => calls === 1)
+    const inbox = (messages: unknown[]) =>
+      engine.app.request(`/runs/${started.run_id}/messages`, {
+        method: 'POST',
+        headers: bearer(),
+        body: JSON.stringify({ contract_version: '1', messages }),
+      })
+    const message = { role: 'user', id: 'msg_2', content: [{ type: 'text', text: `${C}-inbox` }] }
+    expect((await inbox([message])).status).toBe(202)
+    expect((await inbox([{ ...message, content: [{ type: 'text', text: `${C}-other` }] }])).status).toBe(409)
+    release()
+    await waitFor(async () => {
+      const res = await engine.app.request(`/runs/${started.run_id}`, { headers: bearer() })
+      return ((await res.json()) as { status: string }).status === 'completed'
+    })
+    flushJournal()
+    const memory = await (await engine.app.request('/logs?limit=10000', { headers: bearer() })).text()
+    expect(memory).toContain('inbox_accepted')
+    expect(memory).toContain('inbox_consumed')
+    expect(memory).toContain('inbox_rejected')
+    expect(memory + s.stdout.join('')).not.toContain(C)
+    expect(s.misses).toEqual([])
+  })
+})

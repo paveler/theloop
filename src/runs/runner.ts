@@ -32,6 +32,7 @@ import {
   type ToolCallSummary,
   type ToolDef,
   type UsageCall,
+  type UserMessage,
 } from '../contracts.js'
 import type { EgressClient } from '../egress/client.js'
 import { EngineError, type ErrorCode } from '../errors.js'
@@ -41,6 +42,7 @@ import { sha256 } from '../ids.js'
 import { contextFor, log, safeUrl } from '../log.js'
 import { classList, describeView, isAllClasses } from '../log-policy.js'
 import {
+  countInbox,
   countLlmFallback,
   countProviderAttempt,
   countRunFinished,
@@ -90,7 +92,7 @@ import { streamStep, type StepOutcome, type StepToolCall } from './provider.js'
 import { SkillState, type ModelTool, type Restored } from './skills.js'
 import { validateToolArgs } from '../tools/args.js'
 import { callTool, type ToolOutcome } from '../tools/http.js'
-import { checkBudgets, normalizeUsage, UsageTracker } from './usage.js'
+import { checkBudgets, normalizeUsage, UsageTracker, type BudgetEstimate } from './usage.js'
 
 /** Network / 5xx: ×2 (SPEC §11.3). 429 has its own ladder: Retry-After or full jitter, up to PROVIDER_RATE_LIMIT_RETRIES. */
 const PROVIDER_RETRY_DELAYS_MS = [1000, 3000]
@@ -198,6 +200,10 @@ class RunExecution {
   private finalIgnoredNone = false
   /** The model ended a step with an empty answer: the next step re-asks it, once (SPEC §10.1 rule 8). */
   private emptyReask = false
+  /** id of the last inbox message appended to the history: origin_request_id of later tool calls (§6.4, §4.11). */
+  private lastInjectedId: string | null = null
+  /** The budget estimate of the last main attempt: whether a step for queued inbox messages still fits (§4.11). */
+  private lastBudgetEstimate: BudgetEstimate | null = null
   /** What reached the user, counted only with limits.max_presentations (SPEC §6.9). */
   private readonly presentations: Presentation[] = []
   private timeoutTimer: ReturnType<typeof setTimeout> | null = null
@@ -494,6 +500,8 @@ class RunExecution {
     for (let step = 1; ; step++) {
       this.steps = step
       this.record.steps = step
+      // the step boundary is the only point where inbox messages enter the history (§4.11)
+      this.drainInbox(step)
 
       // §10.1: the last allowed step goes without tools, so a run on max_steps still ends with an answer
       if (limits.final_answer && !this.finalAnswer && limits.max_steps > 1 && step >= limits.max_steps) {
@@ -563,6 +571,10 @@ class RunExecution {
           log.info('final_answer', { run_id: this.record.runId, step, limit: final, outcome: 'model' })
         } else if (reask) {
           log.info('empty_answer', { run_id: this.record.runId, step, outcome: 'model' })
+        } else if (this.continueForInbox(step)) {
+          // §4.11: the answer stands, the queued messages get their own step; no await between
+          // this look at the inbox and finish(), so nothing can slip in between
+          continue
         }
         this.finish('completed', 'end_turn')
         return
@@ -758,17 +770,14 @@ class RunExecution {
       // budgets — before EVERY attempt, including transport retries (SPEC §10.2).
       // With message caching the history is a worst-case cache write: it costs more than plain input
       const cacheable = this.cacheEnabled ? this.systemTokens + this.toolTokens : 0
-      const budget = checkBudgets(
-        this.usage,
-        {
-          input: this.cacheEnabled ? 0 : prompt.historyTokens + this.systemTokens + this.toolTokens,
-          cacheWrite: (this.cacheEnabled ? prompt.historyTokens : 0) + (this.cacheCreated ? 0 : cacheable),
-          cacheRead: this.cacheCreated ? cacheable : 0,
-          output: this.maxTokens,
-        },
-        plan.limits,
-        this.llm.pricing,
-      )
+      const estimate: BudgetEstimate = {
+        input: this.cacheEnabled ? 0 : prompt.historyTokens + this.systemTokens + this.toolTokens,
+        cacheWrite: (this.cacheEnabled ? prompt.historyTokens : 0) + (this.cacheCreated ? 0 : cacheable),
+        cacheRead: this.cacheCreated ? cacheable : 0,
+        output: this.maxTokens,
+      }
+      if (mode === 'main') this.lastBudgetEstimate = estimate
+      const budget = checkBudgets(this.usage, estimate, plan.limits, this.llm.pricing)
       if (!budget.ok) {
         this.logLimit(budget.exceeded!, {
           step,
@@ -1587,7 +1596,9 @@ class RunExecution {
     const outcome = await callTool(deps.egress, def, call.args, timeoutMs, {
       runId: record.runId,
       callId: call.callId,
-      originRequestId: plan.request.idempotency_key ?? null,
+      // after an inbox message the call answers that message: a write must not collapse into
+      // the operation of the original request (§6.4, §4.11)
+      originRequestId: this.lastInjectedId ?? plan.request.idempotency_key ?? null,
       meta: plan.request.meta,
       resultUrl: `${deps.config.publicUrl}/runs/${record.runId}/tool-result?token=${callRecord.token}`,
       toolResultMaxBytes: plan.limits.tool_result_max_bytes,
@@ -1640,6 +1651,8 @@ class RunExecution {
    * repair failure: the model's answer already exists, the run ends completed.
    */
   private async applyOutputChecks(step: number, message: AssistantMessage | null): Promise<'done' | 'cancelled'> {
+    // §4.11: a run that continued for inbox messages checks every answer; the result is the last one's
+    this.outputCheckResults = []
     const original = message ? textOf(message) : ''
     const repaired = new Map<string, string>()
     const stripped = new Set<string>()
@@ -1880,6 +1893,43 @@ class RunExecution {
 
   /* ------------------------------------------------------------ history */
 
+  /** Appends queued inbox messages to the history, in arrival order (§4.11). */
+  private drainInbox(step: number): void {
+    const { record } = this
+    if (record.inbox.pending === 0) return
+    const messages = record.inbox.drain()
+    for (const message of messages) {
+      const stored: UserMessage = { ...message, injected: true, run_id: record.runId, seq: this.seq++ }
+      this.newMessages.push(stored)
+      this.lastInjectedId = message.id ?? this.lastInjectedId
+      record.sse.emit('message_injected', { id: message.id, seq: stored.seq })
+    }
+    log.info('inbox_consumed', {
+      run_id: record.runId,
+      step,
+      ids: messages.map((m) => m.id),
+      seqs: messages.map((_, i) => this.seq - messages.length + i),
+    })
+    countInbox('consumed', messages.length)
+  }
+
+  /**
+   * After a plain end_turn: another step for queued inbox messages, only if one is allowed —
+   * steps, time and budget left, not aborted (§4.11, §10.1). Otherwise they become pending.
+   * The budget check reuses the last attempt's estimate: synchronous, so the decision and
+   * finish() stay in one tick.
+   */
+  private continueForInbox(step: number): boolean {
+    const { record, plan } = this
+    if (record.inbox.pending === 0 || record.inbox.isClosed) return false
+    if (step >= plan.limits.max_steps || record.abort.signal.aborted || Date.now() >= this.deadline) return false
+    if (this.lastBudgetEstimate && !checkBudgets(this.usage, this.lastBudgetEstimate, plan.limits, this.llm.pricing).ok) {
+      return false
+    }
+    log.info('inbox_continue', { run_id: record.runId, step, count: record.inbox.pending })
+    return true
+  }
+
   private pushAssistant(parts: AssistantPart[], partial: boolean): AssistantMessage | null {
     if (parts.length === 0) return null
     const message: AssistantMessage = {
@@ -2046,6 +2096,13 @@ class RunExecution {
     if (this.timeoutTimer) clearTimeout(this.timeoutTimer)
 
     const { record, plan, deps } = this
+    // §4.11: the inbox closes before the terminal status; what is still queued goes back to the harness
+    const pending = record.inbox.close()
+    const inboxUsed = record.inbox.used
+    if (pending.length > 0) {
+      log.info('inbox_pending', { run_id: record.runId, ids: pending.map((m) => m.id), count: pending.length })
+      countInbox('pending', pending.length)
+    }
     const finishedAt = Date.now()
     const usage = this.usage.snapshot()
     const context = this.contextUsage()
@@ -2067,6 +2124,7 @@ class RunExecution {
         duration_ms: finishedAt - record.startedAt,
         steps: this.steps,
         queue_wait_ms: this.queueWaitMs,
+        ...(inboxUsed ? { injected: record.inbox.consumed } : {}),
       },
       expires_at: new Date(finishedAt + retention).toISOString(),
       context_trimmed: this.contextTrimmed,
@@ -2077,6 +2135,7 @@ class RunExecution {
       ...(this.fallbackAnswer ? { answer_source: 'fallback' as const } : {}),
       ...(plan.limits.max_presentations != null ? { presentations: this.presentations } : {}),
       ...(plan.request.llm_is_array ? { llm_used: this.llmRef(), llm_fallbacks: this.llmFallbacks } : {}),
+      ...(inboxUsed ? { pending_messages: pending } : {}),
       error: error ?? null,
     }
 

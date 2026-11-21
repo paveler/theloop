@@ -102,6 +102,9 @@ const FIELDS: Record<string, Rule> = {
   run_id: 'safe',
   session_id: 'safe',
   idempotency_key: 'safe',
+  // inbox message ids are the harness's own record ids, declared like idempotency_key (§4.11)
+  ids: 'safe',
+  seqs: 'safe',
   history_revision: 'safe',
   operation_id: 'safe',
   step: 'safe',
@@ -316,6 +319,8 @@ const CONTENT: Record<string, Rule> = {
   answer: 'messages',
   partial_text: 'messages',
   engine_note: 'messages',
+  // inbox messages as the harness sent them (§4.11)
+  messages: 'messages',
   block: 'messages',
   draft: 'messages',
   issues: 'messages',

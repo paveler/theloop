@@ -22,8 +22,12 @@ export type ErrorCode =
   | 'result_mismatch'
   | 'not_finished'
   | 'call_closed'
+  | 'run_finished'
+  | 'run_cancelling'
+  | 'inbox_id_mismatch'
   // 413 / 429 / 503
   | 'payload_too_large'
+  | 'inbox_full'
   | 'overloaded'
   | 'shutting_down'
   // 404
@@ -59,7 +63,11 @@ const HTTP_STATUS: Record<ErrorCode, number> = {
   result_mismatch: 409,
   not_finished: 409,
   call_closed: 409,
+  run_finished: 409,
+  run_cancelling: 409,
+  inbox_id_mismatch: 409,
   payload_too_large: 413,
+  inbox_full: 413,
   overloaded: 429,
   shutting_down: 503,
   run_not_found: 404,

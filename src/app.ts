@@ -9,6 +9,7 @@ import { cors } from 'hono/cors'
 import type { Config } from './config.js'
 import {
   CONTRACT_VERSION,
+  InboxRequestSchema,
   ToolResultBodySchema,
   publicError,
   type RunResult,
@@ -29,9 +30,10 @@ import {
 import { formatLogText, LOG_LEVELS, type LogEntry, type LogLevel, type LogQuery } from './log-buffer.js'
 import { buildModel, type ModelFactory } from './providers/factory.js'
 import { pinnedProviderHosts, registerEndpoints } from './providers/allowlist.js'
-import { configureMetrics, countRunStarted, renderMetrics } from './metrics.js'
+import { configureMetrics, countInbox, countRunStarted, renderMetrics } from './metrics.js'
 import { ProviderThrottle } from './providers/throttle.js'
 import { RunRegistry, isTerminal, type RunRecord } from './runs/registry.js'
+import type { AcceptOutcome } from './runs/inbox.js'
 import { startRun } from './runs/runner.js'
 import { validateRunRequest } from './runs/validate.js'
 
@@ -322,6 +324,7 @@ export function createEngine(
         timing: { started_at: run.startedAtIso },
         steps: run.steps,
         usage: run.liveUsage(),
+        ...(run.inbox.used ? { inbox_pending: run.inbox.pending } : {}),
       })
     }
 
@@ -433,6 +436,45 @@ export function createEngine(
     if (!isTerminal(run.status)) throw new EngineError('not_finished', 'run has not finished yet')
     registry.ack(run, 'endpoint')
     return c.json({ acked: true }, 200)
+  })
+
+  /* ------------------------------------------------ POST /runs/id/messages */
+
+  // the run inbox (SPEC §4.11): ENGINE_TOKEN only — it changes the run's history
+  app.post('/runs/:id/messages', async (c) => {
+    requireEngineToken(c.req.header('authorization'), config)
+    const run = mustGetRun(registry, c.req.param('id'))
+    const raw = await readJsonBody(c.req.raw, config.maxRequestBytes)
+    const parsed = InboxRequestSchema.safeParse(raw)
+    if (!parsed.success) {
+      const issue = parsed.error.issues[0]
+      throw new EngineError('bad_request', `invalid inbox body: ${issue ? `${issue.path.join('.')} ${issue.message}`.trim() : 'malformed'}`)
+    }
+    const body = parsed.data
+    // a shutdown closes the inbox like a cancel: nothing new may extend a run that has to end
+    const state = isTerminal(run.status) ? 'finished' : run.status === 'cancelling' || shuttingDown ? 'cancelling' : 'open'
+    let outcome: AcceptOutcome
+    try {
+      outcome = run.inbox.accept(body.messages, state)
+    } catch (err) {
+      if (err instanceof EngineError) {
+        log.info('inbox_rejected', { run_id: run.runId, code: err.code, count: body.messages.length })
+        countInbox('rejected', body.messages.length)
+      }
+      throw err
+    }
+    if (outcome.kind === 'accepted') {
+      if (body.history_revision != null) run.historyRevision = body.history_revision
+      log.info(
+        'inbox_accepted',
+        { run_id: run.runId, ids: outcome.ids, count: outcome.added, history_revision: body.history_revision ?? undefined },
+        { messages: body.messages },
+      )
+      countInbox('accepted', outcome.added)
+    } else {
+      log.info('inbox_accepted', { run_id: run.runId, ids: outcome.ids, count: 0, duplicate: true })
+    }
+    return c.json({ accepted: outcome.ids, run_status: 'running', inbox_pending: run.inbox.pending }, 202)
   })
 
   /* ------------------------------------------------------------------ logs */
@@ -749,7 +791,7 @@ function authorizeRunAccess(
  */
 function resultFor(result: RunResult, auth: RunAuth): Record<string, unknown> {
   if (auth === 'engine') return result as unknown as Record<string, unknown>
-  const { messages: _messages, error, ...rest } = result
+  const { messages: _messages, pending_messages: _pending, error, ...rest } = result
   return { ...rest, error: error ? publicError(error) : null }
 }
 

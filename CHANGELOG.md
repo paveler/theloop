@@ -4,6 +4,41 @@ All notable changes to theloop. The contract is versioned separately (`contract_
 [SPEC.md](SPEC.md)); every change below is additive to it. Releases follow semver: no breaking
 changes within 1.x.
 
+## v1.6.0 — 2026-11-22
+
+**The run inbox.** A running run can now take new user messages: a follow-up typed while the
+model works, or an event from outside (a background job finished, a trigger). The run picks them
+up at the next step boundary and answers in the same run. Purely additive: a harness that never
+calls the new endpoint sees no change in any body.
+
+### Added
+
+- **`POST /runs/{id}/messages`** (SPEC §4.11). `ENGINE_TOKEN` only; `user` messages with `text`
+  and `event` parts, each with the harness's own `id`. Accepted whole or not at all; a repeat with
+  the same body is a no-op `202`, the same `id` with another body is `409 inbox_id_mismatch`; a
+  finished run answers `409 run_finished` (with `known` ids), a cancelling one `409 run_cancelling`;
+  `413 inbox_full` over `MAX_INBOX_MESSAGES` (20) or `MAX_INBOX_BYTES` (256 KiB) per run.
+- **Insertion at the step boundary.** Queued messages enter the history at the start of the next
+  step with `injected: true`, the harness `id` and `seq`. After a plain `end_turn` with messages
+  queued the run takes one more step when steps, time and budget allow; a limit's text-only final
+  step takes them before its call (SPEC §10.1 rule 9).
+- **`pending_messages`** in the result: accepted messages the run never appended (no step left,
+  cancel, timeout, `awaiting_tool`, failure). Every accepted message is in exactly one place.
+  `timing.injected` counts the appended ones. Both only when the run accepted inbox messages, and
+  never in the run-token projection.
+- **`origin_request_id` after an inbox message** is that message's `id` (SPEC §6.1, §6.4), so a
+  write requested after a follow-up is a new operation, not a repeat of the original one.
+- **`history_revision`** in the inbox body: the result echoes the last one received.
+- SSE `message_injected { id, seq }` and `injected: [{ id, seq, text_offset }]` in the snapshot;
+  `inbox_pending` in `GET /runs/{id}` while running; journal events `inbox_accepted`,
+  `inbox_rejected`, `inbox_consumed`, `inbox_continue`, `inbox_pending`; metric
+  `theloop_inbox_messages_total{outcome}`.
+
+### Changed
+
+- A run that goes on after an answer checks every answer with the format gate; `output_checks`
+  in the result is the last answer's, one entry per fence (SPEC §5.4, §7).
+
 ## v1.5.0 — 2026-11-12
 
 **The on-prem release.** theloop now installs and runs inside a closed network: local and

@@ -12,6 +12,7 @@ import { hashBody, newToken, timingSafeEqualStr } from '../ids.js'
 import { sendAlert } from '../alerts.js'
 import { holdRunSecrets, log, releaseRunContext } from '../log.js'
 import { SseHub } from '../stream/sse.js'
+import { RunInbox } from './inbox.js'
 import { ToolWaitTimeout, type AsyncToolResult } from '../tools/http.js'
 
 export type CallState = 'open' | 'resolved' | 'closed'
@@ -83,6 +84,8 @@ export interface RunRecord {
 
   calls: Map<string, CallRecord>
   callTokens: Map<string, string>
+  /** Messages the harness adds while the run is running (SPEC §4.11). */
+  inbox: RunInbox
 
   terminal: Promise<void>
   resolveTerminal: () => void
@@ -247,6 +250,7 @@ export class RunRegistry {
       },
       calls: new Map(),
       callTokens: new Map(),
+      inbox: new RunInbox({ maxMessages: this.config.maxInboxMessages, maxBytes: this.config.maxInboxBytes }),
       terminal,
       resolveTerminal,
     }

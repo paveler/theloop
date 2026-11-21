@@ -107,6 +107,10 @@ export function countRunFinished(status: string, finishReason: string): void {
   inc('theloop_runs_finished_total', 'Runs that reached a terminal status.', { status, finish_reason: finishReason })
 }
 
+export function countInbox(outcome: 'accepted' | 'consumed' | 'pending' | 'rejected', n: number): void {
+  if (n > 0) inc('theloop_inbox_messages_total', 'Run inbox messages by outcome (SPEC §4.11).', { outcome }, n)
+}
+
 export function statusClass(status: number | null | undefined, network: boolean): string {
   if (network || status == null) return 'network'
   if (status === 429) return '429'

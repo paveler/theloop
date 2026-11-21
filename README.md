@@ -88,6 +88,10 @@ intents, limits and everything else — [SPEC.md](SPEC.md).
 - **Fallback chain.** Send `llm` as an array, and a provider failure moves the run to the
   next model instead of failing it. The result says which model answered and why the
   others were skipped.
+- **Messages into a running run.** `POST /runs/{id}/messages` adds a user follow-up or an
+  outside event (a job finished, a trigger) to a run that is still working; the run picks it
+  up at the next step boundary and answers in the same run — no cancel, no second run, one
+  result. What the run could not take comes back as `pending_messages`.
 - **Skills and deferred tools.** `skills[]` in the `SKILL.md` shape: the model sees an index
   and loads a skill's instructions and tools mid-run. Deferred tools stay out of the context
   until a skill or `search_tools` (BM25) brings them in, and the prompt cache survives
@@ -279,6 +283,7 @@ src/
   metrics.ts            GET /metrics, Prometheus text (§4.10)
   alerts.ts             error webhook (§12.3)
   runs/registry.ts      in-memory runs: status, SSE buffer, tokens, session lock, idempotency
+  runs/inbox.ts         the run inbox: messages added to a running run (§4.11)
   runs/runner.ts        the loop, step by step: one streamText per step → finish-step →
                         limits → tools → next step
   runs/provider.ts      one provider attempt, error classification
